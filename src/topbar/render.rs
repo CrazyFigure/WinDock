@@ -1,0 +1,216 @@
+//! 顶部栏渲染（毛玻璃态 / 最大化纯色融合态），GDI 双缓冲到 DIB 后 BitBlt。
+
+use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, BitBlt, EndPaint, SRCCOPY, PAINTSTRUCT,
+};
+
+use crate::config::{Appearance, TopbarCfg};
+use crate::topbar::tray_mirror::TrayIconCache;
+use crate::topbar::{ColorMode, Hit, TopBar};
+use crate::ui::*;
+
+pub fn paint(hwnd: HWND, bar: &mut TopBar, _cfg: &TopbarCfg, appearance: &Appearance, tray_icons: &TrayIconCache) {
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
+    if hdc.is_invalid() {
+        return;
+    }
+    let w = bar.monitor.width();
+    let h = bar.height;
+    if !bar.target.ensure(w.max(1), h.max(1)) {
+        unsafe {
+            let _ = EndPaint(hwnd, &ps);
+        }
+        return;
+    }
+    let Some(dc) = bar.target.mem_dc else {
+        unsafe {
+            let _ = EndPaint(hwnd, &ps);
+        }
+        return;
+    };
+    let Some(mut sf) = bar.target.surface() else {
+        unsafe {
+            let _ = EndPaint(hwnd, &ps);
+        }
+        return;
+    };
+    // 全透明黑 = 透出 DWM 毛玻璃
+    sf.clear_rect_transparent(w, h);
+    let s = bar.dpi as f32 / 96.0;
+    let text: Rgba = if bar.dark_text { rgb(0x1D1D1F, 1.0) } else { rgb(0xF5F5F7, 1.0) };
+    let text_dim: Rgba = if bar.dark_text { rgb(0x3A3A3C, 1.0) } else { rgb(0xD1D1D6, 1.0) };
+
+    if bar.mode == ColorMode::Fused {
+        let c = bar.cur_fused;
+        sf.fill_rect(
+            &RECT { left: 0, top: 0, right: w, bottom: h },
+            (c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0, 1.0),
+        );
+    } else if appearance.backdrop != "acrylic" {
+        let a = appearance.opacity;
+        let (r, g, b, _) = appearance.dock_tint();
+        sf.fill_rect(&RECT { left: 0, top: 0, right: w, bottom: h }, (r, g, b, a));
+    } else {
+        // DWM Acrylic 毛玻璃之上叠加一层柔和玻璃调色罩，避免暗壁纸发死黑、亮壁纸对比度不足
+        let glass_tint = if bar.dark_text {
+            (1.0, 1.0, 1.0, 0.38)
+        } else {
+            (0.08, 0.09, 0.11, 0.36)
+        };
+        sf.fill_rect(&RECT { left: 0, top: 0, right: w, bottom: h }, glass_tint);
+    }
+
+    // 激活态高亮（面板/浮层展开时的常驻胶囊底色）
+    if let Some(ah) = &bar.active_hit {
+        if let Some(r) = bar.rect_of(ah) {
+            let hr = RECT {
+                left: r.left + (1.0 * s) as i32,
+                top: (3.0 * s) as i32,
+                right: r.right - (1.0 * s) as i32,
+                bottom: h - (3.0 * s) as i32,
+            };
+            let bg = if bar.dark_text {
+                (0.0, 0.0, 0.0, 0.14)
+            } else {
+                (1.0, 1.0, 1.0, 0.24)
+            };
+            sf.fill_rrect(&hr, 5.0 * s, bg);
+        }
+    }
+
+    // 悬停高亮（macOS 柔和圆角胶囊，不刺眼）
+    if let Some(hv) = &bar.hover {
+        if bar.active_hit.as_ref() != Some(hv) {
+            if let Some(r) = bar.rect_of(hv) {
+                let hr = RECT {
+                    left: r.left + (1.0 * s) as i32,
+                    top: (3.0 * s) as i32,
+                    right: r.right - (1.0 * s) as i32,
+                    bottom: h - (3.0 * s) as i32,
+                };
+                let hl = if bar.dark_text {
+                    (0.0, 0.0, 0.0, 0.10)
+                } else {
+                    (1.0, 1.0, 1.0, 0.18)
+                };
+                sf.fill_rrect(&hr, 5.0 * s, hl);
+            }
+        }
+    }
+
+    // 左侧：单色徽标 + 前台应用名 + 文件/窗口/前往 菜单；右侧：托盘收纳/状态图标/时钟
+    let text_shadow = bar.mode == ColorMode::Glass && !bar.dark_text;
+    let popover_open = bar.popover.as_ref().map(|p| p.visible).unwrap_or(false);
+    let app_icons = crate::app::app_icon_cache();
+    for (r, hit) in bar.hits.iter() {
+        match hit {
+            Hit::ProductMenu => {
+                let cx = (r.left + r.right) as f32 * 0.5;
+                draw_topbar_logo(&mut sf, cx, h as f32 * 0.5, 16.0 * s, text);
+            }
+            Hit::AppMenu => {
+                draw_transparent_text_aligned(&mut sf, &mut bar.scratch, &bar.active_app, bar.font_bold, r, text, TextAlign::Center, text_shadow, s);
+            }
+            Hit::MenuFile => {
+                draw_transparent_text_aligned(&mut sf, &mut bar.scratch, "文件", bar.font, r, text, TextAlign::Center, text_shadow, s);
+            }
+            Hit::MenuWindow => {
+                draw_transparent_text_aligned(&mut sf, &mut bar.scratch, "窗口", bar.font, r, text, TextAlign::Center, text_shadow, s);
+            }
+            Hit::MenuGo => {
+                draw_transparent_text_aligned(&mut sf, &mut bar.scratch, "前往", bar.font, r, text, TextAlign::Center, text_shadow, s);
+            }
+            Hit::TrayToggle => {
+                let cx = (r.left + r.right) as f32 * 0.5;
+                let glyph = if popover_open { Glyph::ChevronDown } else { Glyph::ChevronLeft };
+                draw_glyph(&mut sf, glyph, cx, h as f32 * 0.5, 11.0 * s, text_dim);
+            }
+            Hit::TrayIcon(key) => {
+                if bar.drag.as_ref().is_some_and(|d| &d.key == key) {
+                    continue;
+                }
+                let cx = (r.left + r.right) as f32 * 0.5;
+                let cy = h as f32 * 0.5;
+                if let Some(item) = bar.tray_items.iter().find(|t| &t.key == key) {
+                    crate::topbar::tray_popover::draw_shelf_item_icon(&mut sf, &mut bar.scratch, bar.font, item, &app_icons, tray_icons, cx, cy, 16.0 * s, bar.dark_text, s);
+                } else if let Some(p) = tray_icons.get(key) {
+                    sf.draw_icon_bilinear(&p, cx, cy, 16.0 * s, false, 0.0);
+                }
+            }
+            Hit::Ime => {
+                // macOS 紧凑输入法微边框胶囊（居中贴合文字宽度）
+                let cx = (r.left + r.right) / 2;
+                let half_w = (12.0 * s).round() as i32;
+                let badge = RECT {
+                    left: (cx - half_w).max(r.left + 2),
+                    top: (5.5 * s).round() as i32,
+                    right: (cx + half_w).min(r.right - 2),
+                    bottom: h - (5.5 * s).round() as i32,
+                };
+                sf.stroke_rrect(&badge, 4.0 * s, 1.0, (text.0, text.1, text.2, 0.42));
+                draw_transparent_text_aligned(&mut sf, &mut bar.scratch, &bar.status.ime, bar.font, r, text, TextAlign::Center, text_shadow, s);
+            }
+            Hit::Network => {
+                draw_glyph(&mut sf, if bar.status.network { Glyph::Wifi } else { Glyph::WifiOff }, (r.left + r.right) as f32 * 0.5, h as f32 * 0.5, 15.0 * s, text);
+            }
+            Hit::Brightness => {
+                draw_glyph(&mut sf, Glyph::Sun, (r.left + r.right) as f32 * 0.5, h as f32 * 0.5, 15.0 * s, text);
+            }
+            Hit::Volume => {
+                let (vol, mute) = bar.status.volume.unwrap_or((0, false));
+                let cx = (r.left + r.right) as f32 * 0.5;
+                draw_glyph(&mut sf, if mute || vol == 0 { Glyph::SpeakerMute } else { Glyph::Speaker }, cx, h as f32 * 0.5, 15.0 * s, text);
+            }
+            Hit::Battery => {
+                if let Some((pct, charging)) = bar.status.battery {
+                    let cx = r.left as f32 + 16.0 * s;
+                    draw_battery_filled(&mut sf, cx, h as f32 * 0.5, 15.0 * s, pct, charging, text);
+                    let rc = RECT {
+                        left: r.left + (28.0 * s) as i32,
+                        top: 0,
+                        right: r.right,
+                        bottom: h,
+                    };
+                    draw_transparent_text_aligned(&mut sf, &mut bar.scratch, &format!("{pct}%"), bar.font, &rc, text, TextAlign::Left, text_shadow, s);
+                }
+            }
+            Hit::Control => {
+                draw_glyph(&mut sf, Glyph::ControlCenter, (r.left + r.right) as f32 * 0.5, h as f32 * 0.5, 14.0 * s, text);
+            }
+            Hit::Clock => {
+                draw_transparent_text_aligned(&mut sf, &mut bar.scratch, &bar.status.clock, bar.font, r, text, TextAlign::Center, text_shadow, s);
+            }
+        }
+    }
+
+    // 顶部栏拖拽重排时的插入指示线与跟随图标
+    if let Some(drag) = &bar.drag {
+        let accent = accent_from_config(appearance);
+        sf.fill_rrect(
+            &RECT {
+                left: drag.insert_x - 1,
+                top: (4.0 * s) as i32,
+                right: drag.insert_x + 2,
+                bottom: h - (4.0 * s) as i32,
+            },
+            1.5 * s,
+            (accent.0, accent.1, accent.2, 0.98),
+        );
+        if let Some(item) = bar.tray_items.iter().find(|t| t.key == drag.key) {
+            crate::topbar::tray_popover::draw_shelf_item_icon(&mut sf, &mut bar.scratch, bar.font, item, &app_icons, tray_icons, drag.x as f32, h as f32 * 0.5, 18.0 * s, bar.dark_text, s);
+        }
+    }
+
+    // 毛玻璃态底边极细层次线
+    if bar.mode == ColorMode::Glass {
+        let line_col = if bar.dark_text { (0.0, 0.0, 0.0, 0.08) } else { (1.0, 1.0, 1.0, 0.14) };
+        sf.fill_rect(&RECT { left: 0, top: h - 1, right: w, bottom: h }, line_col);
+    }
+    drop(sf);
+    unsafe {
+        let _ = BitBlt(hdc, 0, 0, w, h, dc, 0, 0, SRCCOPY);
+        let _ = EndPaint(hwnd, &ps);
+    }
+}
