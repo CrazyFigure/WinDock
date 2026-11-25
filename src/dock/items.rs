@@ -83,7 +83,7 @@ fn env_path(var: &str) -> Option<PathBuf> {
     std::env::var_os(var).map(PathBuf::from)
 }
 
-/// 首次运行种子固定项：访达 + 常见浏览器/编辑器（存在才加入）。
+/// 首次运行种子固定项：文件管理器与已安装的常见浏览器、编辑器。
 pub fn seed_items() -> DockItems {
     let mut items = DockItems::default();
     let mut order = 0u32;
@@ -93,7 +93,7 @@ pub fn seed_items() -> DockItems {
         order += 1;
         items.items.push(it);
     };
-    push("app", "C:\\Windows\\explorer.exe", "应用管理器", &mut items);
+    push("app", "C:\\Windows\\explorer.exe", crate::win32::FILE_MANAGER_NAME, &mut items);
     let candidates: [(PathBuf, &str); 5] = [
         (
             env_path("ProgramFiles(x86)")
@@ -178,8 +178,9 @@ pub fn build_entries(items: &DockItems, apps: &[RuntimeApp], show_running: bool)
                 let exe = resolve_item_exe(item);
                 let key = exe.to_lowercase();
                 let app = apps.iter().find(|a| a.key == key);
-                let is_explorer = key.ends_with("\\explorer.exe") || key == "explorer.exe";
-                let label = if item.label.is_empty() || (is_explorer && item.label == "访达") {
+                let label = if crate::win32::is_legacy_file_manager_label(&exe, &item.label) {
+                    crate::win32::FILE_MANAGER_NAME.into()
+                } else if item.label.is_empty() {
                     app.map(|a| a.label.clone())
                         .unwrap_or_else(|| crate::monitor::exe_display_name(&key))
                 } else {
@@ -259,7 +260,7 @@ pub fn launch_item(item: &DockItem) -> bool {
     match item.kind.as_str() {
         "uwp" => open_shell_path("open", "explorer.exe", Some(&format!("shell:AppsFolder\\{}", item.aumid))),
         _ => {
-            // 访达（explorer.exe 无参数）直接打开「此电脑」窗口
+            // 文件管理器（explorer.exe 无参数）直接打开「此电脑」窗口。
             let is_explorer = item.target.to_lowercase().ends_with("\\explorer.exe") || item.target.eq_ignore_ascii_case("explorer.exe");
             if is_explorer && item.args.is_empty() {
                 return open_shell_path("open", "explorer.exe", Some("shell:MyComputerFolder"));
@@ -506,11 +507,11 @@ mod tests {
     }
 
     #[test]
-    fn seed_items_uses_app_manager_label() {
+    fn seed_items_uses_file_manager_label() {
         let seeded = seed_items();
         let first = seeded.items.first().expect("seeded items should not be empty");
         assert!(first.target.to_lowercase().ends_with("explorer.exe"));
-        assert_eq!(first.label, "应用管理器");
+        assert_eq!(first.label, "文件管理器");
     }
 }
 

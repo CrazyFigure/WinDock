@@ -491,11 +491,11 @@ impl Store {
         let mut items = read_json::<DockItems>(&p, "Dock 固定项")
             .or_else(|| read_json::<DockItems>(&bak_of(&p), "Dock 固定项备份"))
             .unwrap_or_default();
-        // 自动迁移历史遗留的「访达」名称为「应用管理器」
+        // 迁移旧版本保存的 Explorer 默认名称，保留用户自定义的标签。
         let mut migrated = false;
         for it in &mut items.items {
-            if it.target.to_lowercase().ends_with("explorer.exe") && it.label == "访达" {
-                it.label = "应用管理器".into();
+            if crate::win32::is_legacy_file_manager_label(&it.target, &it.label) {
+                it.label = crate::win32::FILE_MANAGER_NAME.into();
                 migrated = true;
             }
         }
@@ -540,5 +540,23 @@ mod tests {
         assert_eq!(std::fs::read(&p).unwrap(), b"{\"a\":2}");
         assert_eq!(std::fs::read(bak_of(&p)).unwrap(), b"{\"a\":1}");
         assert!(!p.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn load_dock_items_migrates_only_legacy_explorer_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf());
+        let items: DockItems = serde_json::from_str(r#"{"items":[
+            {"id":"old","kind":"app","target":"C:/Windows/EXPLORER.EXE","label":"应用管理器"},
+            {"id":"older","kind":"app","target":"explorer.exe","label":"访达"},
+            {"id":"custom","kind":"app","target":"explorer.exe","label":"我的文件"},
+            {"id":"other","kind":"app","target":"myexplorer.exe","label":"应用管理器"}
+        ]}"#).unwrap();
+        assert!(store.save_dock_items(&items));
+        let migrated = store.load_dock_items();
+        let labels: Vec<_> = migrated.items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(labels, ["文件管理器", "文件管理器", "我的文件", "应用管理器"]);
+        let saved: DockItems = read_json(&store.dock_items_path(), "Dock 固定项").unwrap();
+        assert_eq!(saved.items[0].label, "文件管理器");
     }
 }

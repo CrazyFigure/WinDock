@@ -16,6 +16,18 @@ use windows::Win32::System::Diagnostics::Debug::{
 };
 use windows::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath};
 
+/// Windows 文件管理器在 Dock、顶部栏和设置页中的统一显示名。
+pub const FILE_MANAGER_NAME: &str = "文件管理器";
+
+/// 只迁移 Explorer 入口曾经使用过的默认名称，保留自定义名称。
+pub fn is_legacy_file_manager_label(target: &str, label: &str) -> bool {
+    target
+        .rsplit(['\\', '/'])
+        .next()
+        .is_some_and(|file| file.eq_ignore_ascii_case("explorer.exe"))
+        && matches!(label, "访达" | "应用管理器")
+}
+
 /// 转为以 0 结尾的 UTF-16。
 pub fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
     s.as_ref().encode_wide().chain(std::iter::once(0)).collect()

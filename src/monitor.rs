@@ -95,7 +95,7 @@ fn is_desktop_class(class: &str) -> bool {
 /// 常见 Windows 内置应用精准中文名映射。
 fn known_system_name(file_lower: &str) -> Option<&'static str> {
     Some(match file_lower {
-        "explorer.exe" => "应用管理器",
+        "explorer.exe" => crate::win32::FILE_MANAGER_NAME,
         "systemsettings.exe" => "设置",
         "windowsterminal.exe" => "终端",
         "notepad.exe" => "记事本",
@@ -654,7 +654,7 @@ mod tests {
     #[test]
     fn system_names_and_host_cleanup() {
         assert_eq!(app_display_name(r"C:\Windows\SystemApps\SystemSettings.exe", None), "设置");
-        assert_eq!(app_display_name(r"C:\Windows\explorer.exe", None), "应用管理器");
+        assert_eq!(app_display_name(r"C:\Windows\explorer.exe", None), "文件管理器");
         assert_eq!(app_display_name(r"C:\Windows\System32\ApplicationFrameHost.exe", Some("设置")), "设置");
         assert_eq!(app_display_name(r"C:\Windows\System32\applicationframehost.exe", None), "系统应用");
         assert_eq!(clean_pe_name("Microsoft Windows Operating System"), None);

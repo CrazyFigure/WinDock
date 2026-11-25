@@ -533,26 +533,25 @@ pub fn capture_screen_rect(x: i32, y: i32, w: i32, h: i32) -> Option<IconPixels>
             return None;
         }
         let slice = std::slice::from_raw_parts(ptr as *const u8, (w * h * 4) as usize);
-        let mut px = slice.to_vec();
-        // 截图为不透明图：按左上角像素做色键生成 alpha，使托盘图标在任意底色上自然。
-        let (kb, kg, kr) = (px[0], px[1], px[2]);
-        for p in px.chunks_exact_mut(4) {
-            let d = (p[0] as i32 - kb as i32).abs() + (p[1] as i32 - kg as i32).abs() + (p[2] as i32 - kr as i32).abs();
-            let a = if d < 24 { 0 } else { 255 };
-            p[3] = a as u8;
-            if a == 0 {
-                p[0] = 0;
-                p[1] = 0;
-                p[2] = 0;
-            }
-        }
+        let px = slice.to_vec();
         let _ = DeleteObject(HGDIOBJ(bmp.0));
-        Some(IconPixels {
-            w: w as u32,
-            h: h as u32,
-            px: Arc::new(px),
-        })
+        key_out_icon_background(px, w, h)
     }
+}
+
+/// 将不透明的原生托盘截图转为带透明背景的图标像素。
+pub fn key_out_icon_background(mut px: Vec<u8>, w: i32, h: i32) -> Option<IconPixels> {
+    let background = px.get(..3)?;
+    let (kb, kg, kr) = (background[0], background[1], background[2]);
+    for pixel in px.chunks_exact_mut(4) {
+        let distance = pixel[0].abs_diff(kb) as u16 + pixel[1].abs_diff(kg) as u16 + pixel[2].abs_diff(kr) as u16;
+        if distance < 24 {
+            pixel.fill(0);
+        } else {
+            pixel[3] = 255;
+        }
+    }
+    Some(IconPixels { w: w as u32, h: h as u32, px: Arc::new(px) })
 }
 
 /// 图标内容边界归一化（复用 WinLaunchpad 算法）：裁剪透明留白、尖角矩形圆角化、

@@ -269,11 +269,11 @@ fn dock_kind_label(item: &crate::config::DockItem) -> &'static str {
 }
 
 fn dock_label(item: &crate::config::DockItem) -> String {
-    let is_explorer = item.target.to_lowercase().ends_with("explorer.exe");
+    // 设置页也可能显示尚未保存的旧标签，按 Dock 的规则显示。
+    if crate::win32::is_legacy_file_manager_label(&item.target, &item.label) {
+        return crate::win32::FILE_MANAGER_NAME.into();
+    }
     if !item.label.is_empty() {
-        if is_explorer && item.label == "访达" {
-            return "应用管理器".into();
-        }
         return item.label.clone();
     }
     if item.kind == "folder" || item.kind == "file" {
@@ -1105,7 +1105,7 @@ impl Dlg {
             Hit::DockDown => (g.small[3].unwrap_or(g.row), "下移选中的固定项".to_string()),
             Hit::DockRemove => (g.small[2].unwrap_or(g.row), "从 Dock 移除选中的固定项".to_string()),
             Hit::DockAdd => (g.small[1].unwrap_or(g.row), "选择要固定到 Dock 的程序、快捷方式或文件夹".to_string()),
-            Hit::DockReset => (g.small[0].unwrap_or(g.row), "恢复默认固定项（应用管理器与常见浏览器 / 编辑器）".to_string()),
+            Hit::DockReset => (g.small[0].unwrap_or(g.row), "恢复默认固定项（文件管理器与常见浏览器 / 编辑器）".to_string()),
             Hit::DockRow(i) => {
                 let sorted = app.dock_items.sorted();
                 let it = sorted.get(i)?;

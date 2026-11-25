@@ -34,7 +34,7 @@ use crate::taskbar::{self, TaskbarController, WM_APP_TASKBAR_RESHOW};
 use crate::topbar::color_sync::{self, Rgb};
 use crate::topbar::panel::{NetworkData, PanelAction, PanelKind, StatusPanel};
 use crate::topbar::status;
-use crate::topbar::tray_mirror::{self, TrayIconCache, TrayItem};
+use crate::topbar::tray_mirror::{self, TrayIconCache, TrayInvocation, TrayItem, TraySnapshot};
 use crate::topbar::tray_popover::Popover;
 use crate::topbar::{Hit, TopBar, TopbarDrag};
 use crate::tray::Tray;
@@ -47,7 +47,6 @@ pub const WM_APP_IPC: u32 = WM_APP + 1;
 pub const WM_APP_TRAY: u32 = WM_APP + 2;
 pub const WM_APP_COLOR: u32 = WM_APP + 32;
 pub const WM_APP_UPDATE: u32 = WM_APP + 50;
-pub const WM_APP_REHIDE_TEMP_TASKBAR: u32 = WM_APP + 55;
 
 pub const IPC_SETTINGS: usize = 1;
 pub const IPC_TOGGLE_DOCK: usize = 2;
@@ -248,6 +247,12 @@ fn entries_equal(a: &crate::dock::items::EntryList, b: &crate::dock::items::Entr
         && a.apps.iter().zip(b.apps.iter()).all(|(x, y)| x.label == y.label)
 }
 
+struct TrayClick {
+    restore_taskbar: bool,
+    right: bool,
+    screen: POINT,
+}
+
 pub struct App {
     pub hwnd: HWND,
     pub mutex: HANDLE,
@@ -284,7 +289,10 @@ pub struct App {
     pub last_clock: String,
     pub last_ime: String,
     pub tray_raw_items: Vec<TrayItem>,
+    tray_snapshot_generation: u64,
     pub last_tray_refresh: Option<Instant>,
+    // 原生点击完成后，按点击前的任务栏状态恢复并处理普通窗口的回退。
+    tray_click: Option<TrayClick>,
     pub temp_show_until: Option<Instant>,
     pub display_dirty_at: Option<Instant>,
     pub cursor_monitor: isize,
@@ -411,7 +419,9 @@ pub fn run(open_settings: bool) -> i32 {
         last_clock: String::new(),
         last_ime: String::new(),
         tray_raw_items: Vec::new(),
+        tray_snapshot_generation: 0,
         last_tray_refresh: None,
+        tray_click: None,
         temp_show_until: None,
         display_dirty_at: None,
         cursor_monitor: 0,
@@ -724,7 +734,7 @@ impl App {
         if !cfg.show_folders {
             list.right.retain(|f| !matches!(f.kind, FuncKind::Folder(_)));
         }
-        // 已设置 WinLaunchpad 且未自定义固定项时：启动台居最左，应用管理器紧随第二
+        // 已设置 WinLaunchpad 且未自定义固定项时，启动台居最左，文件管理器紧随其后。
         if !self.config.general.winlaunchpad_path.is_empty()
             && !self.dock_items.items.iter().any(|i| i.kind == "winlaunchpad")
         {
@@ -744,7 +754,7 @@ impl App {
                     .as_deref()
                     .is_some_and(|p| p.ends_with("\\explorer.exe"))
                     || e.icon_key.to_lowercase().contains("explorer.exe")
-                    || e.label == "应用管理器"
+                    || e.label == crate::win32::FILE_MANAGER_NAME
             }) {
                 let real_pos = exp_pos + 1;
                 if real_pos != 1 {
@@ -956,6 +966,10 @@ impl App {
 
     fn toggle_taskbar(&mut self) {
         if self.taskbar.active() {
+            // 原生点击返回时尊重用户在此期间手动选择的任务栏状态。
+            if let Some(click) = &mut self.tray_click {
+                click.restore_taskbar = false;
+            }
             let show = !self.taskbar.temporary_show();
             self.taskbar.set_temporary_show(show);
             self.temp_show_until = None;
@@ -986,24 +1000,17 @@ impl App {
     // ---------- 托盘镜像 ----------
 
     pub fn refresh_tray(&mut self) {
-        if self.topbars.is_empty() {
+        if self.topbars.is_empty() || self.tray_click.is_some() {
             return;
         }
         self.last_tray_refresh = Some(Instant::now());
-        tray_mirror::spawn_refresh(self.hwnd);
+        tray_mirror::spawn_refresh(self.hwnd, self.tray_icons.clone());
     }
 
-    fn on_tray_items(&mut self, lparam: isize) {
-        let items = *unsafe { Box::from_raw(lparam as *mut Vec<TrayItem>) };
-        let changed = if self.taskbar.any_visible() || !self.taskbar.active() {
-            tray_mirror::capture_icons(&items, &self.tray_icons, tray_mirror::bump_generation())
-        } else {
-            false
-        };
-        self.tray_raw_items = items;
-        self.sync_shelf_items();
-        if changed {
-            self.redraw_shelf_views();
+    /// 同步可见托盘的扫描结果，保留当前未展开区域的缓存。
+    fn apply_tray_snapshot(&mut self, snapshot: TraySnapshot) {
+        if snapshot.apply(&mut self.tray_raw_items, &mut self.tray_snapshot_generation) {
+            self.sync_shelf_items();
         }
     }
 
@@ -1431,7 +1438,8 @@ impl App {
                     tray_mirror::spawn_live_window_icon_refresh(self.hwnd, jobs, self.tray_icons.clone());
                 }
             }
-            let due = self.last_tray_refresh.map(|t| t.elapsed() >= Duration::from_secs(if taskbar_open { 4 } else { 6 })).unwrap_or(true);
+            // 托盘可见时定期采集原生动态像素，即使应用提示文字没有变化。
+            let due = self.last_tray_refresh.map(|t| t.elapsed() >= Duration::from_secs(if taskbar_open { 2 } else { 6 })).unwrap_or(true);
             if (popover_open || taskbar_open) && due {
                 self.refresh_tray();
             }
@@ -1630,6 +1638,9 @@ impl App {
     fn on_taskbar_created(&mut self) {
         self.tray.add();
         self.taskbar.on_taskbar_created();
+        // Explorer 重建会注销旧托盘按钮，等待新 Explorer 发布实际条目。
+        self.tray_raw_items.clear();
+        self.sync_shelf_items();
         for bar in &mut self.topbars {
             // Explorer 重启后 AppBar 注册失效，需重新 ABM_NEW
             bar.appbar = false;
@@ -2467,49 +2478,54 @@ impl App {
         }
     }
 
-    /// 以原版应用行为执行顶部栏或收纳浮层图标的单击 / 右键菜单：
-    /// 1. 拥有真实 UIA 托盘按钮时，直接透传原生左/右键交互（若系统任务栏已隐藏则短暂呼出定位后再恢复隐藏）；
-    /// 2. 否则针对应用窗口：左键前置/最小化切换，右键弹出该窗口原生系统菜单。
+    /// 右键先在实际托盘中找应用。普通窗口保留原有的系统菜单和左键切换行为。
     fn invoke_tray_native(&mut self, key: &str, right: bool, sx: i32, sy: i32) {
         let Some(item) = self.topbars.first().and_then(|b| b.tray_items.iter().find(|t| t.key == key)).cloned() else {
             return;
         };
-        if item.element.is_some() && (right || item.app_hwnds.is_empty()) {
-            let need_temp = self.taskbar.active() && !self.taskbar.temporary_show();
-            if need_temp {
-                self.taskbar.set_temporary_show(true);
-            }
-            let main_hwnd = self.hwnd.0 as isize;
-            let cache = self.tray_icons.clone();
-            std::thread::spawn(move || {
-                if need_temp {
-                    std::thread::sleep(std::time::Duration::from_millis(60));
-                }
-                if right {
-                    tray_mirror::invoke_right(&item);
-                } else {
-                    tray_mirror::invoke_left(&item);
-                }
-                if need_temp {
-                    std::thread::sleep(std::time::Duration::from_millis(if right { 220 } else { 180 }));
-                    // 趁任务栏仍处于临时显示状态重新采样该托盘图标（捕获如 VPN 状态切换变化）
-                    if tray_mirror::capture_icons(&[item], &cache, tray_mirror::bump_generation()) {
-                        unsafe {
-                            let _ = PostMessageW(HWND(main_hwnd as *mut _), tray_mirror::WM_APP_LIVE_ICON_CHANGED, WPARAM(0), LPARAM(0));
-                        }
-                    }
-                    unsafe {
-                        let _ = PostMessageW(HWND(main_hwnd as *mut _), WM_APP_REHIDE_TEMP_TASKBAR, WPARAM(0), LPARAM(0));
-                        let _ = PostMessageW(HWND(main_hwnd as *mut _), tray_mirror::WM_APP_TRAY_ITEMS, WPARAM(0), LPARAM(0));
-                    }
-                }
-            });
+        if !right && !item.app_hwnds.is_empty() {
+            self.invoke_window_shelf_item(&item, false, POINT { x: sx, y: sy });
             return;
         }
+        if self.tray_click.is_some() {
+            return;
+        }
+        let restore_taskbar = self.taskbar.active() && !self.taskbar.temporary_show();
+        if restore_taskbar {
+            self.taskbar.set_temporary_show(true);
+        }
+        let screen = POINT { x: sx, y: sy };
+        if tray_mirror::spawn_invocation(self.hwnd, item.clone(), right, self.tray_icons.clone()) {
+            self.tray_click = Some(TrayClick { restore_taskbar, right, screen });
+        } else {
+            if restore_taskbar {
+                self.taskbar.set_temporary_show(false);
+            }
+            self.invoke_window_shelf_item(&item, right, screen);
+        }
+    }
+
+    fn on_tray_invoked(&mut self, result: TrayInvocation) {
+        let Some(click) = self.tray_click.take() else { return };
+        if click.restore_taskbar {
+            self.taskbar.set_temporary_show(false);
+        }
+        self.apply_tray_snapshot(result.snapshot);
+        // 普通窗口才回退到窗口菜单。
+        if result.ordinary_window {
+            self.invoke_window_shelf_item(&result.target, click.right, click.screen);
+        }
+    }
+
+    /// 普通窗口沿用系统菜单或前置、最小化切换。
+    fn invoke_window_shelf_item(&self, item: &TrayItem, right: bool, screen: POINT) {
         if let Some(&first_h) = item.app_hwnds.first() {
             let target = HWND(first_h as *mut _);
+            if !unsafe { IsWindow(target).as_bool() } {
+                return;
+            }
             if right {
-                self.show_native_window_system_menu(target, sx, sy);
+                self.show_native_window_system_menu(target, screen.x, screen.y);
             } else {
                 let is_fg = unsafe { GetForegroundWindow() == target && !IsIconic(target).as_bool() };
                 if is_fg {
@@ -2672,7 +2688,7 @@ impl App {
                     }
                     None => self.popup_at(
                         vec![
-                            MenuItem::normal(M_NEW_FINDER, "打开应用管理器"),
+                            MenuItem::normal(M_NEW_FINDER, "打开文件管理器"),
                             MenuItem::normal(M_SETTINGS, "WinDockFinder设置"),
                         ],
                         MenuCtx::None,
@@ -2683,7 +2699,7 @@ impl App {
             }
             Hit::MenuFile => {
                 let mut v = vec![
-                    MenuItem::normal(M_NEW_FINDER, "新建应用管理器窗口"),
+                    MenuItem::normal(M_NEW_FINDER, "新建文件管理器窗口"),
                     MenuItem::normal(M_OPEN_TERMINAL, "打开终端"),
                 ];
                 let ctx = if let Some(fg) = self.foreground_window() {
@@ -3163,17 +3179,18 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         crate::dock::icons::WM_APP_ICON => app.on_icon(lparam.0),
         crate::monitor::WM_APP_MONITOR => app.on_monitor_event(),
         WM_APP_TASKBAR_RESHOW => app.taskbar.run_rehide(),
-        WM_APP_REHIDE_TEMP_TASKBAR => {
-            if app.taskbar.active() {
-                app.taskbar.set_temporary_show(false);
-            }
-        }
         crate::topbar::status::WM_APP_STATUS => {}
         crate::topbar::tray_mirror::WM_APP_TRAY_ITEMS => {
             if lparam.0 != 0 {
-                app.on_tray_items(lparam.0);
-            } else {
-                app.refresh_tray();
+                let snapshot = *Box::from_raw(lparam.0 as *mut TraySnapshot);
+                if app.tray_click.is_none() {
+                    app.apply_tray_snapshot(snapshot);
+                }
+            }
+        }
+        crate::topbar::tray_mirror::WM_APP_TRAY_INVOKED => {
+            if lparam.0 != 0 {
+                app.on_tray_invoked(*Box::from_raw(lparam.0 as *mut TrayInvocation));
             }
         }
         crate::topbar::tray_mirror::WM_APP_LIVE_ICON_CHANGED => app.redraw_shelf_views(),
