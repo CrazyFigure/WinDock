@@ -42,17 +42,16 @@ pub fn paint(hwnd: HWND, bar: &mut TopBar, _cfg: &TopbarCfg, appearance: &Appear
     let text: Rgba = if bar.dark_text { rgb(0x1D1D1F, 1.0) } else { rgb(0xF5F5F7, 1.0) };
     let text_dim: Rgba = if bar.dark_text { rgb(0x3A3A3C, 1.0) } else { rgb(0xD1D1D6, 1.0) };
 
-    if bar.mode == ColorMode::Fused {
-        let c = bar.cur_fused;
-        sf.fill_rect(
-            &RECT { left: 0, top: 0, right: w, bottom: h },
-            (c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0, 1.0),
-        );
+    let bg_rgb = if bar.mode == ColorMode::Fused {
+        bar.cur_fused
     } else {
-        // 纯净 macOS 材质：固定纯色底，避免透出壁纸造成左右颜色不统一
-        let (r, g, b, _) = appearance.dock_tint();
-        sf.fill_rect(&RECT { left: 0, top: 0, right: w, bottom: h }, (r, g, b, 1.0));
-    }
+        appearance.topbar_base_rgb()
+    };
+    // 统一不透明纯色填充（桌面为纯净主题色，最大化为窗口融合色），保证整条顶栏颜色均匀一致
+    sf.fill_rect(
+        &RECT { left: 0, top: 0, right: w, bottom: h },
+        (bg_rgb.r as f32 / 255.0, bg_rgb.g as f32 / 255.0, bg_rgb.b as f32 / 255.0, 1.0),
+    );
 
     // 激活态高亮（面板/浮层展开时的常驻胶囊底色）
     if let Some(ah) = &bar.active_hit {
@@ -93,7 +92,7 @@ pub fn paint(hwnd: HWND, bar: &mut TopBar, _cfg: &TopbarCfg, appearance: &Appear
     }
 
     // 左侧：单色徽标 + 前台应用名 + 文件/窗口/前往 菜单；右侧：托盘收纳/状态图标/时钟
-    let text_shadow = bar.mode == ColorMode::Glass && !bar.dark_text;
+    let text_shadow = false;
     let popover_open = bar.popover.as_ref().map(|p| p.visible).unwrap_or(false);
     let app_icons = crate::app::app_icon_cache();
     for (r, hit) in bar.hits.iter() {
@@ -195,9 +194,9 @@ pub fn paint(hwnd: HWND, bar: &mut TopBar, _cfg: &TopbarCfg, appearance: &Appear
         }
     }
 
-    // 毛玻璃态底边极细层次线
+    // 桌面统一态底边极细层次线
     if bar.mode == ColorMode::Glass {
-        let line_col = if bar.dark_text { (0.0, 0.0, 0.0, 0.08) } else { (1.0, 1.0, 1.0, 0.14) };
+        let line_col = if bar.dark_text { (0.0, 0.0, 0.0, 0.08) } else { (1.0, 1.0, 1.0, 0.10) };
         sf.fill_rect(&RECT { left: 0, top: h - 1, right: w, bottom: h }, line_col);
     }
     drop(sf);

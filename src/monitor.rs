@@ -626,8 +626,12 @@ unsafe extern "system" fn on_event(
         // 遮罩、提示和原生托盘显隐都不改变运行应用列表，避免重复刷新 Dock。
         return;
     }
-    // 前台切换事件立即投递不丢帧，其余高频移动事件保留 35ms 节流
-    if event != EVENT_SYSTEM_FOREGROUND {
+    // 前台切换与最小化/还原事件（含 Win+D 切换桌面与还原）立即投递不丢帧，其余高频移动事件保留 35ms 节流
+    let urgent = matches!(
+        event,
+        EVENT_SYSTEM_FOREGROUND | EVENT_SYSTEM_MINIMIZESTART | EVENT_SYSTEM_MINIMIZEEND
+    );
+    if !urgent {
         let mut last = LAST_POST.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(t) = *last {
             if t.elapsed().as_millis() < 35 {

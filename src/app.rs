@@ -59,6 +59,10 @@ const TIMER_SLOW: usize = 2;
 const TIMER_EDGE: usize = 3;
 const TIMER_TRAY_CONTEXT: usize = 4;
 const TIMER_TRAY_FLASH: usize = 6;
+/// Win+D 切换桌面或窗口还原动画结束后的状态复查定时器。
+const TIMER_MONITOR_SETTLE: usize = 7;
+/// 最大化窗口取色二次校验定时器（覆盖还原动画滞后导致首次采到壁纸残影的场景）。
+const TIMER_COLOR_RECHECK: usize = 8;
 const HK_DOCK: i32 = 7001;
 const HK_TOPBAR: i32 = 7002;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -633,6 +637,8 @@ impl App {
             let _ = KillTimer(self.hwnd, TIMER_FRAME);
             let _ = KillTimer(self.hwnd, TIMER_SLOW);
             let _ = KillTimer(self.hwnd, TIMER_EDGE);
+            let _ = KillTimer(self.hwnd, TIMER_MONITOR_SETTLE);
+            let _ = KillTimer(self.hwnd, TIMER_COLOR_RECHECK);
         }
         self.frame_on = false;
         self.edge_timer_on = false;
@@ -877,22 +883,35 @@ impl App {
         self.sync_edge_timer();
         // 最大化窗口自动取色融合
         let cfg = &self.config.topbar;
+        let base_rgb = self.config.appearance.topbar_base_rgb();
         let fg = self.snap.foreground;
+        let hmon = self.snap.maximized_monitor;
         let want_fused = cfg.adaptive_maximized_color
-            && self.snap.maximized_monitor != 0
+            && hmon != 0
             && !fullscreen
             && !color_sync::is_excluded(&self.snap.foreground_exe, &cfg.adaptive_color_exclude);
         if want_fused {
-            if self.fused_hwnd != fg {
+            let missing_fused = self
+                .topbars
+                .iter()
+                .any(|b| b.monitor.hmonitor.0 as isize == hmon && b.mode != crate::topbar::ColorMode::Fused);
+            if self.fused_hwnd != fg || missing_fused {
                 self.fused_hwnd = fg;
                 self.spawn_color_sample(true);
+                // 延迟 280ms 复查一次标题栏颜色，避免 Win+D 还原动画期间首次采样采到壁纸
+                unsafe {
+                    let _ = SetTimer(self.hwnd, TIMER_COLOR_RECHECK, 280, None);
+                }
             }
         } else {
             let had_fused = self.fused_hwnd != 0 || self.topbars.iter().any(|b| b.mode == crate::topbar::ColorMode::Fused);
             self.fused_hwnd = 0;
             self.color_token += 1; // 使在途采样失效
+            unsafe {
+                let _ = KillTimer(self.hwnd, TIMER_COLOR_RECHECK);
+            }
             for bar in &mut self.topbars {
-                bar.set_fused_target(None, false);
+                bar.set_fused_target(None, base_rgb, true);
                 bar.dark_text = pure_dark_text;
                 invalidate(bar.hwnd);
             }
@@ -959,16 +978,16 @@ impl App {
             return;
         }
         let hmon = self.snap.maximized_monitor;
-        let first = self.topbars.iter().all(|b| b.mode != crate::topbar::ColorMode::Fused);
+        let base_rgb = self.config.appearance.topbar_base_rgb();
+        let instant = self.config.topbar.color_transition_ms == 0 || self.config.appearance.reduce_motion;
         for bar in &mut self.topbars {
             if bar.monitor.hmonitor.0 as isize == hmon {
-                bar.set_fused_target(Some(rgb), false);
+                bar.set_fused_target(Some(rgb), base_rgb, instant);
             } else {
-                bar.set_fused_target(None, false);
+                bar.set_fused_target(None, base_rgb, true);
             }
             invalidate(bar.hwnd);
         }
-        let _ = first;
         self.ensure_frame();
     }
 
@@ -1447,6 +1466,14 @@ impl App {
 
     fn on_slow(&mut self) {
         self.slow_ticks += 1;
+        // 1Hz 轻量状态校对：兜底 Win+D 等系统级切换偶发漏掉 WinEvent 的场景
+        if monitor::refresh() {
+            self.snap = monitor::snapshot();
+            self.refresh_entries();
+            self.sync_shelf_items();
+            self.on_state_changed();
+            self.ensure_frame();
+        }
         // 守护进程意外退出：先恢复任务栏，本会话暂停隐藏
         if let Some(h) = self.guard_handle {
             unsafe {
@@ -1784,6 +1811,30 @@ impl App {
                     self.repaint_tray_frames();
                 }
             }
+            TIMER_MONITOR_SETTLE => {
+                unsafe {
+                    let _ = KillTimer(self.hwnd, TIMER_MONITOR_SETTLE);
+                }
+                if monitor::refresh() {
+                    self.snap = monitor::snapshot();
+                    self.refresh_entries();
+                    self.sync_shelf_items();
+                    self.on_state_changed();
+                    self.ensure_frame();
+                }
+            }
+            TIMER_COLOR_RECHECK => {
+                unsafe {
+                    let _ = KillTimer(self.hwnd, TIMER_COLOR_RECHECK);
+                }
+                if self.fused_hwnd != 0
+                    && self.config.topbar.adaptive_maximized_color
+                    && !self.snap.fullscreen
+                    && !self.color_busy
+                {
+                    self.spawn_color_sample(false);
+                }
+            }
             _ => {}
         }
     }
@@ -1875,6 +1926,10 @@ impl App {
         self.sync_shelf_items();
         self.on_state_changed();
         self.ensure_frame();
+        // 安排 200ms 尾随状态复查，确保 Win+D 还原动画结束后前台与最大化态完整同步
+        unsafe {
+            let _ = SetTimer(self.hwnd, TIMER_MONITOR_SETTLE, 200, None);
+        }
     }
 
     pub fn on_update(&mut self, lparam: isize) {

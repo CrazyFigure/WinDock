@@ -253,13 +253,22 @@ impl Appearance {
         }
     }
 
-    /// Dock 毛玻璃胶囊底色（深色模式：深灰半透明；浅色：亮白半透明）。
+    /// Dock 胶囊底色（深色模式：深灰半透明；浅色：亮白半透明）。
     pub fn dock_tint(&self) -> (f32, f32, f32, f32) {
         let a = self.opacity;
         if self.is_dark() {
             (0.09, 0.10, 0.12, a)
         } else {
             (0.97, 0.97, 0.98, a)
+        }
+    }
+
+    /// 顶部栏在桌面/非最大化态下的统一纯净底色（完全不透明，避免透出壁纸造成左右色差）。
+    pub fn topbar_base_rgb(&self) -> crate::topbar::color_sync::Rgb {
+        if self.is_dark() {
+            crate::topbar::color_sync::Rgb::new(0x1E, 0x1F, 0x24)
+        } else {
+            crate::topbar::color_sync::Rgb::new(0xF3, 0xF4, 0xF7)
         }
     }
 }

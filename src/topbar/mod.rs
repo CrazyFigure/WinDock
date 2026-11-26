@@ -163,12 +163,12 @@ impl TopBar {
                 drag: None,
                 popover: None,
                 mode: ColorMode::Glass,
-                fused_from: Rgb::new(0, 0, 0),
-                fused_to: Rgb::new(0, 0, 0),
+                fused_from: appearance.topbar_base_rgb(),
+                fused_to: appearance.topbar_base_rgb(),
                 fused_t: 1.0,
                 fused_target: None,
-                cur_fused: Rgb::new(0xF3, 0xF3, 0xF3),
-                dark_text: true,
+                cur_fused: appearance.topbar_base_rgb(),
+                dark_text: !appearance.is_dark(),
                 active_app: "桌面".into(),
                 status: StatusSnapshot::default(),
                 tray_items: Vec::new(),
@@ -335,29 +335,36 @@ impl TopBar {
 
     // ---------- 取色融合 ----------
 
-    /// 设置最大化融合目标色（None = 回到毛玻璃态）。
-    pub fn set_fused_target(&mut self, target: Option<Rgb>, instant: bool) {
+    /// 设置最大化融合目标色（None = 回到桌面统一纯净色）。
+    pub fn set_fused_target(&mut self, target: Option<Rgb>, base: Rgb, instant: bool) {
         let same = match (target, self.fused_target) {
-            (None, None) => true,
-            (Some(a), Some(b)) => a == b,
+            (None, None) => self.mode == ColorMode::Glass && self.cur_fused == base,
+            (Some(a), Some(b)) => self.mode == ColorMode::Fused && a == b,
             _ => false,
         };
         if same && self.fused_t >= 1.0 {
             return;
         }
-        self.fused_from = self.cur_fused;
-        self.fused_to = target.unwrap_or(self.cur_fused);
+        // 从非融合态进入最大化时以当前桌面统一色为过渡起点，避免沿用陈旧窗口色闪烁
+        self.fused_from = if self.mode == ColorMode::Fused { self.cur_fused } else { base };
         self.fused_target = target;
         if let Some(t) = target {
             self.mode = ColorMode::Fused;
+            self.fused_to = t;
             self.fused_t = if instant { 1.0 } else { 0.0 };
             if instant {
                 self.cur_fused = t;
                 self.dark_text = t.use_dark_text();
+            } else {
+                self.cur_fused = self.fused_from;
+                self.dark_text = t.use_dark_text();
             }
         } else {
             self.mode = ColorMode::Glass;
+            self.fused_to = base;
+            self.cur_fused = base;
             self.fused_t = 1.0;
+            self.dark_text = base.use_dark_text();
         }
         unsafe {
             let _ = InvalidateRect(self.hwnd, None, false);
