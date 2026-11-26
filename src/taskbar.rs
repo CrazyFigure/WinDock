@@ -3,7 +3,7 @@
 //! 安全策略：先创建双栏与守护进程并落盘 `taskbar_recovery.json`，再隐藏任务栏；
 //! 退出/崩溃/卡死时按记录 100% 还原任务栏可见性与原始 `ABS_AUTOHIDE` 状态。
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -90,16 +90,20 @@ pub fn window_pid(hwnd: HWND) -> u32 {
 /// 枚举本会话 Explorer 的全部任务栏窗口（主屏 Shell_TrayWnd + 副屏 Shell_SecondaryTrayWnd）。
 pub fn find_taskbars() -> Vec<HWND> {
     let mut out = Vec::new();
+    if let Some(main) = primary_taskbar() {
+        out.push(main);
+    }
     unsafe {
-        if let Ok(main) = FindWindowW(w!("Shell_TrayWnd"), None) {
-            if is_explorer_window(main) {
-                out.push(main);
-            }
-        }
         let list = &mut out as *mut Vec<HWND> as isize;
         let _ = windows::Win32::UI::WindowsAndMessaging::EnumWindows(Some(enum_secondary), LPARAM(list));
     }
     out
+}
+
+/// 原生通知区所在的主任务栏，确认它属于当前 Explorer。
+pub fn primary_taskbar() -> Option<HWND> {
+    let hwnd = unsafe { FindWindowW(w!("Shell_TrayWnd"), None).ok()? };
+    is_explorer_window(hwnd).then_some(hwnd)
 }
 
 unsafe extern "system" fn enum_secondary(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -265,6 +269,7 @@ pub struct TaskbarController {
     /// 本会话是否处于异常暂停（上次未正常恢复），需用户手动重新开启。
     pub paused: bool,
     temp_show: bool,
+    tray_peek: Option<TrayPeek>,
     rehide_count: u32,
     rehide_window_start: u64,
     pub original_state: u32,
@@ -278,6 +283,7 @@ impl TaskbarController {
             record: None,
             paused: false,
             temp_show: false,
+            tray_peek: None,
             rehide_count: 0,
             rehide_window_start: 0,
             original_state: 0,
@@ -311,6 +317,7 @@ impl TaskbarController {
 
     /// 隐藏全部任务栏并落盘恢复记录。调用前必须已存在可见桌面入口。
     pub fn hide_all(&mut self, main_pid: u32, autohide: bool) -> bool {
+        self.end_tray_peek();
         let bars = find_taskbars();
         if bars.is_empty() {
             log::log("未发现任何任务栏窗口，跳过隐藏");
@@ -346,6 +353,7 @@ impl TaskbarController {
 
     /// 恢复任务栏：撤销隐藏、还原原始自动隐藏状态、清除记录。
     pub fn restore_all(&mut self) {
+        self.end_tray_peek();
         if let Some(rec) = self.record.take() {
             unsafe {
                 for &h in &rec.hidden_hwnds {
@@ -367,6 +375,7 @@ impl TaskbarController {
 
     /// 临时显示/隐藏（不改变记录，临时显示期间防回弹放行）。
     pub fn set_temporary_show(&mut self, show: bool) {
+        self.end_tray_peek();
         if self.record.is_none() {
             return;
         }
@@ -386,6 +395,24 @@ impl TaskbarController {
         self.temp_show
     }
 
+    /// 仅为一次托盘交互暂停主任务栏的防回弹，其他任务栏继续隐藏。
+    pub fn begin_tray_peek(&mut self) -> Option<TrayPeek> {
+        if !self.active() || self.temp_show {
+            return None;
+        }
+        let hwnd = primary_taskbar()?;
+        let peek = TrayPeek { hwnd: hwnd.0 as isize, active: Arc::new(Mutex::new(true)) };
+        self.tray_peek = Some(peek.clone());
+        Some(peek)
+    }
+
+    /// 用户切换显隐或 Explorer 重启时，撤销后台借用，新的显隐选择优先。
+    pub fn end_tray_peek(&mut self) {
+        if let Some(peek) = self.tray_peek.take() {
+            *peek.active.lock().unwrap_or_else(|error| error.into_inner()) = false;
+        }
+    }
+
     /// 防回弹：Explorer 把隐藏态任务栏设回可见时，带防抖地重新隐藏。
     pub fn run_rehide(&mut self) {
         if self.record.is_none() || self.temp_show {
@@ -403,6 +430,9 @@ impl TaskbarController {
             return;
         }
         for hwnd in find_taskbars() {
+            if self.tray_peek.as_ref().is_some_and(|peek| peek.hwnd() == hwnd) {
+                continue;
+            }
             if is_visible(hwnd) {
                 hide_window(hwnd);
             }
@@ -411,6 +441,7 @@ impl TaskbarController {
 
     /// Explorer 重启（TaskbarCreated）：重新发现任务栏，仍处于隐藏态则重应用。
     pub fn on_taskbar_created(&mut self) {
+        self.end_tray_peek();
         let Some(rec) = self.record.as_mut() else { return };
         let bars = find_taskbars();
         rec.hidden_hwnds = bars.iter().map(|h| h.0 as isize).collect();
@@ -423,10 +454,31 @@ impl TaskbarController {
             }
         }
     }
+}
 
-    /// 当前所有任务栏是否可见（用于更新流程等待恢复确认）。
-    pub fn any_visible(&self) -> bool {
-        find_taskbars().iter().any(|h| is_visible(*h))
+/// 一次后台托盘交互的任务栏借用。锁内只排队异步窗口操作，保证手动显隐后不会补发旧操作。
+#[derive(Clone)]
+pub struct TrayPeek {
+    hwnd: isize,
+    active: Arc<Mutex<bool>>,
+}
+
+impl TrayPeek {
+    pub fn hwnd(&self) -> HWND {
+        HWND(self.hwnd as *mut _)
+    }
+
+    pub fn set_visible(&self, visible: bool) -> bool {
+        let active = self.active.lock().unwrap_or_else(|error| error.into_inner());
+        if !*active {
+            return false;
+        }
+        if visible {
+            show_window(self.hwnd());
+        } else {
+            hide_window(self.hwnd());
+        }
+        true
     }
 }
 

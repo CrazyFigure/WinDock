@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use windows::core::{w, Interface, VARIANT};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::GdiFlush;
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
@@ -22,12 +23,12 @@ use windows::Win32::UI::Accessibility::{
     UIA_InvokePatternId, UIA_NamePropertyId,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    mouse_event, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+    mouse_event, GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-    VIRTUAL_KEY, VK_B, VK_F10, VK_LWIN, VK_SHIFT,
+    VIRTUAL_KEY, VK_B, VK_F10, VK_LWIN, VK_RBUTTON, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CopyIcon, FindWindowExW, FindWindowW, GetAncestor, GetClassLongPtrW, GetCursorPos,
+    CopyIcon, FindWindowExW, GetAncestor, GetClassLongPtrW, GetCursorPos,
     GetForegroundWindow, GetWindowRect, IsHungAppWindow, IsWindow, IsWindowVisible, PostMessageW, SendMessageTimeoutW,
     SetCursorPos, SetForegroundWindow, WindowFromPoint, GA_ROOT, GCLP_HICON, GCLP_HICONSM, HICON,
     ICON_BIG, ICON_SMALL, ICON_SMALL2, PW_RENDERFULLCONTENT, SMTO_ABORTIFHUNG, WM_GETICON,
@@ -35,6 +36,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::ui::{DibTarget, IconPixels};
 use crate::win32::fnv1a64;
+use crate::taskbar::{primary_taskbar, TrayPeek};
+use super::tray_popup::{self, DesktopCover, MenuPlacement};
 
 pub const WM_APP_TRAY_ITEMS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 31;
 pub const WM_APP_LIVE_ICON_CHANGED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 56;
@@ -166,6 +169,11 @@ pub struct TrayInvocation {
     pub snapshot: TraySnapshot,
 }
 
+pub struct TrayRefresh {
+    pub snapshot: TraySnapshot,
+    pub peeked: bool,
+}
+
 struct NativeButton {
     item: TrayItem,
     element: IUIAutomationElement,
@@ -207,40 +215,78 @@ fn post_result<T>(target: HWND, message: u32, result: T) {
     }
 }
 
-/// 采集原生图标和 UIA 对应项，单次扫描在后台完成。
-pub fn spawn_refresh(target: HWND, cache: Arc<TrayIconCache>) {
+/// 采集原生图标。Finder 持有隐藏任务栏时，在遮罩后用无焦点提示完成采样。
+pub fn spawn_refresh(target: HWND, cache: Arc<TrayIconCache>, peek: Option<TrayPeek>) -> bool {
     if IN_FLIGHT.swap(true, Ordering::SeqCst) {
-        return;
+        return false;
     }
     let target = target.0 as isize;
+    let peeked = peek.is_some();
     let spawn = thread::Builder::new().name("tray-uia".into()).spawn(move || {
         let generation = bump_generation();
         let snapshot = with_uia(|uia| {
-            let Some(tray) = main_tray() else { return TraySnapshot::default() };
-            let (main, overflow) = scan_buttons(uia, tray);
-            collect_snapshot(main.as_deref(), overflow.as_deref(), &cache, generation)
+            let Some(tray) = primary_taskbar() else { return TraySnapshot::default() };
+            let reveal = if let Some(peek) = peek {
+                let Some(reveal) = TrayReveal::start(peek, true) else { return TraySnapshot::default() };
+                wait_until(|| unsafe { IsWindowVisible(tray).as_bool() });
+                Some(reveal)
+            } else {
+                None
+            };
+            let (mut main, mut overflow) = scan_buttons(uia, tray);
+            if main.as_ref().is_none_or(Vec::is_empty) {
+                if let Some(cover) = reveal.as_ref().and_then(|display| display.cover.as_ref()) {
+                    if cover.wake_without_focus() {
+                        (main, overflow) = wait_for_buttons(uia, tray, false, Duration::from_millis(1000));
+                    }
+                }
+            }
+            collect_snapshot(main.as_deref(), overflow.as_deref(), &cache, generation, peeked)
         }).unwrap_or_default();
-        post_result(HWND(target as *mut _), WM_APP_TRAY_ITEMS, snapshot);
+        post_result(HWND(target as *mut _), WM_APP_TRAY_ITEMS, TrayRefresh { snapshot, peeked });
         IN_FLIGHT.store(false, Ordering::SeqCst);
     });
     if spawn.is_err() {
         IN_FLIGHT.store(false, Ordering::SeqCst);
     }
+    spawn.is_ok()
 }
 
 /// 按刚刚扫描到的原生按钮执行点击，并把临时显示期间看到的图标同步给 Finder。
-pub fn spawn_invocation(target: HWND, item: TrayItem, right: bool, cache: Arc<TrayIconCache>) -> bool {
+pub fn spawn_invocation(
+    target: HWND, item: TrayItem, anchor: Option<RECT>, peek: Option<TrayPeek>, cache: Arc<TrayIconCache>,
+) -> bool {
     let target = target.0 as isize;
     thread::Builder::new().name("tray-click".into()).spawn(move || {
-        let (ordinary_window, snapshot) = with_uia(|uia| invoke(uia, &item, right, &cache))
+        let (ordinary_window, snapshot) = with_uia(|uia| invoke(uia, &item, anchor, peek, &cache))
             .unwrap_or_else(|| (item.uia_key.is_none(), TraySnapshot::default()));
         post_result(HWND(target as *mut _), WM_APP_TRAY_INVOKED, TrayInvocation { target: item, ordinary_window, snapshot });
     }).is_ok()
 }
 
-fn main_tray() -> Option<HWND> {
-    let hwnd = unsafe { FindWindowW(w!("Shell_TrayWnd"), None).ok()? };
-    crate::taskbar::is_explorer_window(hwnd).then_some(hwnd)
+/// 在 DWM 确认遮罩后借用主任务栏，恢复隐藏后才移除遮罩。
+struct TrayReveal {
+    peek: TrayPeek,
+    cover: Option<DesktopCover>,
+    overflow_cover: Option<DesktopCover>,
+}
+
+impl TrayReveal {
+    fn start(peek: TrayPeek, conceal: bool) -> Option<Self> {
+        let cover = if conceal { Some(tray_popup::taskbar_cover(peek.hwnd())?) } else { None };
+        peek.set_visible(true).then_some(Self { peek, cover, overflow_cover: None })
+    }
+}
+
+impl Drop for TrayReveal {
+    fn drop(&mut self) {
+        if self.peek.set_visible(false) {
+            wait_until(|| !unsafe { IsWindowVisible(self.peek.hwnd()).as_bool() });
+            if self.cover.is_some() {
+                unsafe { let _ = DwmFlush(); }
+            }
+        }
+    }
 }
 
 /// 自动隐藏时窗口有时仍被标记为可见，但实际仅剩屏幕边缘的唤出条。
@@ -260,12 +306,16 @@ fn surface_on_screen(hwnd: HWND) -> bool {
     width > 0 && height > 0 && visible_width >= width / 2 && visible_height >= height / 2
 }
 
-fn overflow_window(tray: HWND) -> Option<HWND> {
+fn overflow_window(tray: HWND, visible: bool) -> Option<HWND> {
     let pid = crate::taskbar::window_pid(tray);
     for &class in OVERFLOW_CLASSES {
+        // 通用 XAML 弹窗类只用于已经显示的溢出面板，不绑定隐藏的其他 Shell 弹窗。
+        if !visible && class == "Xaml_WindowedPopupClass" {
+            continue;
+        }
         let mut previous = HWND::default();
         while let Ok(hwnd) = unsafe { FindWindowExW(None, previous, crate::win32::wide_static(class), None) } {
-            if crate::taskbar::window_pid(hwnd) == pid && surface_on_screen(hwnd) {
+            if crate::taskbar::window_pid(hwnd) == pid && (!visible || surface_on_screen(hwnd)) {
                 return Some(hwnd);
             }
             previous = hwnd;
@@ -289,8 +339,23 @@ fn overflow_chevron(uia: &IUIAutomation, tray: HWND) -> Option<IUIAutomationElem
 fn scan_buttons(uia: &IUIAutomation, tray: HWND) -> (Option<Vec<NativeButton>>, Option<Vec<NativeButton>>) {
     let mut ordinals = HashMap::new();
     let main = surface_on_screen(tray).then(|| enumerate_surface(uia, tray, false, &mut ordinals)).flatten();
-    let overflow = overflow_window(tray).and_then(|hwnd| enumerate_surface(uia, hwnd, true, &mut ordinals));
+    let overflow = overflow_window(tray, true).and_then(|hwnd| enumerate_surface(uia, hwnd, true, &mut ordinals));
     (main, overflow)
+}
+
+/// 任务栏的位置可能已更新，但 XAML 子树仍在加载。等实际通知项出现后再决定是否切换到溢出区。
+fn wait_for_buttons(
+    uia: &IUIAutomation, tray: HWND, in_overflow: bool, timeout: Duration,
+) -> (Option<Vec<NativeButton>>, Option<Vec<NativeButton>>) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let buttons = scan_buttons(uia, tray);
+        let relevant = if in_overflow { &buttons.1 } else { &buttons.0 };
+        if relevant.as_ref().is_some_and(|items| !items.is_empty()) || Instant::now() >= deadline {
+            return buttons;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn enumerate_surface(
@@ -402,6 +467,7 @@ fn collect_snapshot(
     overflow: Option<&[NativeButton]>,
     cache: &TrayIconCache,
     generation: u64,
+    covered: bool,
 ) -> TraySnapshot {
     let mut icons_changed = false;
     let mut collect = |buttons: &[NativeButton]| {
@@ -413,7 +479,7 @@ fn collect_snapshot(
             if (8..=128).contains(&width) && (8..=128).contains(&height) {
                 // 多取一像素作为原生背景色键，避免从图标内部取背景色。
                 let area = RECT { left: icon.left - 1, top: icon.top - 1, right: icon.right + 1, bottom: icon.bottom + 1 };
-                let pixels = if belongs_to(button.root, center(icon)) {
+                let pixels = if !covered && belongs_to(button.root, center(icon)) {
                     crate::dock::icons::capture_screen_rect(area.left, area.top, width + 2, height + 2)
                 } else {
                     printed.get_or_insert_with(|| print_surface(button.root)).as_ref()
@@ -475,6 +541,14 @@ fn click_button(button: &NativeButton, right: bool) -> bool {
     if !right && invoke_element(&button.element) {
         return true;
     }
+    // 优先用 Explorer 的焦点命令，让菜单请求仍是原生托盘操作，鼠标留在 Finder。
+    if right && unsafe { button.element.SetFocus().is_ok() } {
+        let focused = || unsafe { button.element.CurrentHasKeyboardFocus().is_ok_and(|focus| focus.as_bool()) };
+        wait_until(focused);
+        if focused() && send_chord(VK_SHIFT, VK_F10) {
+            return true;
+        }
+    }
     let point = center(button.button_rect);
     if belongs_to(button.root, point) {
         unsafe {
@@ -497,47 +571,73 @@ fn click_button(button: &NativeButton, right: bool) -> bool {
             }
         }
     }
-    if !right || unsafe { button.element.SetFocus().is_err() } {
-        return false;
-    }
-    // 焦点经过校验才发送 Shift+F10，由系统通知应用打开原生上下文菜单。
-    let focused = || unsafe { button.element.CurrentHasKeyboardFocus().is_ok_and(|focus| focus.as_bool()) };
-    wait_until(focused);
-    focused() && send_chord(VK_SHIFT, VK_F10)
+    false
 }
 
-fn invoke(uia: &IUIAutomation, item: &TrayItem, right: bool, cache: &TrayIconCache) -> (bool, TraySnapshot) {
-    let Some(tray) = main_tray() else { return (item.uia_key.is_none(), TraySnapshot::default()) };
+fn invoke(
+    uia: &IUIAutomation, item: &TrayItem, anchor: Option<RECT>, peek: Option<TrayPeek>, cache: &TrayIconCache,
+) -> (bool, TraySnapshot) {
+    let Some(tray) = primary_taskbar() else { return (item.uia_key.is_none(), TraySnapshot::default()) };
+    let right = anchor.is_some();
+    if right {
+        // 顶部栏在按下时收到点击，交接前等待物理右键释放，避免释放消息关掉原生菜单。
+        wait_until(|| unsafe { GetAsyncKeyState(i32::from(VK_RBUTTON.0)) >= 0 });
+    }
     let foreground = unsafe { GetForegroundWindow() };
-    // 等待主线程临时显示任务栏的异步操作生效，再处理系统的自动隐藏状态。
+    let mut reveal = if let Some(peek) = peek {
+        let Some(reveal) = TrayReveal::start(peek, right) else { return (false, TraySnapshot::default()) };
+        Some(reveal)
+    } else {
+        None
+    };
+    // 等待异步显示生效，再处理系统的自动隐藏状态。
     wait_until(|| unsafe { IsWindowVisible(tray).as_bool() });
-    let revealed = !surface_on_screen(tray);
+    let mut buttons = scan_buttons(uia, tray);
+    let revealed = buttons.0.as_ref().is_none_or(Vec::is_empty);
     if revealed {
         // Win+B 让 Explorer 展开自动隐藏的任务栏。
         send_chord(VK_LWIN, VK_B);
-        wait_until(|| surface_on_screen(tray));
+        buttons = wait_for_buttons(uia, tray, false, Duration::from_millis(500));
     }
-    let (mut main, mut overflow) = scan_buttons(uia, tray);
+    let (mut main, mut overflow) = buttons;
     let mut chevron = None;
     if find_target(item, main.iter().flatten().chain(overflow.iter().flatten())).is_none() && overflow.is_none() {
         // 溢出列表只有展开时才发布 UIA 元素，使用原生箭头打开并重新枚举。
+        if let Some(display) = reveal.as_mut().filter(|display| display.cover.is_some()) {
+            display.overflow_cover = overflow_window(tray, false).and_then(tray_popup::taskbar_cover);
+        }
         chevron = overflow_chevron(uia, tray).filter(invoke_element);
         if chevron.is_some() {
-            wait_until(|| overflow_window(tray).is_some());
-            (main, overflow) = scan_buttons(uia, tray);
+            (main, overflow) = wait_for_buttons(uia, tray, true, Duration::from_millis(500));
         }
     }
 
     // 菜单和鼠标高亮可能遮挡托盘，先采集像素再派发点击。
-    let mut snapshot = collect_snapshot(main.as_deref(), overflow.as_deref(), cache, bump_generation());
+    let covered = reveal.as_ref().is_some_and(|display| display.cover.is_some());
+    let mut snapshot = collect_snapshot(main.as_deref(), overflow.as_deref(), cache, bump_generation(), covered);
     let target = find_target(item, main.iter().flatten().chain(overflow.iter().flatten()));
-    let invoked = target.is_some_and(|button| click_button(button, right));
+    let mut cursor = POINT::default();
+    let have_cursor = right && unsafe { GetCursorPos(&mut cursor).is_ok() };
+    let invoked = target.is_some_and(|button| {
+        let Some(anchor) = anchor else { return click_button(button, false) };
+        let source = center(button.button_rect);
+        let opened = MenuPlacement::new(anchor, source, &item.app_hwnds)
+            .open_at(|| click_button(button, true));
+        // 只有鼠标兜底确实移动了光标，且用户尚未挪动时，才还原到点击位置。
+        let mut current = POINT::default();
+        if have_cursor && unsafe { GetCursorPos(&mut current).is_ok() }
+            && current == source && current != cursor
+        {
+            unsafe { let _ = SetCursorPos(cursor.x, cursor.y); }
+        }
+        opened
+    });
     if invoked {
-        // 在主线程恢复隐藏前，留出时间让 Explorer 将鼠标事件转发给应用。
-        thread::sleep(Duration::from_millis(180));
         if !right {
+            // 左键后留出应用更新通知图标的时间。
+            thread::sleep(Duration::from_millis(180));
             let (main, overflow) = scan_buttons(uia, tray);
-            let after = collect_snapshot(main.as_deref(), overflow.as_deref(), cache, bump_generation());
+            let after = collect_snapshot(main.as_deref(), overflow.as_deref(), cache, bump_generation(), covered);
             if after.main.is_some() || after.overflow.is_some() {
                 snapshot.icons_changed |= after.icons_changed;
                 snapshot.generation = after.generation;
@@ -546,7 +646,7 @@ fn invoke(uia: &IUIAutomation, item: &TrayItem, right: bool, cache: &TrayIconCac
             }
         }
     } else {
-        if let Some(chevron) = chevron.filter(|_| overflow_window(tray).is_some()) {
+        if let Some(chevron) = chevron.filter(|_| overflow_window(tray, true).is_some()) {
             invoke_element(&chevron);
         }
         if revealed {

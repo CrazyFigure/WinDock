@@ -1,0 +1,526 @@
+//! 托盘采集与右键交互使用的桌面遮罩和原生菜单定位。
+
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::sync::{mpsc, OnceLock};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use windows::core::w;
+use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Graphics::Dwm::DwmFlush;
+use windows::Win32::Graphics::Gdi::{
+    BitBlt, GetDC, MonitorFromRect, ReleaseDC, CAPTUREBLT, MONITOR_DEFAULTTONEAREST, SRCCOPY,
+};
+use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
+use windows::Win32::UI::WindowsAndMessaging::*;
+
+use crate::taskbar::window_pid;
+use crate::ui::DibTarget;
+use crate::win32::{class_name, monitor_info, monitor_of_window};
+
+/// 遮罩只复制目标区域的原桌面，Explorer 临时展开期间继续显示这块内容。
+/// Finder 创建遮罩，短暂以原生面板作为所有者，使其保持在面板前方。
+/// 自己的消息线程持续派发窗口消息，Explorer 切换焦点和 Z 序时无需等待 UIA 线程。
+pub(super) struct DesktopCover {
+    thread_id: u32,
+    thread: Option<JoinHandle<()>>,
+}
+
+// 只在遮罩线程内处理，唤出请求不会派发给任何其他窗口。
+const WM_WAKE_TRAY: u32 = WM_APP + 1;
+
+impl DesktopCover {
+    fn new(owner: HWND, bounds: RECT) -> Option<Self> {
+        let owner = owner.0 as isize;
+        let (ready, status) = mpsc::channel();
+        let thread = thread::Builder::new()
+            .name("tray-cover".into())
+            .spawn(move || {
+                let Some(_window) = CoverWindow::new(HWND(owner as *mut _), bounds) else {
+                    return;
+                };
+                unsafe {
+                    if ready.send(GetCurrentThreadId()).is_err() {
+                        return;
+                    }
+                    let mut msg = MSG::default();
+                    let mut wake = None;
+                    let mut wake_timer = 0;
+                    while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+                        match msg.message {
+                            WM_WAKE_TRAY if wake.is_none() => {
+                                wake = AttentionWindow::new(bounds);
+                                if wake.is_some() {
+                                    // 等 Explorer 为临时窗口创建任务栏按钮，再请求一次提示。
+                                    wake_timer = SetTimer(None, 0, 260, None);
+                                }
+                            }
+                            WM_TIMER if wake_timer != 0 && msg.wParam.0 == wake_timer => {
+                                let _ = KillTimer(None, wake_timer);
+                                if let Some(wake) = &wake {
+                                    wake.flash(FLASHW_TRAY);
+                                }
+                                wake_timer = 0;
+                            }
+                            _ => {
+                                DispatchMessageW(&msg);
+                            }
+                        }
+                    }
+                    if wake_timer != 0 {
+                        let _ = KillTimer(None, wake_timer);
+                    }
+                }
+            })
+            .ok()?;
+        let thread_id = status.recv_timeout(Duration::from_millis(500)).ok()?;
+        Some(Self {
+            thread_id,
+            thread: Some(thread),
+        })
+    }
+
+    /// 用 Finder 自己的临时任务栏按钮请求展开，不激活 Explorer 或移动光标。
+    pub fn wake_without_focus(&self) -> bool {
+        unsafe { PostThreadMessageW(self.thread_id, WM_WAKE_TRAY, WPARAM(0), LPARAM(0)).is_ok() }
+    }
+}
+
+impl Drop for DesktopCover {
+    fn drop(&mut self) {
+        unsafe {
+            if PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)).is_ok() {
+                if let Some(thread) = self.thread.take() {
+                    let _ = thread.join();
+                }
+            }
+        }
+    }
+}
+
+struct CoverWindow(HWND);
+
+impl CoverWindow {
+    fn new(owner: HWND, bounds: RECT) -> Option<Self> {
+        let w = bounds.right - bounds.left;
+        let h = bounds.bottom - bounds.top;
+        // 单块遮罩最多 8 MiB，防止异常窗口尺寸分配过大的位图。
+        let mut image = DibTarget::default();
+        if w <= 0 || h <= 0 || i64::from(w) * i64::from(h) > 2_097_152 || !image.ensure(w, h) {
+            return None;
+        }
+        let memory = image.mem_dc?;
+        unsafe {
+            let screen = GetDC(None);
+            if screen.is_invalid() {
+                return None;
+            }
+            let copied = BitBlt(
+                memory,
+                0,
+                0,
+                w,
+                h,
+                screen,
+                bounds.left,
+                bounds.top,
+                SRCCOPY | CAPTUREBLT,
+            );
+            ReleaseDC(None, screen);
+            copied.ok()?;
+            // Owned 窗口随对应的 Explorer 面板调整 Z 序，但输入仍穿过屏幕复制区域。
+            let cover = Self(
+                CreateWindowExW(
+                    WS_EX_LAYERED
+                        | WS_EX_TOOLWINDOW
+                        | WS_EX_TOPMOST
+                        | WS_EX_NOACTIVATE
+                        | WS_EX_TRANSPARENT,
+                    w!("Static"),
+                    w!("WinDockFinder tray cover"),
+                    WS_POPUP,
+                    bounds.left,
+                    bounds.top,
+                    w,
+                    h,
+                    owner,
+                    None,
+                    crate::win32::hinstance(),
+                    None,
+                )
+                .ok()?,
+            );
+            let point = POINT {
+                x: bounds.left,
+                y: bounds.top,
+            };
+            let size = SIZE { cx: w, cy: h };
+            UpdateLayeredWindow(
+                cover.0,
+                None,
+                Some(&point),
+                Some(&size),
+                memory,
+                Some(&POINT::default()),
+                COLORREF(0),
+                None,
+                ULW_OPAQUE,
+            )
+            .ok()?;
+            SetWindowPos(
+                cover.0,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+            .ok()?;
+            // 遮罩交给 DWM 后才允许 Explorer 显示，避免底部先显示一帧任务栏。
+            let _ = DwmFlush();
+            Some(cover)
+        }
+    }
+}
+
+impl Drop for CoverWindow {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyWindow(self.0);
+        }
+    }
+}
+
+/// 只有任务栏按钮需要接收 FlashWindowEx。临时窗口放在所有屏幕之外，禁用激活。
+struct AttentionWindow(HWND);
+
+impl AttentionWindow {
+    fn new(bounds: RECT) -> Option<Self> {
+        static CLASS: OnceLock<bool> = OnceLock::new();
+        let name = w!("WinDockFinderTrayWake");
+        let instance = crate::win32::hinstance();
+        unsafe {
+            if !CLASS.get_or_init(|| {
+                RegisterClassW(&WNDCLASSW {
+                    lpfnWndProc: Some(attention_proc),
+                    hInstance: instance,
+                    lpszClassName: name,
+                    ..Default::default()
+                }) != 0
+            }) {
+                return None;
+            }
+            CreateWindowExW(
+                WS_EX_APPWINDOW | WS_EX_NOACTIVATE,
+                name,
+                w!("WinDockFinder"),
+                WS_VISIBLE | WS_POPUP,
+                bounds.left + (bounds.right - bounds.left) / 2,
+                GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN) + 1,
+                1,
+                1,
+                None,
+                None,
+                instance,
+                None,
+            )
+            .ok()
+            .map(Self)
+        }
+    }
+
+    fn flash(&self, action: FLASHWINFO_FLAGS) {
+        unsafe {
+            let _ = FlashWindowEx(&FLASHWINFO {
+                cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+                hwnd: self.0,
+                dwFlags: action,
+                uCount: 1,
+                dwTimeout: 0,
+            });
+        }
+    }
+}
+
+unsafe extern "system" fn attention_proc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    DefWindowProcW(hwnd, msg, wp, lp)
+}
+
+impl Drop for AttentionWindow {
+    fn drop(&mut self) {
+        self.flash(FLASHW_STOP);
+        unsafe {
+            let _ = DestroyWindow(self.0);
+        }
+    }
+}
+
+/// 自动隐藏的任务栏定位可能只剩屏幕边缘的两像素，将完整尺寸投影回所属屏幕内。
+pub(super) fn taskbar_cover(tray: HWND) -> Option<DesktopCover> {
+    let mut bounds = RECT::default();
+    unsafe { GetWindowRect(tray, &mut bounds).ok()? };
+    let screen = monitor_of_window(tray)?.rect;
+    DesktopCover::new(tray, revealed_bounds(bounds, screen))
+}
+
+fn revealed_bounds(bounds: RECT, screen: RECT) -> RECT {
+    let width = (bounds.right - bounds.left).min(screen.right - screen.left);
+    let height = (bounds.bottom - bounds.top).min(screen.bottom - screen.top);
+    let left = bounds.left.clamp(screen.left, screen.right - width);
+    let top = bounds.top.clamp(screen.top, screen.bottom - height);
+    RECT {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
+    }
+}
+
+/// 从 Finder 图标下方打开原生菜单，空间不足时向上弹，并限制在该屏幕的工作区内。
+fn menu_position(anchor: RECT, work: RECT, width: i32, height: i32, gap: i32) -> POINT {
+    let left = anchor
+        .left
+        .clamp(work.left, (work.right - width).max(work.left));
+    let bottom = anchor.bottom.saturating_add(gap).max(work.top);
+    let max_top = (work.bottom - height).max(work.top);
+    let top = if bottom <= max_top {
+        bottom
+    } else {
+        (anchor.top - gap - height).clamp(work.top, max_top)
+    };
+    POINT { x: left, y: top }
+}
+
+fn popup_windows() -> Vec<HWND> {
+    unsafe extern "system" fn collect(hwnd: HWND, data: LPARAM) -> BOOL {
+        if IsWindowVisible(hwnd).as_bool() && class_name(hwnd) == "#32768" {
+            (*(data.0 as *mut Vec<HWND>)).push(hwnd);
+        }
+        true.into()
+    }
+    let mut windows = Vec::new();
+    unsafe {
+        let _ = EnumWindows(Some(collect), LPARAM(&mut windows as *mut _ as isize));
+    }
+    windows
+}
+
+/// 未知进程的托盘项只接受紧邻真实托盘按钮的新菜单。
+fn touches_source(rect: RECT, source: POINT, tolerance: i32) -> bool {
+    let within_x = (rect.left - tolerance..=rect.right + tolerance).contains(&source.x);
+    let within_y = (rect.top - tolerance..=rect.bottom + tolerance).contains(&source.y);
+    within_x && within_y
+}
+
+pub(super) struct MenuPlacement {
+    old_windows: Vec<HWND>,
+    owner_pids: HashSet<u32>,
+    anchor: RECT,
+    source: POINT,
+    placed: bool,
+}
+
+thread_local! {
+    // 进程外 WinEvent 在注册它的托盘工作线程回调，只跟踪当前一次菜单请求。
+    static PENDING_MENU: RefCell<Option<MenuPlacement>> = const { RefCell::new(None) };
+}
+
+unsafe extern "system" fn on_popup(
+    _: HWINEVENTHOOK,
+    _: u32,
+    hwnd: HWND,
+    _: i32,
+    _: i32,
+    _: u32,
+    _: u32,
+) {
+    PENDING_MENU.with(|slot| {
+        if let Ok(mut pending) = slot.try_borrow_mut() {
+            if let Some(placement) = pending.as_mut() {
+                placement.try_move(hwnd);
+            }
+        }
+    });
+}
+
+impl MenuPlacement {
+    pub fn new(anchor: RECT, source: POINT, app_windows: &[isize]) -> Self {
+        Self {
+            old_windows: popup_windows(),
+            owner_pids: app_windows
+                .iter()
+                .map(|raw| window_pid(HWND(*raw as *mut _)))
+                .filter(|pid| *pid != 0)
+                .collect(),
+            anchor,
+            source,
+            placed: false,
+        }
+    }
+
+    /// 先监听应用菜单的出现事件再发送输入，尽早搬移窗口。旧版菜单缺少事件时短时补查。
+    pub fn open_at(self, open: impl FnOnce() -> bool) -> bool {
+        let pid = if self.owner_pids.len() == 1 {
+            *self.owner_pids.iter().next().unwrap_or(&0)
+        } else {
+            0
+        };
+        PENDING_MENU.with(|slot| slot.replace(Some(self)));
+        let hooks = unsafe {
+            [EVENT_SYSTEM_MENUPOPUPSTART, EVENT_OBJECT_SHOW].map(|event| {
+                SetWinEventHook(
+                    event,
+                    event,
+                    None,
+                    Some(on_popup),
+                    pid,
+                    0,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                )
+            })
+        };
+        let opened = open();
+        if opened {
+            let deadline = Instant::now() + Duration::from_millis(450);
+            let mut msg = MSG::default();
+            loop {
+                // 消息检查也会分发排队的进程外 WinEvent。
+                unsafe {
+                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                        DispatchMessageW(&msg);
+                    }
+                }
+                let placed = PENDING_MENU.with(|slot| {
+                    let mut slot = slot.borrow_mut();
+                    let Some(placement) = slot.as_mut() else {
+                        return false;
+                    };
+                    if !placement.placed {
+                        for hwnd in popup_windows() {
+                            if placement.try_move(hwnd) {
+                                break;
+                            }
+                        }
+                    }
+                    placement.placed
+                });
+                if placed || Instant::now() >= deadline {
+                    break;
+                }
+                unsafe { MsgWaitForMultipleObjectsEx(None, 8, QS_ALLINPUT, MWMO_INPUTAVAILABLE) };
+            }
+        }
+        for hook in hooks.into_iter().filter(|hook| !hook.is_invalid()) {
+            unsafe {
+                let _ = UnhookWinEvent(hook);
+            }
+        }
+        PENDING_MENU.with(|slot| slot.replace(None));
+        opened
+    }
+
+    fn try_move(&mut self, hwnd: HWND) -> bool {
+        if self.placed
+            || self.old_windows.contains(&hwnd)
+            || !unsafe { IsWindowVisible(hwnd).as_bool() }
+            || class_name(hwnd) != "#32768"
+        {
+            return false;
+        }
+        let mut rect = RECT::default();
+        if unsafe { GetWindowRect(hwnd, &mut rect).is_err() }
+            || rect.right <= rect.left
+            || rect.bottom <= rect.top
+        {
+            return false;
+        }
+        let monitor = unsafe { MonitorFromRect(&self.anchor, MONITOR_DEFAULTTONEAREST) };
+        let Some(monitor) = monitor_info(monitor) else {
+            return false;
+        };
+        let gap = crate::win32::dp(4, monitor.dpi);
+        let tolerance = crate::win32::dp(32, monitor.dpi);
+        let matches = if self.owner_pids.is_empty() {
+            touches_source(rect, self.source, tolerance)
+        } else {
+            self.owner_pids.contains(&window_pid(hwnd))
+        };
+        if !matches || unsafe { IsHungAppWindow(hwnd).as_bool() } {
+            return false;
+        }
+        let point = menu_position(
+            self.anchor,
+            monitor.work,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            gap,
+        );
+        self.placed = unsafe {
+            SetWindowPos(
+                hwnd,
+                None,
+                point.x,
+                point.y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
+            )
+            .is_ok()
+        };
+        self.placed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anchored_menu_stays_inside_the_clicked_monitor() {
+        let work = RECT {
+            left: -1920,
+            top: 0,
+            right: 0,
+            bottom: 1080,
+        };
+        let top_icon = RECT {
+            left: -60,
+            top: 0,
+            right: -32,
+            bottom: 32,
+        };
+        let point = menu_position(top_icon, work, 250, 300, 4);
+        assert_eq!((point.x, point.y), (-250, 36));
+        let bottom_icon = RECT {
+            top: 1030,
+            bottom: 1060,
+            ..top_icon
+        };
+        assert_eq!(menu_position(bottom_icon, work, 250, 300, 4).y, 726);
+    }
+
+    #[test]
+    fn cover_includes_the_fully_revealed_taskbar() {
+        let screen = RECT {
+            left: 0,
+            top: 0,
+            right: 3072,
+            bottom: 1920,
+        };
+        let tucked = RECT {
+            left: 0,
+            top: 1918,
+            right: 3072,
+            bottom: 2014,
+        };
+        assert_eq!(revealed_bounds(tucked, screen).top, 1824);
+    }
+}
