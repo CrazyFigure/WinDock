@@ -1,0 +1,262 @@
+name: Release and mirror to CNB
+
+on:
+  push:
+    branches: ['**']
+    tags: ['**']
+  delete:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '要构建发布的已有标签，留空时只同步 Git 引用'
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  CNB_REMOTE: https://cnb.cool/crazy-figure/WinDockFinder.git
+  RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+
+jobs:
+  mirror:
+    name: Mirror Git refs to CNB
+    if: github.repository == 'CrazyFigure/WinDockFinder'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # 每次拉取当前引用并串行推送，避免旧的执行覆盖新镜像。
+    concurrency:
+      group: cnb-mirror
+      queue: max
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Push branches and tags
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${CNB_TOKEN:?请配置 CNB_TOKEN 仓库密钥}"
+          git fetch --force --prune --prune-tags origin
+          git update-ref --no-deref -d refs/remotes/origin/HEAD
+          # 通过临时凭据助手传递令牌，避免将令牌写入仓库地址或 Git 配置。
+          GIT_TERMINAL_PROMPT=0 git -c credential.helper= \
+            -c 'credential.helper=!f() { if [ "$1" = get ]; then printf "username=cnb\npassword=%s\n" "$CNB_TOKEN"; fi; }; f' \
+            push --prune "$CNB_REMOTE" '+refs/remotes/origin/*:refs/heads/*' '+refs/tags/*:refs/tags/*'
+
+  build:
+    name: Build and publish Windows installer
+    if: >-
+      github.repository == 'CrazyFigure/WinDockFinder' &&
+      ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+       (github.event_name == 'workflow_dispatch' && inputs.release_tag != ''))
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    concurrency:
+      group: github-release-${{ inputs.release_tag || github.ref_name }}
+      queue: max
+    outputs:
+      setup: ${{ steps.package.outputs.setup }}
+      commit: ${{ steps.build.outputs.commit }}
+    steps:
+      # 发布工具随工作流签入。分开签出标签源码，允许为已有 v0.0.1 标签补发。
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          path: source
+          persist-credentials: false
+
+      - name: Build and check version
+        id: build
+        shell: pwsh
+        working-directory: source
+        run: |
+          if ($env:RELEASE_TAG -cnotmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw '发布标签必须符合 vX.Y.Z 格式'
+          }
+          $metadata = rustup run stable cargo metadata --locked --format-version 1 --no-deps
+          if ($LASTEXITCODE -ne 0) { throw '读取 Cargo 包信息失败' }
+          $version = ($metadata | ConvertFrom-Json).packages[0].version
+          if ($env:RELEASE_TAG -cne "v$version") {
+            throw "发布标签 $env:RELEASE_TAG 与 Cargo 版本 $version 不一致"
+          }
+
+          # 关于页和 Release 使用同一份标签内更新日志。
+          $notes = Get-Content -Raw -Encoding utf8 'assets/release-notes.json' | ConvertFrom-Json
+          $note = $notes | Where-Object { $_.version -ceq $version } | Select-Object -First 1
+          if (-not $note) { throw "缺少 $env:RELEASE_TAG 的更新日志" }
+          $lines = @('首次安装请下载文件名以 `_setup.exe` 结尾的安装程序。', '')
+          $lines += foreach ($section in $note.sections) {
+            "## $($section.title)"
+            ''
+            foreach ($item in $section.items) { "- $item" }
+            ''
+          }
+          $lines | Set-Content -Encoding utf8 (Join-Path $env:RUNNER_TEMP 'release-notes.md')
+
+          rustup run stable cargo build --locked --release --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Windows EXE 构建失败' }
+          $commit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw '读取标签提交失败' }
+          "commit=$commit" >> $env:GITHUB_OUTPUT
+
+      - name: Package Windows installer
+        id: package
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'nsis-3.11.zip'
+          $nsis = Join-Path $env:RUNNER_TEMP 'nsis-3.11'
+          Invoke-WebRequest 'https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.11/nsis-3.11.zip' -OutFile $archive
+          $expectedHash = 'c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1'
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ine $expectedHash) {
+            throw 'NSIS 下载校验失败'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $nsis
+          $compiler = Get-ChildItem -LiteralPath $nsis -Filter 'makensis.exe' -File -Recurse | Select-Object -First 1
+          if (-not $compiler) { throw 'NSIS 安装包编译器不存在' }
+
+          # 只有安装包会发布。打包工具检查 EXE 的数字和文本版本资源。
+          $exe = 'source/target/x86_64-pc-windows-msvc/release/WinDockFinder.exe'
+          $version = $env:RELEASE_TAG.Substring(1)
+          if ((Get-Item -LiteralPath $exe).VersionInfo.FileVersion -cne $version) {
+            throw "EXE 内嵌版本与标签 $env:RELEASE_TAG 不一致"
+          }
+          $setup = & ./tools/package-windows.ps1 -Executable $exe -Icon 'source/assets/app.ico' -OutputDirectory $env:RUNNER_TEMP -Makensis $compiler.FullName
+          "setup=$($setup.Name)" >> $env:GITHUB_OUTPUT
+
+      - name: Smoke test installer and uninstaller
+        env:
+          SETUP_ASSET: ${{ steps.package.outputs.setup }}
+        shell: pwsh
+        run: |
+          # 在干净的 Windows runner 上覆盖含空格路径、静默升级和卸载入口。
+          $setup = Join-Path $env:RUNNER_TEMP $env:SETUP_ASSET
+          $install = Join-Path $env:RUNNER_TEMP 'WinDockFinder smoke test'
+          $startup = Join-Path ([Environment]::GetFolderPath('Startup')) 'WinDockFinder.lnk'
+          $registry = 'HKCU:/Software/Microsoft/Windows/CurrentVersion/Uninstall/WinDockFinder'
+          $process = Start-Process -FilePath $setup -ArgumentList "/S /D=$install" -Wait -PassThru
+          $exe = Join-Path $install 'WinDockFinder.exe'
+          if ($process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $exe) -or
+              -not (Test-Path -LiteralPath $startup) -or (Get-ItemProperty $registry).InstallLocation -ne $install) {
+            throw '静默安装验证失败'
+          }
+          $source = 'source/target/x86_64-pc-windows-msvc/release/WinDockFinder.exe'
+          if ((Get-FileHash -LiteralPath $exe).Hash -cne (Get-FileHash -LiteralPath $source).Hash) {
+            throw '安装后的应用与构建产物不一致'
+          }
+          Remove-Item -LiteralPath $startup
+          $upgrade = Start-Process -FilePath $setup -ArgumentList '/S' -Wait -PassThru
+          if ($upgrade.ExitCode -ne 0 -or (Test-Path -LiteralPath $startup)) {
+            throw '静默升级未保留用户关闭开机启动的选择'
+          }
+          $uninstaller = Join-Path $install 'Uninstall.exe'
+          $process = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
+          if ($process.ExitCode -ne 0 -or (Test-Path -LiteralPath $exe) -or (Test-Path -LiteralPath $registry)) {
+            throw '静默卸载验证失败'
+          }
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SETUP_ASSET: ${{ steps.package.outputs.setup }}
+          SOURCE_COMMIT: ${{ steps.build.outputs.commit }}
+          WINDOCKFINDER_UPDATE_PRIVATE_KEY: ${{ secrets.WINDOCKFINDER_UPDATE_PRIVATE_KEY }}
+        shell: pwsh
+        run: |
+          $releaseRef = "refs/tags/$env:RELEASE_TAG"
+          $refs = git ls-remote origin $releaseRef "${releaseRef}^{}"
+          if ($LASTEXITCODE -ne 0 -or ($refs -split [char]9) -cnotcontains $env:SOURCE_COMMIT) {
+            throw 'GitHub 标签与构建提交不一致'
+          }
+
+          $setupPath = Join-Path $env:RUNNER_TEMP $env:SETUP_ASSET
+          $signaturePath = "$setupPath.sig"
+          $publicKey = 'source/assets/update-public-key.hex'
+          $existing = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json assets,isDraft 2>$null
+          $release = if ($LASTEXITCODE -eq 0) { $existing | ConvertFrom-Json }
+          $assets = $release.assets | Where-Object { $_.state -ceq 'uploaded' } | ForEach-Object { $_.name }
+
+          # 重试时沿用已发布的安装包。签名必须对应用户实际下载的 EXE。
+          $upload = @($setupPath, $signaturePath)
+          if ($assets -ccontains $env:SETUP_ASSET) {
+            gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern $env:SETUP_ASSET --dir $env:RUNNER_TEMP --clobber
+            if ($LASTEXITCODE -ne 0) { throw '读取已发布的安装包失败' }
+            $upload = @($signaturePath)
+            if ($assets -ccontains "$env:SETUP_ASSET.sig") {
+              gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern "$env:SETUP_ASSET.sig" --dir $env:RUNNER_TEMP --clobber
+              if ($LASTEXITCODE -ne 0) { throw '读取已发布的安装包签名失败' }
+              node scripts/sign-update.mjs $setupPath $publicKey --verify
+              if ($LASTEXITCODE -ne 0) { throw '已发布的安装包验签失败' }
+              $upload = @()
+            }
+          }
+          if ($upload.Count -gt 0) {
+            node scripts/sign-update.mjs $setupPath $publicKey
+            if ($LASTEXITCODE -ne 0) { throw '安装包签名失败' }
+          }
+          if (-not $release) {
+            $notesPath = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+            gh release create $env:RELEASE_TAG @upload --repo $env:GITHUB_REPOSITORY --verify-tag --notes-file $notesPath --title "WinDockFinder $env:RELEASE_TAG"
+            if ($LASTEXITCODE -ne 0) { throw '创建 GitHub Release 失败' }
+          } else {
+            if ($upload.Count -gt 0) {
+              gh release upload $env:RELEASE_TAG @upload --repo $env:GITHUB_REPOSITORY --clobber
+              if ($LASTEXITCODE -ne 0) { throw '上传 GitHub Release 附件失败' }
+            }
+            if ($release.isDraft) {
+              gh release edit $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --draft=false
+              if ($LASTEXITCODE -ne 0) { throw '发布 GitHub Release 草稿失败' }
+            }
+          }
+
+  sync:
+    name: Sync GitHub Release to CNB
+    needs: [mirror, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: cnb-release-${{ inputs.release_tag || github.ref_name }}
+      queue: max
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.build.outputs.commit }}
+          path: source
+          persist-credentials: false
+
+      - name: Sync Windows installer and signature
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          SETUP_ASSET: ${{ needs.build.outputs.setup }}
+          SOURCE_COMMIT: ${{ needs.build.outputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 确认镜像标签指向本次构建，再同步 GitHub Release 原附件。
+          release_ref="refs/tags/$RELEASE_TAG"
+          git ls-remote "$CNB_REMOTE" "$release_ref" "$release_ref^{}" \
+            | cut -f1 | grep -Fx "$SOURCE_COMMIT"
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json tagName,name,body,isPrerelease,isDraft > "$RUNNER_TEMP/release.json"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$SETUP_ASSET" --pattern "$SETUP_ASSET.sig" --dir "$RUNNER_TEMP"
+          setup="$RUNNER_TEMP/$SETUP_ASSET"
+          node scripts/sign-update.mjs "$setup" source/assets/update-public-key.hex --verify
+          node scripts/sync-cnb-release.mjs "$RUNNER_TEMP/release.json" "$setup" "$setup.sig"
