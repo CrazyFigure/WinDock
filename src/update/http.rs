@@ -27,8 +27,19 @@ impl Drop for Handle {
     }
 }
 
-/// 建立连接并发送 GET，返回 (request, status, Content-Length)。失败时句柄随 Handle 析构关闭。
-fn open_get(agent: &str, host: &str, path: &str, accept: PCWSTR) -> Result<(Handle, u32, Option<u64>), String> {
+/// 持有一次请求的完整 WinHTTP 句柄链与响应元信息。
+struct Response {
+    // Rust 按字段声明顺序析构：必须先关闭子请求句柄，再依次关闭连接与会话句柄，
+    // 否则关闭父句柄会取消未读完的请求并导致 WinHttpReadData 报 0x80072EF1。
+    request: Handle,
+    _connection: Handle,
+    _session: Handle,
+    status: u32,
+    content_length: Option<u64>,
+}
+
+/// 建立连接并发送 GET，返回完整句柄链与响应状态。
+fn open_get(agent: &str, host: &str, path: &str, accept: PCWSTR) -> Result<Response, String> {
     let host = wide(host);
     let path = wide(path);
     let agent = wide(agent);
@@ -80,17 +91,23 @@ fn open_get(agent: &str, host: &str, path: &str, accept: PCWSTR) -> Result<(Hand
             ptr::null_mut(),
         )
         .is_ok();
-        Ok((request, status, has_len.then_some(len as u64)))
+        Ok(Response {
+            request,
+            _connection: connection,
+            _session: session,
+            status,
+            content_length: has_len.then_some(len as u64),
+        })
     }
 }
 
-fn read_body(request: &Handle, limit: u64, mut on_chunk: impl FnMut(&[u8], u64, Option<u64>) -> Result<(), String>) -> Result<(), String> {
+fn read_body(resp: &Response, limit: u64, mut on_chunk: impl FnMut(&[u8], u64, Option<u64>) -> Result<(), String>) -> Result<(), String> {
     let mut buffer = [0u8; 64 * 1024];
     let mut total = 0u64;
     loop {
         let mut read = 0u32;
         unsafe {
-            WinHttpReadData(request.0, buffer.as_mut_ptr().cast(), buffer.len() as u32, &mut read)
+            WinHttpReadData(resp.request.0, buffer.as_mut_ptr().cast(), buffer.len() as u32, &mut read)
                 .map_err(|err| err.to_string())?;
         }
         if read == 0 {
@@ -100,35 +117,18 @@ fn read_body(request: &Handle, limit: u64, mut on_chunk: impl FnMut(&[u8], u64, 
         if total > limit {
             return Err("发布服务器返回的数据超过大小限制".into());
         }
-        on_chunk(&buffer[..read as usize], total, request_length(request))?;
+        on_chunk(&buffer[..read as usize], total, resp.content_length)?;
     }
-}
-
-fn request_length(request: &Handle) -> Option<u64> {
-    let mut len = 0u32;
-    let mut size = size_of::<u32>() as u32;
-    let ok = unsafe {
-        WinHttpQueryHeaders(
-            request.0,
-            WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
-            PCWSTR::null(),
-            Some(ptr::from_mut(&mut len).cast()),
-            &mut size,
-            ptr::null_mut(),
-        )
-        .is_ok()
-    };
-    ok.then_some(len as u64)
 }
 
 /// 读取完整响应（用于小型 JSON / 签名文件）。
 pub fn get(host: &str, path: &str, accept: PCWSTR, limit: usize) -> Result<Vec<u8>, String> {
-    let (request, status, _) = open_get("WinDockFinder", host, path, accept)?;
-    if status != 200 {
-        return Err(format!("HTTP {status}"));
+    let resp = open_get("WinDockFinder", host, path, accept)?;
+    if resp.status != 200 {
+        return Err(format!("HTTP {}", resp.status));
     }
     let mut out = Vec::new();
-    read_body(&request, limit as u64, |chunk, _, _| {
+    read_body(&resp, limit as u64, |chunk, _, _| {
         out.extend_from_slice(chunk);
         Ok(())
     })?;
@@ -137,9 +137,46 @@ pub fn get(host: &str, path: &str, accept: PCWSTR, limit: usize) -> Result<Vec<u
 
 /// 流式下载：每个 64 KB 块回调一次（累计字节、总长度），调用方边写盘边计算 SHA-256。
 pub fn stream(host: &str, path: &str, limit: u64, on_chunk: impl FnMut(&[u8], u64, Option<u64>) -> Result<(), String>) -> Result<(), String> {
-    let (request, status, _) = open_get("WinDockFinder", host, path, w!("application/octet-stream"))?;
-    if status != 200 {
-        return Err(format!("HTTP {status}"));
+    let resp = open_get("WinDockFinder", host, path, w!("application/octet-stream"))?;
+    if resp.status != 200 {
+        return Err(format!("HTTP {}", resp.status));
     }
-    read_body(&request, limit, on_chunk)
+    read_body(&resp, limit, on_chunk)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn response_fields_drop_child_before_parents() {
+        // 验证 Response 结构体保持 request -> _connection -> _session 的析构顺序，
+        // 避免 Drop 时先关闭父句柄导致 WinHTTP 取消子请求。
+        struct Probe<'a> {
+            name: &'static str,
+            order: &'a RefCell<Vec<&'static str>>,
+        }
+        impl Drop for Probe<'_> {
+            fn drop(&mut self) {
+                self.order.borrow_mut().push(self.name);
+            }
+        }
+        struct OrderCheck<'a> {
+            _request: Probe<'a>,
+            _connection: Probe<'a>,
+            _session: Probe<'a>,
+        }
+        let log = RefCell::new(Vec::new());
+        {
+            let _check = OrderCheck {
+                _request: Probe { name: "request", order: &log },
+                _connection: Probe { name: "connection", order: &log },
+                _session: Probe { name: "session", order: &log },
+            };
+        }
+        assert_eq!(*log.borrow(), vec!["request", "connection", "session"]);
+        assert!(std::mem::offset_of!(Response, request) < std::mem::offset_of!(Response, _connection));
+        assert!(std::mem::offset_of!(Response, _connection) < std::mem::offset_of!(Response, _session));
+    }
 }

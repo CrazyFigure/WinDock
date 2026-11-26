@@ -476,4 +476,39 @@ mod tests {
         assert!(stable_version("1.2.3-beta").is_none());
         assert!(stable_version("01.2.3").is_none());
     }
+
+    #[test]
+    #[ignore = "需要连接 GitHub / CNB 网络"]
+    fn live_check_and_stream_verify_work() {
+        let (bundle, ch) = check().expect("live update::check failed");
+        println!("check succeeded via {:?}: bundle={:?}", ch, bundle.as_ref().map(|b| &b.version));
+        let cnb = check_channel(Channel::Cnb).expect("CNB check_channel failed");
+        println!("CNB check_channel succeeded: {:?}", cnb.as_ref().map(|b| &b.version));
+
+        // 顺带验证 CNB 与 GitHub 下载重定向及 Ed25519 验签（v0.0.1）。
+        for channel in [Channel::Cnb, Channel::GitHub] {
+            let name = asset_name("0.0.1");
+            let (shost, spath) = channel.download("0.0.1", &format!("{name}.sig"));
+            let sig = http::get(shost, &spath, w!("application/octet-stream"), SIG_LIMIT)
+                .unwrap_or_else(|e| panic!("{channel:?} sig download failed: {e}"));
+            assert_eq!(sig.len(), 64);
+
+            let (host, path) = channel.download("0.0.1", &name);
+            let mut hasher = Sha256::new();
+            let mut got = 0u64;
+            http::stream(host, &path, SETUP_LIMIT, |chunk, received, total| {
+                hasher.update(chunk);
+                got = received;
+                if let Some(t) = total {
+                    assert!(received <= t);
+                }
+                Ok(())
+            })
+            .unwrap_or_else(|e| panic!("{channel:?} setup stream failed: {e}"));
+            assert!(got > 0);
+            let digest = hasher.finalize();
+            verify(&name, &digest, &sig).unwrap_or_else(|e| panic!("{channel:?} verify failed: {e}"));
+            println!("{channel:?} stream + verify ok ({got} bytes)");
+        }
+    }
 }
