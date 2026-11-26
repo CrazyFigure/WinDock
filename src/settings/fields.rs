@@ -245,8 +245,8 @@ impl Field {
         if let Some(name) = name {
             c.topbar.status_items.retain(|s| s != name);
             if v {
-                // 保持固定顺序：输入法、网络、亮度、音量、电量
-                let order = ["ime", "network", "brightness", "volume", "battery"];
+                // 保持固定顺序：输入法、网络、音量、亮度、电量
+                let order = ["ime", "network", "volume", "brightness", "battery"];
                 let pos = order.iter().position(|o| *o == name).unwrap_or(0);
                 let insert_at = c
                     .topbar

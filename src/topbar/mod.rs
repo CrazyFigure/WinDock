@@ -461,13 +461,14 @@ impl TopBar {
                 push_right(&mut rx, (22.0 * s) as i32 + (4.0 * s) as i32 + self.measure(self.font, &text).0, Hit::Battery, &mut hits);
             }
         }
+        // 从右向左排列：电量 → 亮度 → 音量，视觉顺序即为 音量 → 亮度 → 电量
+        if cfg.has_status("brightness") {
+            push_right(&mut rx, (16.0 * s) as i32, Hit::Brightness, &mut hits);
+        }
         if cfg.has_status("volume") {
             if let Some((_, _)) = self.status.volume {
                 push_right(&mut rx, (16.0 * s) as i32, Hit::Volume, &mut hits);
             }
-        }
-        if cfg.has_status("brightness") {
-            push_right(&mut rx, (16.0 * s) as i32, Hit::Brightness, &mut hits);
         }
         if cfg.has_status("network") {
             push_right(&mut rx, (16.0 * s) as i32, Hit::Network, &mut hits);

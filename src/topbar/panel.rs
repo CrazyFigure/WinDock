@@ -447,12 +447,6 @@ impl StatusPanel {
                     self.vol_level = v;
                     self.vol_mute = m;
                 }
-                if let Some(b) = read_system_brightness() {
-                    self.brightness = b;
-                    self.bright_supported = true;
-                } else {
-                    self.bright_supported = false;
-                }
                 self.net_data.connected = crate::topbar::status::network_connected();
             }
             PanelKind::Clock => {
@@ -501,7 +495,7 @@ impl StatusPanel {
                 let rows = self.power_schemes.len().clamp(1, 4) as i32;
                 (dp(286, d), dp(136, d) + rows * dp(34, d))
             }
-            PanelKind::Control => (dp(296, d), dp(186, d)),
+            PanelKind::Control => (dp(296, d), dp(132, d)),
             PanelKind::Clock => (dp(292, d), dp(304, d)),
         };
         self.w = w;
@@ -1118,18 +1112,6 @@ impl StatusPanel {
                 }
                 y += tile_h + dp(12, d);
 
-                // 亮度滑块卡片
-                let bright_row = RECT { left: pad, top: y, right: w - pad, bottom: y + dp(44, d) };
-                sf.fill_rrect(&bright_row, 10.0 * s, card);
-                draw_glyph(&mut sf, Glyph::Sun, bright_row.left as f32 + 21.0 * s, (bright_row.top + bright_row.bottom) as f32 * 0.5, 15.0 * s, if self.bright_supported { fg } else { fg_dim });
-                let b_slider_r = RECT { left: bright_row.left + dp(42, d), top: bright_row.top, right: bright_row.right - dp(10, d), bottom: bright_row.bottom };
-                let b_frac = if self.bright_supported { (self.brightness as f32 / 100.0).clamp(0.0, 1.0) } else { 0.0 };
-                self.draw_slider(&mut sf, &b_slider_r, b_frac, dark, if self.bright_supported { acc } else { fg_dim }, s);
-                if self.bright_supported {
-                    self.zones.push((b_slider_r, PanelHit::BrightSlider));
-                }
-                y += dp(54, d);
-
                 // 底部快捷操作行（精简短标题防截断）
                 let btn_gap = dp(8, d);
                 let bw = (w - pad * 2 - btn_gap * 2) / 3;
@@ -1401,6 +1383,7 @@ fn read_wmi_brightness() -> Option<i32> {
 }
 
 fn set_wmi_brightness(pct: i32) -> bool {
+    let level = pct.clamp(0, 100) as u8;
     unsafe {
         let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
         let need_uninit = hr.is_ok();
@@ -1420,20 +1403,32 @@ fn set_wmi_brightness(pct: i32) -> bool {
             cls.GetMethod(w!("WmiSetBrightness"), 0, &mut in_sig, std::ptr::null_mut())
                 .ok()?;
             let in_params = in_sig?.SpawnInstance(0).ok()?;
-            in_params.Put(w!("Timeout"), 0, &VARIANT::from(0u32), 0).ok()?;
-            in_params
-                .Put(w!("Brightness"), 0, &VARIANT::from(pct.clamp(0, 100) as u8), 0)
-                .ok()?;
+            // WMI COM 规范要求 CIM_UINT32 使用 VT_I4（传 VT_UI4 会触发 WBEM_E_TYPE_MISMATCH）
+            in_params.Put(w!("Timeout"), 0, &VARIANT::from(0i32), 0).ok()?;
+            // CIM_UINT8 优先使用 VT_UI1，兼容驱动回退 VT_I4
+            if in_params.Put(w!("Brightness"), 0, &VARIANT::from(level), 0).is_err() {
+                in_params.Put(w!("Brightness"), 0, &VARIANT::from(level as i32), 0).ok()?;
+            }
 
             let flags = WBEM_GENERIC_FLAG_TYPE(WBEM_FLAG_FORWARD_ONLY.0 | WBEM_FLAG_RETURN_IMMEDIATELY.0);
             let en = svc
                 .ExecQuery(
                     &BSTR::from("WQL"),
-                    &BSTR::from("SELECT __PATH FROM WmiMonitorBrightnessMethods"),
+                    &BSTR::from("SELECT * FROM WmiMonitorBrightnessMethods"),
                     flags,
                     None,
                 )
                 .ok()?;
+            let _ = CoSetProxyBlanket(
+                &en,
+                RPC_C_AUTHN_WINNT,
+                RPC_C_AUTHZ_NONE,
+                None,
+                RPC_C_AUTHN_LEVEL_CALL,
+                RPC_C_IMP_LEVEL_IMPERSONATE,
+                None,
+                EOAC_NONE,
+            );
             let mut any = false;
             loop {
                 let mut objs = [None];
@@ -1443,21 +1438,21 @@ fn set_wmi_brightness(pct: i32) -> bool {
                 }
                 if let Some(inst) = objs[0].as_ref() {
                     let mut pvar = VARIANT::default();
-                    if inst.Get(w!("__PATH"), 0, &mut pvar, None, None).is_ok() {
+                    let got_path = inst.Get(w!("__RELPATH"), 0, &mut pvar, None, None).is_ok()
+                        || inst.Get(w!("__PATH"), 0, &mut pvar, None, None).is_ok();
+                    if got_path {
                         if let Ok(path) = BSTR::try_from(&pvar) {
-                            if svc
-                                .ExecMethod(
-                                    &path,
-                                    &BSTR::from("WmiSetBrightness"),
-                                    WBEM_GENERIC_FLAG_TYPE(0),
-                                    None,
-                                    &in_params,
-                                    None,
-                                    None,
-                                )
-                                .is_ok()
-                            {
-                                any = true;
+                            match svc.ExecMethod(
+                                &path,
+                                &BSTR::from("WmiSetBrightness"),
+                                WBEM_GENERIC_FLAG_TYPE(0),
+                                None,
+                                &in_params,
+                                None,
+                                None,
+                            ) {
+                                Ok(_) => any = true,
+                                Err(e) => crate::log::log(&format!("WMI 调节亮度失败: {}", crate::win32::error_string(e))),
                             }
                         }
                     }
@@ -1554,8 +1549,11 @@ fn apply_brightness_async(pct: i32) {
                     }
                     break;
                 }
-                let _ = set_wmi_brightness(val);
-                let _ = set_ddc_brightness(val);
+                let wmi_ok = set_wmi_brightness(val);
+                // 仅当 WMI 不可用或存在多屏时补充 DDC/CI 调节，避免单屏笔记本拖动时被 DDC 阻塞
+                if !wmi_ok || crate::win32::all_monitors().len() > 1 {
+                    let _ = set_ddc_brightness(val);
+                }
             }
         });
     }
@@ -2162,5 +2160,13 @@ mod tests {
         assert_eq!(g[32], (2024, 3, 1, false));
         assert_eq!(year_page_start(2026), 2016);
         assert_eq!(year_page_start(2028), 2028);
+    }
+
+    #[test]
+    fn wmi_brightness_roundtrip_preserves_current_level() {
+        // 本机支持 WMI 内屏亮度时验证写入接口真正可用（原样写回当前亮度，不改变屏幕视觉）
+        if let Some(cur) = read_wmi_brightness() {
+            assert!(set_wmi_brightness(cur), "WmiSetBrightness 应能成功写入当前亮度 {cur}");
+        }
     }
 }

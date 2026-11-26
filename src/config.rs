@@ -155,6 +155,9 @@ pub struct TopbarCfg {
     /// 可选 token：M d E HH mm ss 12h
     pub clock_format: String,
     pub status_items: Vec<String>,
+    /// 一次性迁移标记：为旧版配置自动补齐顶部栏亮度按钮，后续遵循用户手动开关。
+    #[serde(default)]
+    pub brightness_status_migrated: bool,
     pub pinned_tray_keys: Vec<String>,
     pub fullscreen_yield: bool,
 }
@@ -170,7 +173,8 @@ impl Default for TopbarCfg {
             color_transition_ms: 150,
             show_active_app: true,
             clock_format: "M月d日 E HH:mm".into(),
-            status_items: vec!["ime".into(), "network".into(), "brightness".into(), "volume".into(), "battery".into()],
+            status_items: vec!["ime".into(), "network".into(), "volume".into(), "brightness".into(), "battery".into()],
+            brightness_status_migrated: false,
             pinned_tray_keys: Vec::new(),
             fullscreen_yield: true,
         }
@@ -187,7 +191,19 @@ impl TopbarCfg {
         if self.clock_format.is_empty() {
             self.clock_format = "M月d日 E HH:mm".into();
         }
-        self.status_items.retain(|s| matches!(s.as_str(), "ime" | "network" | "brightness" | "volume" | "battery"));
+        self.status_items.retain(|s| matches!(s.as_str(), "ime" | "network" | "volume" | "brightness" | "battery"));
+        // 旧版配置未包含顶部栏亮度按钮时自动补齐到音量与电量之间
+        if !self.brightness_status_migrated {
+            self.brightness_status_migrated = true;
+            if !self.has_status("brightness") {
+                let insert_at = self
+                    .status_items
+                    .iter()
+                    .position(|s| s == "battery")
+                    .unwrap_or(self.status_items.len());
+                self.status_items.insert(insert_at, "brightness".into());
+            }
+        }
         self
     }
 
@@ -531,6 +547,28 @@ mod tests {
         assert!(c.topbar.has_status("brightness"));
         assert!(!c.general.startup_initialized);
         assert_eq!(c.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn legacy_config_migrates_brightness_between_volume_and_battery() {
+        let old = serde_json::from_str::<Config>(
+            r#"{"topbar":{"status_items":["ime","network","volume","battery"]}}"#,
+        )
+        .unwrap()
+        .normalized();
+        assert_eq!(
+            old.topbar.status_items,
+            vec!["ime", "network", "volume", "brightness", "battery"]
+        );
+        assert!(old.topbar.brightness_status_migrated);
+
+        // 用户主动关闭后不再被强制恢复
+        let disabled = serde_json::from_str::<Config>(
+            r#"{"topbar":{"status_items":["ime","network","volume","battery"],"brightness_status_migrated":true}}"#,
+        )
+        .unwrap()
+        .normalized();
+        assert!(!disabled.topbar.has_status("brightness"));
     }
 
     #[test]
