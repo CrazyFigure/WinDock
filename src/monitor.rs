@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use windows::core::PCWSTR;
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::Graphics::Dwm::{
@@ -40,18 +40,45 @@ pub struct WinInfo {
     pub minimized: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct MaximizedWindow {
+    pub monitor: isize,
+    pub hwnd: isize,
+    pub exe: String,
+    pub rect: RECT,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct MonitorState {
     pub foreground: isize,
     pub foreground_exe: String,
     pub foreground_name: String,
     pub foreground_title: String,
-    /// 前台最大化窗口所在显示器（句柄值）
+    /// 当前活跃显示器的最大化窗口所在显示器（句柄值）
     pub maximized_monitor: isize,
+    /// 当前活跃显示器的最大化窗口句柄
+    pub maximized_hwnd: isize,
+    /// 当前活跃显示器的最大化窗口进程路径（小写）
+    pub maximized_exe: String,
     /// 前台最大化窗口矩形（用于标题栏取色）
     pub maximized_rect: Option<RECT>,
+    /// 各显示器按 Z 序最上层可见（未最小化）最大化窗口列表
+    pub maximized_windows: Vec<MaximizedWindow>,
     pub fullscreen: bool,
     pub windows: Vec<WinInfo>,
+}
+
+impl MonitorState {
+    /// 获取指定显示器最上层可见最大化窗口。
+    pub fn maximized_on(&self, hmon: isize) -> Option<&MaximizedWindow> {
+        self.maximized_windows.iter().find(|w| w.monitor == hmon)
+    }
+
+    /// 判断指定显示器当前是否存在最大化窗口。
+    pub fn is_monitor_maximized(&self, hmon: isize) -> bool {
+        self.maximized_on(hmon).is_some()
+            || (self.maximized_monitor != 0 && self.maximized_monitor == hmon)
+    }
 }
 
 // SAFETY: 状态仅在 UI 线程读写，句柄均以整数保存，可安全跨线程共享。
@@ -72,7 +99,10 @@ static STATE: Mutex<MonitorState> = Mutex::new(MonitorState {
     foreground_name: String::new(),
     foreground_title: String::new(),
     maximized_monitor: 0,
+    maximized_hwnd: 0,
+    maximized_exe: String::new(),
     maximized_rect: None,
+    maximized_windows: Vec::new(),
     fullscreen: false,
     windows: Vec::new(),
 });
@@ -83,13 +113,32 @@ static LAST_POST: Mutex<Option<Instant>> = Mutex::new(None);
 static NAME_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 fn is_our_window(class: &str) -> bool {
-    class.starts_with("WinDockFinder") || class == "SysShadow" || class == "Xaml_WindowedPopupClass"
+    class.starts_with("WinDockFinder") || class == "SysShadow"
+}
+
+/// 真正代表桌面壁纸/桌面图标层的窗口类名。
+fn is_explicit_desktop_class(class: &str) -> bool {
+    matches!(class, "Progman" | "WorkerW" | "Shell_IconView")
+}
+
+/// 托盘溢出气泡、原生右键菜单、工具提示等瞬态系统浮窗，不应使顶部栏退出最大化融合态。
+fn is_transient_tray_or_popup_class(class: &str) -> bool {
+    matches!(
+        class,
+        "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "#32768"
+            | "tooltips_class32"
+            | "Windows.UI.Input.InputSite.WindowClass"
+            | "Windows.UI.Composition.DesktopWindowContentBridge"
+    ) || class.starts_with("NotifyIconOverflowWindow")
+        || class.starts_with("TopLevelWindowForOverflowXamlIsland")
+        || class.starts_with("Xaml_WindowedPopupClass")
+        || class.contains("QWindowPopup")
 }
 
 fn is_desktop_class(class: &str) -> bool {
-    matches!(class, "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "Shell_IconView")
-        || class.starts_with("NotifyIconOverflowWindow")
-        || class.starts_with("TopLevelWindowForOverflowXamlIsland")
+    is_explicit_desktop_class(class) || is_transient_tray_or_popup_class(class)
 }
 
 /// 常见 Windows 内置应用精准中文名映射。
@@ -389,8 +438,133 @@ fn visible_window_rect(hwnd: HWND) -> RECT {
     r
 }
 
-/// 判断窗口是否为可切换的普通顶层应用窗口。
-fn is_app_window(hwnd: HWND) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowCoverage {
+    None,
+    Maximized,
+    Fullscreen,
+}
+
+/// 根据窗口矩形、显示器范围、Zoomed 状态与标题栏样式判定覆盖形态（纯函数，便于单测）。
+fn classify_window_coverage(
+    r: RECT,
+    mon_rect: RECT,
+    mon_work: RECT,
+    is_zoomed: bool,
+    has_caption: bool,
+) -> WindowCoverage {
+    let covers_full = r.left <= mon_rect.left + 1
+        && r.right >= mon_rect.right - 1
+        && r.top <= mon_rect.top + 1
+        && r.bottom >= mon_rect.bottom - 1;
+    let covers_work = (r.right - r.left) >= (mon_work.right - mon_work.left - 8)
+        && (r.bottom - r.top) >= (mon_work.bottom - mon_work.top - 8);
+    // 优先以 Windows 原生 IsZoomed 判定最大化，避免无边框最大化误判成独占全屏
+    if is_zoomed {
+        WindowCoverage::Maximized
+    } else if covers_full && !has_caption {
+        WindowCoverage::Fullscreen
+    } else if covers_work {
+        WindowCoverage::Maximized
+    } else {
+        WindowCoverage::None
+    }
+}
+
+unsafe fn window_cloaked(hwnd: HWND) -> bool {
+    let mut cloaked = 0u32;
+    let _ = DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_CLOAKED,
+        &mut cloaked as *mut u32 as *mut _,
+        4,
+    );
+    cloaked != 0
+}
+
+unsafe fn has_shell_def_view(hwnd: HWND) -> bool {
+    FindWindowExW(hwnd, None, w!("SHELLDLL_DefView"), None)
+        .is_ok_and(|child| !child.0.is_null())
+}
+
+/// 计算两个矩形的重叠宽高（任意轴无重叠时返回 0, 0）。
+fn rect_overlap_size(a: RECT, b: RECT) -> (i32, i32) {
+    let w = (a.right.min(b.right) - a.left.max(b.left)).max(0);
+    let h = (a.bottom.min(b.bottom) - a.top.max(b.top)).max(0);
+    if w == 0 || h == 0 {
+        (0, 0)
+    } else {
+        (w, h)
+    }
+}
+
+struct BackdropScan {
+    target: RECT,
+    min_w: i32,
+    min_h: i32,
+    out: Vec<HWND>,
+}
+
+unsafe extern "system" fn enum_dock_backdrops(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let scan = &mut *(lparam.0 as *mut BackdropScan);
+    if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() || window_cloaked(hwnd) {
+        return BOOL::from(true);
+    }
+    let class = class_name(hwnd);
+    if is_our_window(&class) || is_transient_tray_or_popup_class(&class) {
+        return BOOL::from(true);
+    }
+    // 到达桌面图标/壁纸层即终止（Win+D 置前时直接得出空集合；正常情况下方不会再有可见应用）
+    if class == "Progman" || (class == "WorkerW" && has_shell_def_view(hwnd)) {
+        let (ow, oh) = rect_overlap_size(visible_window_rect(hwnd), scan.target);
+        if ow >= scan.min_w && oh >= scan.min_h {
+            return BOOL::from(false);
+        }
+        return BOOL::from(true);
+    }
+    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+    // 跳过穿透式透明辅助层及无标题工具浮窗，避免误将隐形辅助层当作背后应用
+    if (ex & (WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0)) == (WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0) {
+        return BOOL::from(true);
+    }
+    if (ex & (WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0)) != 0 && window_text(hwnd).trim().is_empty() {
+        return BOOL::from(true);
+    }
+    let r = visible_window_rect(hwnd);
+    let (ow, oh) = rect_overlap_size(r, scan.target);
+    if ow >= scan.min_w && oh >= scan.min_h {
+        scan.out.push(hwnd);
+        // 若非分层窗口已完整遮盖 Dock 胶囊，无需继续遍历更深 Z 序窗口
+        if (ex & WS_EX_LAYERED.0) == 0
+            && r.left <= scan.target.left
+            && r.right >= scan.target.right
+            && r.top <= scan.target.top
+            && r.bottom >= scan.target.bottom
+        {
+            return BOOL::from(false);
+        }
+    }
+    BOOL::from(true)
+}
+
+/// 按 Z 序查找真正位于 Dock 胶囊背后的可见外部应用窗口（纯桌面/Win+D 返回空）。
+pub fn dock_backdrop_windows(cap_screen: RECT) -> Vec<HWND> {
+    let cap_w = (cap_screen.right - cap_screen.left).max(1);
+    let cap_h = (cap_screen.bottom - cap_screen.top).max(1);
+    let mut scan = BackdropScan {
+        target: cap_screen,
+        min_w: (cap_w / 5).clamp(24, 96),
+        min_h: (cap_h / 2).clamp(12, 32),
+        out: Vec::new(),
+    };
+    unsafe {
+        let _ = EnumWindows(Some(enum_dock_backdrops), LPARAM(&mut scan as *mut BackdropScan as isize));
+    }
+    scan.out
+}
+
+/// 判断窗口是否为可切换的普通顶层应用窗口（复用已获取的类名避免重复查询）。
+fn is_app_window_with_class(hwnd: HWND, class: &str) -> bool {
     unsafe {
         if !IsWindowVisible(hwnd).as_bool() {
             return false;
@@ -399,18 +573,10 @@ fn is_app_window(hwnd: HWND) -> bool {
         if ex & WS_EX_TOOLWINDOW.0 != 0 || ex & WS_EX_NOACTIVATE.0 != 0 {
             return false;
         }
-        let mut cloaked = 0u32;
-        let _ = DwmGetWindowAttribute(
-            hwnd,
-            DWMWA_CLOAKED,
-            &mut cloaked as *mut u32 as *mut _,
-            4,
-        );
-        if cloaked != 0 {
+        if window_cloaked(hwnd) {
             return false;
         }
-        let class = class_name(hwnd);
-        if is_our_window(&class) || is_desktop_class(&class) {
+        if is_our_window(class) || is_desktop_class(class) {
             return false;
         }
         // 有所有者的弹窗/对话框不作为独立应用
@@ -432,52 +598,81 @@ fn is_app_window(hwnd: HWND) -> bool {
     }
 }
 
+struct EnumScan {
+    windows: Vec<WinInfo>,
+    maximized: Vec<MaximizedWindow>,
+    decided_monitors: Vec<isize>,
+}
+
+/// 窗口句柄若已无效、隐藏、最小化或处于其他虚拟桌面，不应继续作为瞬态保留目标。
+unsafe fn is_live_foreground_candidate(hwnd: HWND) -> bool {
+    !hwnd.0.is_null()
+        && IsWindow(hwnd).as_bool()
+        && IsWindowVisible(hwnd).as_bool()
+        && !IsIconic(hwnd).as_bool()
+        && !window_cloaked(hwnd)
+}
+
 /// 重新计算快照；返回是否发生变化（需要通知 Dock/顶部栏重排或取色）。
 pub fn refresh() -> bool {
+    let prev = STATE.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let mut new_state = MonitorState::default();
+    let mut scan = EnumScan {
+        windows: Vec::new(),
+        maximized: Vec::new(),
+        decided_monitors: Vec::new(),
+    };
     unsafe {
         let fg = GetForegroundWindow();
-        new_state.foreground = fg.0 as isize;
-        if !fg.0.is_null() {
-            let (_pid, exe_lower, exe_raw) = resolve_window_process(fg);
-            let title = window_text(fg);
-            new_state.foreground_exe = exe_lower;
-            new_state.foreground_title = title.clone();
-            let class = class_name(fg);
-            if is_our_window(&class) {
-                // 自绘菜单/状态面板临时取得焦点时，保留先前外部应用的前台与最大化取色状态，防止顶部栏闪烁
-                let prev = STATE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut fg_ext: Option<(HWND, String, MonitorInfo, RECT, WindowCoverage)> = None;
+        if fg.0.is_null() {
+            // 自绘菜单/状态面板或原生浮窗刚关闭时的瞬态空前台：保留仍然可见的先前外部前景应用
+            if is_live_foreground_candidate(HWND(prev.foreground as *mut _)) {
                 new_state.foreground = prev.foreground;
-                new_state.foreground_exe = prev.foreground_exe;
-                new_state.foreground_name = prev.foreground_name;
-                new_state.foreground_title = prev.foreground_title;
-                new_state.maximized_monitor = prev.maximized_monitor;
-                new_state.maximized_rect = prev.maximized_rect;
+                new_state.foreground_exe = prev.foreground_exe.clone();
+                new_state.foreground_name = prev.foreground_name.clone();
+                new_state.foreground_title = prev.foreground_title.clone();
                 new_state.fullscreen = prev.fullscreen;
-            } else if is_desktop_class(&class) {
+            } else {
+                new_state.foreground_name = "桌面".to_string();
+            }
+        } else {
+            let class = class_name(fg);
+            if is_our_window(&class) || is_transient_tray_or_popup_class(&class) {
+                // 点击 Finder/托盘触发自绘面板、右键菜单或系统托盘溢出弹窗时，保留先前外部应用状态
+                if is_live_foreground_candidate(HWND(prev.foreground as *mut _)) {
+                    new_state.foreground = prev.foreground;
+                    new_state.foreground_exe = prev.foreground_exe.clone();
+                    new_state.foreground_name = prev.foreground_name.clone();
+                    new_state.foreground_title = prev.foreground_title.clone();
+                    new_state.fullscreen = prev.fullscreen;
+                } else {
+                    new_state.foreground_name = "桌面".to_string();
+                }
+            } else if is_explicit_desktop_class(&class) {
+                new_state.foreground = fg.0 as isize;
                 new_state.foreground_name = "桌面".to_string();
             } else {
+                let (_pid, exe_lower, exe_raw) = resolve_window_process(fg);
+                let title = window_text(fg);
+                new_state.foreground = fg.0 as isize;
+                new_state.foreground_exe = exe_lower.clone();
+                new_state.foreground_title = title.clone();
                 new_state.foreground_name = app_display_name(&exe_raw, Some(&title));
-                let r = visible_window_rect(fg);
                 if let Some(mon) = monitor_of_window(fg) {
+                    let r = visible_window_rect(fg);
                     let style = GetWindowLongPtrW(fg, GWL_STYLE) as u32;
-                    let has_caption = (style & WS_CAPTION.0) == WS_CAPTION.0;
-                    let covers_full = r.left <= mon.rect.left + 1
-                        && r.right >= mon.rect.right - 1
-                        && r.top <= mon.rect.top + 1
-                        && r.bottom >= mon.rect.bottom - 1;
-                    let covers_work = (r.right - r.left) >= (mon.work.right - mon.work.left - 8)
-                        && (r.bottom - r.top) >= (mon.work.bottom - mon.work.top - 8);
-                    // 优先以 Windows 原生 IsZoomed 判定最大化，避免无边框最大化误判成独占全屏
-                    if IsZoomed(fg).as_bool() {
-                        new_state.maximized_monitor = mon.hmonitor.0 as isize;
-                        new_state.maximized_rect = Some(r);
-                    } else if covers_full && !has_caption {
+                    let cov = classify_window_coverage(
+                        r,
+                        mon.rect,
+                        mon.work,
+                        IsZoomed(fg).as_bool(),
+                        (style & WS_CAPTION.0) == WS_CAPTION.0,
+                    );
+                    if cov == WindowCoverage::Fullscreen {
                         new_state.fullscreen = true;
-                    } else if covers_work {
-                        new_state.maximized_monitor = mon.hmonitor.0 as isize;
-                        new_state.maximized_rect = Some(r);
                     }
+                    fg_ext = Some((fg, exe_lower, mon, r, cov));
                 }
             }
             // 仅将 D3D 独占全屏(3) / 演示模式(4) 判定为全屏，排除 QUNS_BUSY(2) 防止误隐藏顶部栏
@@ -489,17 +684,51 @@ pub fn refresh() -> bool {
             }
         }
 
-        let list = &mut new_state.windows as *mut Vec<WinInfo> as isize;
-        let _ = EnumWindows(Some(enum_windows), LPARAM(list));
+        let scan_ptr = &mut scan as *mut EnumScan as isize;
+        let _ = EnumWindows(Some(enum_windows), LPARAM(scan_ptr));
+
+        // 兜底：若前台最大化应用因特殊样式未被 enum_windows 计入，补充记录到对应显示器
+        if let Some((fg_hwnd, exe_lower, mon, r, WindowCoverage::Maximized)) = fg_ext {
+            let hmon = mon.hmonitor.0 as isize;
+            if !IsIconic(fg_hwnd).as_bool() && !scan.decided_monitors.contains(&hmon) {
+                scan.maximized.push(MaximizedWindow {
+                    monitor: hmon,
+                    hwnd: fg_hwnd.0 as isize,
+                    exe: exe_lower,
+                    rect: r,
+                });
+                scan.decided_monitors.push(hmon);
+            }
+        }
+
+        let active_hmon = if new_state.foreground != 0 {
+            monitor_of_window(HWND(new_state.foreground as *mut _)).map(|m| m.hmonitor.0 as isize)
+        } else {
+            None
+        };
+        let primary_max = active_hmon
+            .and_then(|hm| scan.maximized.iter().find(|w| w.monitor == hm))
+            .or_else(|| scan.maximized.first());
+        if let Some(m) = primary_max {
+            new_state.maximized_monitor = m.monitor;
+            new_state.maximized_hwnd = m.hwnd;
+            new_state.maximized_exe = m.exe.clone();
+            new_state.maximized_rect = Some(m.rect);
+        }
     }
-    new_state.windows.sort_by(|a, b| (a.hwnd.0 as isize).cmp(&(b.hwnd.0 as isize)));
+    scan.windows.sort_by(|a, b| (a.hwnd.0 as isize).cmp(&(b.hwnd.0 as isize)));
+    new_state.windows = scan.windows;
+    new_state.maximized_windows = scan.maximized;
     let changed = {
         let mut cur = STATE.lock().unwrap_or_else(|e| e.into_inner());
         let changed = cur.foreground != new_state.foreground
             || cur.foreground_exe != new_state.foreground_exe
             || cur.foreground_name != new_state.foreground_name
             || cur.maximized_monitor != new_state.maximized_monitor
+            || cur.maximized_hwnd != new_state.maximized_hwnd
+            || cur.maximized_exe != new_state.maximized_exe
             || cur.maximized_rect != new_state.maximized_rect
+            || cur.maximized_windows != new_state.maximized_windows
             || cur.fullscreen != new_state.fullscreen
             || cur.windows.len() != new_state.windows.len()
             || cur
@@ -514,19 +743,68 @@ pub fn refresh() -> bool {
 }
 
 unsafe extern "system" fn enum_windows(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    if is_app_window(hwnd) {
-        let list = &mut *(lparam.0 as *mut Vec<WinInfo>);
-        let (pid, exe, exe_raw) = resolve_window_process(hwnd);
+    let scan = &mut *(lparam.0 as *mut EnumScan);
+    let class = class_name(hwnd);
+    // Win+D 等操作将桌面图标宿主提到窗口前方时，锁定对应显示器为非最大化桌面视图
+    if (class == "Progman" || (class == "WorkerW" && has_shell_def_view(hwnd)))
+        && IsWindowVisible(hwnd).as_bool()
+        && !window_cloaked(hwnd)
+    {
+        if let Some(mon) = monitor_of_window(hwnd) {
+            let r = visible_window_rect(hwnd);
+            if (r.right - r.left) >= mon.width() - 2 && (r.bottom - r.top) >= mon.height() - 2 {
+                let hmon = mon.hmonitor.0 as isize;
+                if !scan.decided_monitors.contains(&hmon) {
+                    scan.decided_monitors.push(hmon);
+                }
+            }
+        }
+        return BOOL::from(true);
+    }
+
+    if is_app_window_with_class(hwnd, &class) {
+        let (_pid_val, exe, exe_raw) = resolve_window_process(hwnd);
         let title = window_text(hwnd);
         let display_name = app_display_name(&exe_raw, Some(&title));
-        list.push(WinInfo {
+        let minimized = IsIconic(hwnd).as_bool();
+        if !minimized {
+            if let Some(mon) = monitor_of_window(hwnd) {
+                let hmon = mon.hmonitor.0 as isize;
+                if !scan.decided_monitors.contains(&hmon) {
+                    let r = visible_window_rect(hwnd);
+                    let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+                    match classify_window_coverage(
+                        r,
+                        mon.rect,
+                        mon.work,
+                        IsZoomed(hwnd).as_bool(),
+                        (style & WS_CAPTION.0) == WS_CAPTION.0,
+                    ) {
+                        WindowCoverage::Maximized => {
+                            scan.maximized.push(MaximizedWindow {
+                                monitor: hmon,
+                                hwnd: hwnd.0 as isize,
+                                exe: exe.clone(),
+                                rect: r,
+                            });
+                            scan.decided_monitors.push(hmon);
+                        }
+                        WindowCoverage::Fullscreen => {
+                            scan.decided_monitors.push(hmon);
+                        }
+                        WindowCoverage::None => {}
+                    }
+                }
+            }
+        }
+        scan.windows.push(WinInfo {
             hwnd,
-            pid,
+            pid: _pid_val,
             title,
             exe,
             exe_raw,
             display_name,
-            minimized: IsIconic(hwnd).as_bool(),
+            minimized,
         });
     }
     BOOL::from(true)
@@ -669,5 +947,52 @@ mod tests {
         assert_eq!(clean_pe_name("Microsoft Windows Operating System"), None);
         assert_eq!(clean_pe_name("Application Frame Host"), None);
         assert_eq!(clean_pe_name("Visual Studio Code™"), Some("Visual Studio Code".into()));
+    }
+
+    #[test]
+    fn desktop_and_transient_class_classification() {
+        assert!(is_explicit_desktop_class("Progman"));
+        assert!(is_explicit_desktop_class("WorkerW"));
+        assert!(!is_explicit_desktop_class("Shell_TrayWnd"));
+
+        assert!(is_transient_tray_or_popup_class("Shell_TrayWnd"));
+        assert!(is_transient_tray_or_popup_class("Windows.UI.Input.InputSite.WindowClass"));
+        assert!(is_transient_tray_or_popup_class("Windows.UI.Composition.DesktopWindowContentBridge"));
+        assert!(is_transient_tray_or_popup_class("TopLevelWindowForOverflowXamlIsland"));
+        assert!(is_transient_tray_or_popup_class("Xaml_WindowedPopupClass"));
+        assert!(is_transient_tray_or_popup_class("#32768"));
+        assert!(!is_transient_tray_or_popup_class("Chrome_WidgetWin_1"));
+    }
+
+    #[test]
+    fn window_coverage_and_per_monitor_state() {
+        let mon = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
+        let work = RECT { left: 0, top: 30, right: 1920, bottom: 1080 };
+        let normal = RECT { left: 100, top: 100, right: 900, bottom: 700 };
+        let zoomed_rect = RECT { left: 0, top: 30, right: 1920, bottom: 1080 };
+        assert_eq!(classify_window_coverage(normal, mon, work, false, true), WindowCoverage::None);
+        assert_eq!(classify_window_coverage(zoomed_rect, mon, work, true, false), WindowCoverage::Maximized);
+        assert_eq!(classify_window_coverage(mon, mon, work, false, false), WindowCoverage::Fullscreen);
+        assert_eq!(classify_window_coverage(zoomed_rect, mon, work, false, true), WindowCoverage::Maximized);
+
+        let mut st = MonitorState::default();
+        st.maximized_windows.push(MaximizedWindow {
+            monitor: 101,
+            hwnd: 202,
+            exe: r"C:\App\edge.exe".into(),
+            rect: zoomed_rect,
+        });
+        assert!(st.is_monitor_maximized(101));
+        assert!(!st.is_monitor_maximized(999));
+        assert_eq!(st.maximized_on(101).unwrap().hwnd, 202);
+    }
+
+    #[test]
+    fn rect_overlap_calculates_intersection_and_disjoint() {
+        let a = RECT { left: 100, top: 200, right: 500, bottom: 260 };
+        let b = RECT { left: 300, top: 220, right: 700, bottom: 280 };
+        let disjoint = RECT { left: 600, top: 200, right: 800, bottom: 260 };
+        assert_eq!(rect_overlap_size(a, b), (200, 40));
+        assert_eq!(rect_overlap_size(a, disjoint), (0, 0));
     }
 }

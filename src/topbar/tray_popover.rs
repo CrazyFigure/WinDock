@@ -86,6 +86,7 @@ pub struct Popover {
     pub dark: bool,
     pub accent: (f32, f32, f32),
     anchor: RECT,
+    prev_fg: HWND,
     context_key: Option<String>,
 }
 
@@ -141,6 +142,7 @@ impl Popover {
                 dark: false,
                 accent: (0.04, 0.52, 1.0),
                 anchor: RECT::default(),
+                prev_fg: HWND::default(),
                 context_key: None,
             })
         }
@@ -172,8 +174,11 @@ impl Popover {
     }
 
     /// 打开浮层：锚定在顶部栏 `<` 按钮正下方、右对齐，自动避让屏幕边界。
-    pub fn open(&mut self, anchor: RECT, mut items: Vec<TrayItem>, pinned: Vec<String>, appearance: &Appearance) {
+    pub fn open(&mut self, anchor: RECT, mut items: Vec<TrayItem>, pinned: Vec<String>, prev_fg: HWND, appearance: &Appearance) {
         sort_items(&mut items);
+        if !prev_fg.0.is_null() && prev_fg != self.hwnd {
+            self.prev_fg = prev_fg;
+        }
         self.items = items;
         self.pinned = pinned;
         self.scroll = 0;
@@ -259,6 +264,8 @@ impl Popover {
             self.hover_idx = None;
             self.press = None;
             self.context_key = None;
+            // 收纳格隐藏前若仍持有前台焦点，主动归还原窗口防止前台变空导致顶部栏转黑
+            crate::win32::restore_foreground_if_owned(self.hwnd, self.prev_fg);
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }

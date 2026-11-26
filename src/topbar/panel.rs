@@ -354,7 +354,7 @@ impl StatusPanel {
         }
         self.kind = kind;
         self.anchor = anchor;
-        if !prev_fg.0.is_null() {
+        if !prev_fg.0.is_null() && prev_fg != self.hwnd {
             self.prev_fg = prev_fg;
         }
         self.dark = appearance.is_dark();
@@ -389,6 +389,8 @@ impl StatusPanel {
             self.visible = false;
             self.hover = PanelHit::None;
             self.pressed = PanelHit::None;
+            // 若面板关闭前仍持有焦点，先归还给原外部应用窗口，避免顶部栏色回落桌面色
+            crate::win32::restore_foreground_if_owned(self.hwnd, self.prev_fg);
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }

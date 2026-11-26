@@ -193,6 +193,7 @@ impl WindowPreview {
         anchor_top: i32,
         mon: MonitorInfo,
         appearance: &Appearance,
+        dock_dark: bool,
     ) {
         if windows.is_empty() {
             self.close();
@@ -205,7 +206,7 @@ impl WindowPreview {
         self.cards.clear();
         self.entry_idx = Some(entry_idx);
         self.exe_key = exe_key.to_string();
-        self.dark = appearance.desktop_is_dark();
+        self.dark = dock_dark;
         self.accent = accent_from_config(appearance);
         self.hover_card = None;
         self.hover_close = None;

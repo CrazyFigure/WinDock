@@ -22,6 +22,8 @@ pub struct TipTarget {
     pub anchor: RECT,
     pub dpi: u32,
     pub text: String,
+    // 标记该项是否位于原生托盘溢出区，悬停稳定后才按需抓溢出详情
+    pub hidden_icon: bool,
 }
 
 #[derive(Default)]
@@ -36,6 +38,10 @@ pub struct TrayTooltip {
 impl TrayTooltip {
     pub fn owner(&self) -> Option<HWND> {
         self.target.as_ref().map(|target| target.owner)
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible
     }
 
     pub fn tracks(&self, target: &TipTarget) -> bool {
@@ -76,7 +82,8 @@ impl TrayTooltip {
         self.visible = false;
     }
 
-    pub fn on_timer(&mut self, main: HWND, dark: bool) {
+    /// 悬停防抖计时器到点后显示提示；若指向溢出区托盘项，返回其所属宿主窗口以便按需刷新详情。
+    pub fn on_timer(&mut self, main: HWND, dark: bool) -> Option<HWND> {
         unsafe {
             let _ = KillTimer(main, TIMER_TRAY_TIP);
         }
@@ -88,8 +95,10 @@ impl TrayTooltip {
                 && WindowFromPoint(cursor) == target.owner
         }) {
             self.render(dark);
+            self.target.as_ref().filter(|t| t.hidden_icon).map(|t| t.owner)
         } else {
             self.clear(main);
+            None
         }
     }
 

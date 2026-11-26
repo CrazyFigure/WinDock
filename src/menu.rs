@@ -79,6 +79,7 @@ impl MenuItem {
 pub struct ContextMenu {
     pub hwnd: HWND,
     pub visible: bool,
+    prev_fg: HWND,
     dpi: u32,
     w: i32,
     h: i32,
@@ -99,6 +100,7 @@ impl Default for ContextMenu {
         Self {
             hwnd: HWND::default(),
             visible: false,
+            prev_fg: HWND::default(),
             dpi: 96,
             w: 0,
             h: 0,
@@ -184,11 +186,15 @@ impl ContextMenu {
         items: Vec<MenuItem>,
         x: i32,
         y: i32,
+        prev_fg: HWND,
         appearance: &Appearance,
     ) {
         if items.is_empty() {
             self.close();
             return;
+        }
+        if !prev_fg.0.is_null() && prev_fg != self.hwnd {
+            self.prev_fg = prev_fg;
         }
         let mon = unsafe {
             let pt = POINT { x, y };
@@ -295,6 +301,8 @@ impl ContextMenu {
             self.visible = false;
             self.hover = None;
             self.pressed = None;
+            // 若关闭时菜单仍持有前景焦点，先归还给原窗口，避免点击顶部栏等无激活区域后焦点掉到桌面
+            crate::win32::restore_foreground_if_owned(self.hwnd, self.prev_fg);
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }

@@ -63,14 +63,13 @@ fn register_classes(hinst: windows::Win32::Foundation::HINSTANCE) {
         return;
     }
     unsafe {
-        let brush: windows::Win32::Graphics::Gdi::HBRUSH =
-            std::mem::transmute(windows::Win32::Graphics::Gdi::GetStockObject(windows::Win32::Graphics::Gdi::BLACK_BRUSH));
+        // 使用空背景画刷，避免窗口重绘或激活切换时系统先刷出黑底闪烁
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(topbar_proc),
             hInstance: hinst,
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            hbrBackground: brush,
+            hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH::default(),
             lpszClassName: crate::win32::wide_static(CLASS_TOPBAR),
             ..Default::default()
         };
@@ -109,6 +108,9 @@ pub struct TopBar {
     pub fused_target: Option<Rgb>,
     pub cur_fused: Rgb,
     pub dark_text: bool,
+    // 当前已融合或待采样的外部最大化窗口句柄，以及是否需要重新取色
+    pub fused_hwnd: isize,
+    pub color_dirty: bool,
     pub active_app: String,
     pub status: StatusSnapshot,
     pub tray_items: Vec<TrayItem>,
@@ -170,6 +172,8 @@ impl TopBar {
                 fused_target: None,
                 cur_fused: base_rgb,
                 dark_text: base_rgb.use_dark_text(),
+                fused_hwnd: 0,
+                color_dirty: false,
                 active_app: "桌面".into(),
                 status: StatusSnapshot::default(),
                 tray_items: Vec::new(),
@@ -526,8 +530,11 @@ unsafe extern "system" fn topbar_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         WM_ERASEBKGND => return LRESULT(1),
         WM_PAINT => {
-            crate::app::with_app(hwnd, |app| app.paint_topbar(hwnd));
-            return LRESULT(0);
+            // 若主处理器正忙于模态或嵌套分发，交由默认过程校验绘制区，避免未 Validate 的黑底闪烁
+            if !crate::app::handler_busy() {
+                crate::app::with_app(hwnd, |app| app.paint_topbar(hwnd));
+                return LRESULT(0);
+            }
         }
         WM_MOUSEMOVE => {
             let x = crate::win32::get_x_lparam(lparam.0);

@@ -288,6 +288,24 @@ pub fn bring_to_front(hwnd: HWND) {
     }
 }
 
+/// 关闭自绘菜单/浮层前，若其仍持有前台焦点，则将焦点平稳归还给原外部窗口，
+/// 避免因无焦点顶部栏触发窗口隐藏后前台句柄落空（NULL/Shell_TrayWnd）导致状态闪烁。
+pub fn restore_foreground_if_owned(popup: HWND, prev_fg: HWND) {
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        if popup.0.is_null() || prev_fg.0.is_null() || prev_fg == popup {
+            return;
+        }
+        if GetForegroundWindow() == popup
+            && IsWindow(prev_fg).as_bool()
+            && IsWindowVisible(prev_fg).as_bool()
+            && !IsIconic(prev_fg).as_bool()
+        {
+            let _ = SetForegroundWindow(prev_fg);
+        }
+    }
+}
+
 /// 在资源管理器中打开路径（文件、目录、shell: 路径）。
 pub fn open_shell_path(verb: &str, file: &str, params: Option<&str>) -> bool {
     use windows::core::PCWSTR;
@@ -365,23 +383,47 @@ pub fn fnv1a64(data: &[u8]) -> u64 {
     h
 }
 
-/// 系统深色模式（AppsUseLightTheme=0 即深色）。
-pub fn system_uses_dark_theme() -> bool {
+/// 查询 Windows 系统浅/深色主题设置（优先 AppsUseLightTheme，缺失时回退 SystemUsesLightTheme）；
+/// 仅在系统注册表键均无法读取时返回 None，以便调用方继续降级到壁纸亮度等兜底策略。
+pub fn system_theme_dark() -> Option<bool> {
     use windows::Win32::System::Registry::{
         RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD, REG_VALUE_TYPE,
     };
-    let mut data = 0u32;
-    let mut size = 4u32;
-    let r = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
-            w!("AppsUseLightTheme"),
-            RRF_RT_REG_DWORD,
-            Some(&mut REG_VALUE_TYPE(0)),
-            Some(&mut data as *mut u32 as *mut _),
-            Some(&mut size),
-        )
-    };
-    r.is_ok() && data == 0
+    for value_name in [w!("AppsUseLightTheme"), w!("SystemUsesLightTheme")] {
+        let mut data = 0u32;
+        let mut size = 4u32;
+        let r = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
+                value_name,
+                RRF_RT_REG_DWORD,
+                Some(&mut REG_VALUE_TYPE(0)),
+                Some(&mut data as *mut u32 as *mut _),
+                Some(&mut size),
+            )
+        };
+        if r.is_ok() {
+            return Some(data == 0);
+        }
+    }
+    None
+}
+
+/// 系统深色模式（AppsUseLightTheme=0 即深色）。
+pub fn system_uses_dark_theme() -> bool {
+    system_theme_dark().unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_foreground_handles_null_and_self_safely() {
+        restore_foreground_if_owned(HWND::default(), HWND::default());
+        let pseudo = HWND(0x1234isize as *mut _);
+        restore_foreground_if_owned(pseudo, HWND::default());
+        restore_foreground_if_owned(pseudo, pseudo);
+    }
 }

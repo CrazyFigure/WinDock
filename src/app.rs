@@ -47,6 +47,7 @@ pub const MUTEX_NAME: &str = "Local\\WinDockFinder-SingleInstance";
 pub const WM_APP_IPC: u32 = WM_APP + 1;
 pub const WM_APP_TRAY: u32 = WM_APP + 2;
 pub const WM_APP_COLOR: u32 = WM_APP + 32;
+pub const WM_APP_DOCK_COLOR: u32 = WM_APP + 33;
 pub const WM_APP_UPDATE: u32 = WM_APP + 50;
 
 pub const IPC_SETTINGS: usize = 1;
@@ -224,9 +225,21 @@ fn fill_buf(buf: &mut [u16], s: &str) {
 }
 
 fn is_desktop_class(class: &str) -> bool {
-    matches!(class, "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "Shell_IconView")
-        || class.starts_with("NotifyIconOverflowWindow")
+    matches!(
+        class,
+        "Progman"
+            | "WorkerW"
+            | "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "Shell_IconView"
+            | "#32768"
+            | "tooltips_class32"
+            | "Windows.UI.Input.InputSite.WindowClass"
+            | "Windows.UI.Composition.DesktopWindowContentBridge"
+    ) || class.starts_with("NotifyIconOverflowWindow")
         || class.starts_with("TopLevelWindowForOverflowXamlIsland")
+        || class.starts_with("Xaml_WindowedPopupClass")
+        || class.contains("QWindowPopup")
         || class.starts_with("WinDockFinder")
 }
 
@@ -345,9 +358,12 @@ pub struct App {
     pub temp_show_until: Option<Instant>,
     pub display_dirty_at: Option<Instant>,
     pub cursor_monitor: isize,
-    pub fused_hwnd: isize,
+    // 当前正在后台采样的 (显示器句柄, 最大化窗口句柄)
+    pub color_sampling: Option<(isize, isize)>,
     pub color_token: u64,
     pub color_busy: bool,
+    pub dock_color_token: u64,
+    pub dock_color_busy: bool,
     pub last_beat: Instant,
     pub menu_ctx: MenuCtx,
     pub update_checked: bool,
@@ -479,9 +495,11 @@ pub fn run(open_settings: bool) -> i32 {
         temp_show_until: None,
         display_dirty_at: None,
         cursor_monitor: 0,
-        fused_hwnd: 0,
+        color_sampling: None,
         color_token: 0,
         color_busy: false,
+        dock_color_token: 0,
+        dock_color_busy: false,
         last_beat: Instant::now(),
         menu_ctx: MenuCtx::None,
         update_checked: false,
@@ -860,6 +878,25 @@ impl App {
         monitor::app_display_name(&self.snap.foreground_exe, Some(&self.snap.foreground_title))
     }
 
+    /// 判断当前是否有顶部栏菜单、状态面板、收纳浮层或托盘提示遮盖顶部采样区。
+    fn has_topbar_overlay(&self) -> bool {
+        self.context_menu.visible
+            || self.status_panel.visible
+            || self.tray_context.is_some()
+            || self.tray_tip.is_visible()
+            || self.topbars.iter().any(|b| b.popover.as_ref().is_some_and(|p| p.visible))
+    }
+
+    /// 计算指定显示器顶部栏应保持或进入融合取色的目标最大化窗口句柄。
+    fn bar_fusion_target(snap: &MonitorState, hmon: isize, cfg: &crate::config::TopbarCfg) -> Option<isize> {
+        if !cfg.adaptive_maximized_color || snap.fullscreen {
+            return None;
+        }
+        snap.maximized_on(hmon)
+            .filter(|w| !color_sync::is_excluded(&w.exe, &cfg.adaptive_color_exclude))
+            .map(|w| w.hwnd)
+    }
+
     fn on_state_changed(&mut self) {
         let label = self.active_app_label();
         let fullscreen = self.snap.fullscreen;
@@ -882,42 +919,57 @@ impl App {
             self.last_ime = first.status.ime.clone();
         }
         self.sync_edge_timer();
-        // 最大化窗口自动取色融合
+
+        // 最大化窗口自动取色融合（按显示器独立跟踪最上层可见最大化窗口，点击 Finder 或切出浮窗不失真）
         let cfg = &self.config.topbar;
-        let fg = self.snap.foreground;
-        let hmon = self.snap.maximized_monitor;
-        let want_fused = cfg.adaptive_maximized_color
-            && hmon != 0
-            && !fullscreen
-            && !color_sync::is_excluded(&self.snap.foreground_exe, &cfg.adaptive_color_exclude);
-        if want_fused {
-            let missing_fused = self
-                .topbars
-                .iter()
-                .any(|b| b.monitor.hmonitor.0 as isize == hmon && b.mode != crate::topbar::ColorMode::Fused);
-            if self.fused_hwnd != fg || missing_fused {
-                self.fused_hwnd = fg;
-                self.spawn_color_sample(true);
-                // 延迟 280ms 复查一次标题栏颜色，避免 Win+D 还原动画期间首次采样采到壁纸
-                unsafe {
-                    let _ = SetTimer(self.hwnd, TIMER_COLOR_RECHECK, 280, None);
+        let mut need_sample = false;
+        let mut any_glass_changed = false;
+        let mut invalidate_sampling = false;
+        for bar in &mut self.topbars {
+            let hmon = bar.monitor.hmonitor.0 as isize;
+            if let Some(target_hwnd) = Self::bar_fusion_target(&self.snap, hmon, cfg) {
+                if bar.fused_hwnd != target_hwnd || bar.mode != crate::topbar::ColorMode::Fused {
+                    bar.fused_hwnd = target_hwnd;
+                    bar.color_dirty = true;
                 }
-            }
-        } else {
-            let had_fused = self.fused_hwnd != 0 || self.topbars.iter().any(|b| b.mode == crate::topbar::ColorMode::Fused);
-            self.fused_hwnd = 0;
-            self.color_token += 1; // 使在途采样失效
-            unsafe {
-                let _ = KillTimer(self.hwnd, TIMER_COLOR_RECHECK);
-            }
-            for bar in &mut self.topbars {
+                if bar.color_dirty {
+                    need_sample = true;
+                }
+            } else {
+                let had_fused = bar.fused_hwnd != 0 || bar.mode == crate::topbar::ColorMode::Fused;
+                bar.fused_hwnd = 0;
+                bar.color_dirty = false;
+                if self.color_sampling.is_some_and(|(m, _)| m == hmon) {
+                    self.color_sampling = None;
+                    invalidate_sampling = true;
+                }
                 bar.set_fused_target(None, base_rgb, true);
                 bar.dark_text = pure_dark_text;
                 invalidate(bar.hwnd);
+                if had_fused {
+                    any_glass_changed = true;
+                }
             }
-            if had_fused {
-                self.ensure_frame();
+        }
+        if invalidate_sampling {
+            self.color_token += 1;
+        }
+        let any_fused = self.topbars.iter().any(|b| b.fused_hwnd != 0);
+        if !any_fused {
+            unsafe {
+                let _ = KillTimer(self.hwnd, TIMER_COLOR_RECHECK);
             }
+        } else if need_sample {
+            if !self.has_topbar_overlay() {
+                self.sample_next_dirty_topbar(true);
+            }
+            // 延迟 280ms 复查一次标题栏颜色，避免 Win+D 还原动画期间首次采样采到壁纸
+            unsafe {
+                let _ = SetTimer(self.hwnd, TIMER_COLOR_RECHECK, 280, None);
+            }
+        }
+        if any_glass_changed {
+            self.ensure_frame();
         }
         if !self.docks.is_empty() {
             // 仅当存在自动隐藏/智能避让 Dock 状态需要推进时启动帧调度
@@ -928,34 +980,148 @@ impl App {
                     break;
                 }
             }
+            self.sync_dock_backdrops();
         }
     }
 
-    fn spawn_color_sample(&mut self, initial_delay: bool) {
-        if self.color_busy || self.snap.foreground == 0 {
+    /// 协调 Dock 背后配色采样：优先跟随背后窗口色，其次 Windows 系统主题，最后降级壁纸。
+    fn sync_dock_backdrops(&mut self) {
+        let appearance = self.config.appearance.clone();
+        if appearance.theme != "system" || self.snap.fullscreen {
+            self.dock_color_token += 1;
+            let mut dirty = false;
+            for d in &mut self.docks {
+                d.apply_backdrop_color(None, &appearance, true);
+                dirty |= d.dirty;
+            }
+            if dirty {
+                self.ensure_frame();
+            }
+            return;
+        }
+        for d in &mut self.docks {
+            d.backdrop_dirty = true;
+        }
+        self.spawn_dock_backdrop_sample();
+    }
+
+    /// 为下一个已显示且待更新背后配色的 Dock 异步拉起采样线程（隐藏中将直接在显出首帧零遮挡采样）。
+    fn spawn_dock_backdrop_sample(&mut self) {
+        if self.config.appearance.theme != "system" || self.snap.fullscreen || self.dock_color_busy {
+            return;
+        }
+        let target = self
+            .docks
+            .iter()
+            .find(|d| d.backdrop_dirty && d.window_visible && d.want_visible)
+            .map(|d| (d.monitor.hmonitor.0 as isize, d.capsule_screen_rect(), d.win_rect, d.monitor.rect));
+        let Some((hmon, cap_screen, win_rect, mon_rect)) = target else {
+            return;
+        };
+        self.dock_color_busy = true;
+        self.dock_color_token += 1;
+        let token = self.dock_color_token;
+        let main = self.hwnd.0 as isize;
+        let spawned = std::thread::Builder::new()
+            .name("dock-color".into())
+            .spawn(move || {
+                let rgb = color_sync::sample_dock_backdrop(cap_screen, win_rect, mon_rect, true);
+                let payload = Box::new((token, hmon, rgb));
+                unsafe {
+                    let _ = PostMessageW(
+                        HWND(main as *mut _),
+                        WM_APP_DOCK_COLOR,
+                        WPARAM(0),
+                        LPARAM(Box::into_raw(payload) as isize),
+                    );
+                }
+            });
+        if spawned.is_err() {
+            self.dock_color_busy = false;
+        }
+    }
+
+    fn on_dock_color(&mut self, lparam: isize) {
+        self.dock_color_busy = false;
+        let (token, hmon, rgb) = *unsafe { Box::from_raw(lparam as *mut (u64, isize, Option<Rgb>)) };
+        if token != self.dock_color_token || self.config.appearance.theme != "system" {
+            return;
+        }
+        let appearance = self.config.appearance.clone();
+        let instant = self.config.topbar.color_transition_ms == 0 || appearance.reduce_motion;
+        let mut need_frame = false;
+        for d in &mut self.docks {
+            if d.monitor.hmonitor.0 as isize == hmon {
+                d.apply_backdrop_color(rgb, &appearance, instant);
+                need_frame |= d.dirty;
+            }
+        }
+        if need_frame {
+            self.ensure_frame();
+        }
+        self.spawn_dock_backdrop_sample();
+    }
+
+    /// 浮窗/菜单关闭后若仍无其它遮罩且存在待取色顶部栏，立即补采一次颜色。
+    fn flush_pending_color_samples(&mut self) {
+        if !self.has_topbar_overlay()
+            && self.topbars.iter().any(|b| b.fused_hwnd != 0 && b.color_dirty)
+        {
+            self.sample_next_dirty_topbar(false);
+        }
+    }
+
+    /// 无遮罩时将已进入融合态的顶部栏标记为待复查并触发新一轮采样。
+    fn schedule_fused_color_recheck(&mut self) {
+        if !self.config.topbar.adaptive_maximized_color || self.snap.fullscreen {
+            return;
+        }
+        let mut any = false;
+        for bar in &mut self.topbars {
+            if bar.fused_hwnd != 0 {
+                bar.color_dirty = true;
+                any = true;
+            }
+        }
+        if any && !self.has_topbar_overlay() {
+            self.sample_next_dirty_topbar(false);
+        }
+    }
+
+    /// 依次为下一个待取色/待复查的融合顶部栏启动后台采样；目标变更时递增值以废止旧结果。
+    fn sample_next_dirty_topbar(&mut self, initial_delay: bool) {
+        if !self.config.topbar.adaptive_maximized_color || self.snap.fullscreen {
+            return;
+        }
+        let next = self
+            .topbars
+            .iter()
+            .find(|b| b.fused_hwnd != 0 && b.color_dirty)
+            .map(|b| (b.monitor.hmonitor.0 as isize, b.fused_hwnd, b.monitor.rect, b.height));
+        let Some((hmon, target, mon_rect, bar_h)) = next else {
+            self.color_sampling = None;
+            return;
+        };
+        if self.color_busy {
+            // 若目标窗口在采样中途发生变化，立即推进 token 使旧线程返回结果自然作废
+            if self.color_sampling != Some((hmon, target)) {
+                self.color_token += 1;
+            }
             return;
         }
         self.color_busy = true;
+        self.color_sampling = Some((hmon, target));
         self.color_token += 1;
         let token = self.color_token;
-        let target = self.snap.foreground as isize;
         let main = self.hwnd.0 as isize;
-        let hmon = self.snap.maximized_monitor;
-        let (mon_rect, bar_h) = self
-            .topbars
-            .iter()
-            .find(|b| b.monitor.hmonitor.0 as isize == hmon)
-            .or_else(|| self.topbars.first())
-            .map(|b| (Some(b.monitor.rect), b.height))
-            .unwrap_or((None, 30));
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("caption-color".into())
             .spawn(move || {
                 if initial_delay {
                     std::thread::sleep(Duration::from_millis(60));
                 }
-                let rgb = color_sync::caption_color(HWND(target as *mut _), mon_rect, bar_h);
-                let payload = Box::new((token, rgb));
+                let rgb = color_sync::caption_color(HWND(target as *mut _), Some(mon_rect), bar_h);
+                let payload = Box::new((token, hmon, target, rgb));
                 unsafe {
                     let _ = PostMessageW(
                         HWND(main as *mut _),
@@ -964,31 +1130,40 @@ impl App {
                         LPARAM(Box::into_raw(payload) as isize),
                     );
                 }
-            })
-            .ok();
+            });
+        if spawned.is_err() {
+            self.color_busy = false;
+            self.color_sampling = None;
+        }
     }
 
     fn on_color(&mut self, lparam: isize) {
         self.color_busy = false;
-        let (token, rgb) = *unsafe { Box::from_raw(lparam as *mut (u64, Rgb)) };
-        if token != self.color_token || self.fused_hwnd == 0 {
-            if self.fused_hwnd != 0 {
-                self.spawn_color_sample(false);
+        self.color_sampling = None;
+        let (token, hmon, target, rgb) = *unsafe { Box::from_raw(lparam as *mut (u64, isize, isize, Rgb)) };
+        if token != self.color_token {
+            if !self.has_topbar_overlay() {
+                self.sample_next_dirty_topbar(false);
             }
             return;
         }
-        let hmon = self.snap.maximized_monitor;
         let base_rgb = self.config.appearance.topbar_base_rgb();
         let instant = self.config.topbar.color_transition_ms == 0 || self.config.appearance.reduce_motion;
+        let mut applied = false;
         for bar in &mut self.topbars {
-            if bar.monitor.hmonitor.0 as isize == hmon {
+            if bar.monitor.hmonitor.0 as isize == hmon && bar.fused_hwnd == target && target != 0 {
+                bar.color_dirty = false;
                 bar.set_fused_target(Some(rgb), base_rgb, instant);
-            } else {
-                bar.set_fused_target(None, base_rgb, true);
+                invalidate(bar.hwnd);
+                applied = true;
             }
-            invalidate(bar.hwnd);
         }
-        self.ensure_frame();
+        if applied {
+            self.ensure_frame();
+        }
+        if !self.has_topbar_overlay() {
+            self.sample_next_dirty_topbar(false);
+        }
     }
 
     fn refresh_status(&mut self, full: bool) {
@@ -1187,7 +1362,7 @@ impl App {
         let hidden_by_mode = match cfg.hide_mode.as_str() {
             "always" => false,
             "auto" => true,
-            _ => self.snap.maximized_monitor == dock.monitor.hmonitor.0 as isize,
+            _ => self.snap.is_monitor_maximized(dock.monitor.hmonitor.0 as isize),
         };
         if !hidden_by_mode {
             return (true, false);
@@ -1357,7 +1532,8 @@ impl App {
                 };
                 let ptr = app_ptr();
                 let appearance = &self.config.appearance;
-                self.window_preview.show_for(ptr, hi, &exe, &windows, anchor_cx, anchor_top, mon, appearance);
+                let dock_dark = self.docks[di].color_dark;
+                self.window_preview.show_for(ptr, hi, &exe, &windows, anchor_cx, anchor_top, mon, appearance, dock_dark);
                 self.docks[di].dirty = true;
                 self.ensure_frame();
                 self.sync_edge_timer();
@@ -1413,6 +1589,7 @@ impl App {
         self.last_frame = Instant::now();
         let mut animating = self.eval_reveal();
         let n = self.docks.len();
+        let transition = self.config.topbar.color_transition_ms;
         for i in 0..n {
             let (want, hidden) = self.dock_state(i);
             let cfg = &self.config.dock;
@@ -1421,7 +1598,7 @@ impl App {
                 let dock = &mut self.docks[i];
                 dock.set_want_visible(want);
                 dock.update_trigger(hidden);
-                dock.tick(dt, cfg, appearance)
+                dock.tick(dt, cfg, appearance, transition)
             };
             let need_draw = a || self.docks[i].dirty;
             animating |= a;
@@ -1429,7 +1606,6 @@ impl App {
                 self.render_dock(i);
             }
         }
-        let transition = self.config.topbar.color_transition_ms;
         for bar in &mut self.topbars {
             animating |= bar.tick_color(dt, transition);
         }
@@ -1442,6 +1618,21 @@ impl App {
     }
 
     fn render_dock(&mut self, i: usize) {
+        // 首次从隐藏浮出前同步采样正后方画面（此时 Dock 尚未显示，完全无自遮挡且首帧零闪烁）
+        if !self.docks[i].window_visible && self.docks[i].want_visible && self.docks[i].backdrop_dirty {
+            let appearance = &self.config.appearance;
+            let bg = if appearance.theme == "system" && !self.snap.fullscreen {
+                color_sync::sample_dock_backdrop(
+                    self.docks[i].capsule_screen_rect(),
+                    self.docks[i].win_rect,
+                    self.docks[i].monitor.rect,
+                    false,
+                )
+            } else {
+                None
+            };
+            self.docks[i].apply_backdrop_color(bg, appearance, true);
+        }
         let cfg = &self.config.dock;
         let appearance = &self.config.appearance;
         let icons = self.icons.clone();
@@ -1528,14 +1719,26 @@ impl App {
                 self.rebuild_bars();
             }
         }
-        // 最大化融合态每 10 秒低频复查一次标题栏颜色（低开销）
-        if self.slow_ticks % 10 == 0
-            && self.fused_hwnd != 0
-            && self.config.topbar.adaptive_maximized_color
+        // 最大化融合态每 10 秒低频复查一次标题栏颜色（浮窗展开期间自动跳过，避免采到黑底阴影）
+        if self.slow_ticks % 10 == 0 {
+            self.schedule_fused_color_recheck();
+        }
+        // 可见 Dock 每 2 秒低频复查背后内容（覆盖应用内滚屏/标签页切换或壁纸切换等无窗口焦点变化场景）
+        if self.slow_ticks % 2 == 0
+            && self.config.appearance.theme == "system"
             && !self.snap.fullscreen
-            && !self.color_busy
+            && !self.dock_color_busy
         {
-            self.spawn_color_sample(false);
+            let mut marked = false;
+            for d in &mut self.docks {
+                if d.window_visible && d.want_visible {
+                    d.backdrop_dirty = true;
+                    marked = true;
+                }
+            }
+            if marked {
+                self.spawn_dock_backdrop_sample();
+            }
         }
         // 显示器/主题变更（防抖）
         if let Some(t) = self.display_dirty_at {
@@ -1798,8 +2001,18 @@ impl App {
             TIMER_TRAY_TIP => {
                 if matches!(self.tray_work, Some(TrayWork::Click { right: true, .. })) {
                     self.tray_tip.clear(self.hwnd);
-                } else {
-                    self.tray_tip.on_timer(self.hwnd, self.config.appearance.is_dark());
+                } else if let Some(owner) = self.tray_tip.on_timer(self.hwnd, self.config.appearance.is_dark()) {
+                    // 鼠标在顶部栏固定溢出图标上悬停稳定 100ms 后再按需拉取系统溢出详情，避免扫过即抢焦点
+                    if self.topbar_index(owner).is_some()
+                        && self.tray_context.is_none()
+                        && self.last_tray_details.is_none_or(|last| last.elapsed() >= Duration::from_secs(3))
+                    {
+                        self.tray_details_pending = true;
+                        if let Some(TrayWork::Refresh { canceled, reading_overflow: false, .. }) = &self.tray_work {
+                            canceled.store(true, Ordering::Relaxed);
+                        }
+                        self.refresh_tray();
+                    }
                 }
             }
             TIMER_TRAY_FLASH => {
@@ -1827,13 +2040,7 @@ impl App {
                 unsafe {
                     let _ = KillTimer(self.hwnd, TIMER_COLOR_RECHECK);
                 }
-                if self.fused_hwnd != 0
-                    && self.config.topbar.adaptive_maximized_color
-                    && !self.snap.fullscreen
-                    && !self.color_busy
-                {
-                    self.spawn_color_sample(false);
-                }
+                self.schedule_fused_color_recheck();
             }
             _ => {}
         }
@@ -1848,17 +2055,19 @@ impl App {
 
     /// 在指定屏幕坐标弹出 macOS 风格自绘菜单。
     fn popup_at(&mut self, items: Vec<MenuItem>, ctx: MenuCtx, x: i32, y: i32) {
+        let prev_fg = HWND(self.snap.foreground as *mut _);
         self.close_popover();
         self.status_panel.close();
         self.window_preview.close();
         self.menu_ctx = ctx;
         let ptr = app_ptr();
         let appearance = self.config.appearance.clone();
-        self.context_menu.open(ptr, items, x, y, &appearance);
+        self.context_menu.open(ptr, items, x, y, prev_fg, &appearance);
     }
 
     pub fn close_context_menu(&mut self) {
         self.context_menu.close();
+        self.flush_pending_color_samples();
     }
 
     pub fn menu_mouse_move(&mut self, x: i32, y: i32) {
@@ -1877,12 +2086,14 @@ impl App {
         if let Some(id) = self.context_menu.on_lbutton_up(x, y) {
             self.on_menu(id);
         }
+        self.flush_pending_color_samples();
     }
 
     pub fn menu_key_down(&mut self, vk: u32) {
         if let Some(id) = self.context_menu.on_key_down(vk) {
             self.on_menu(id);
         }
+        self.flush_pending_color_samples();
     }
 
     fn product_menu(&mut self) {
@@ -2572,6 +2783,7 @@ impl App {
     /// 根据当前命中的格子提取实际托盘提示，而非替换成窗口的显示名称。
     fn update_tray_tip(&mut self, hwnd: HWND, x: i32, y: i32) {
         let mut hidden_icon = false;
+        let mut from_popover = false;
         let target = if self.tray_context.is_some() {
             None
         } else if let Some(index) = self.topbar_index(hwnd) {
@@ -2581,23 +2793,39 @@ impl App {
                     let Hit::TrayIcon(key) = &hit else { return };
                     bar.tray_items.iter().find(|item| &item.key == key).and_then(|item| {
                         hidden_icon = item.overflow;
-                        Some(TipTarget { owner: hwnd, key: key.clone(), anchor: tray_anchor(hwnd, bar.rect_of(&hit)?)?,
-                            dpi: bar.dpi, text: item.hint().to_string() })
+                        Some(TipTarget {
+                            owner: hwnd,
+                            key: key.clone(),
+                            anchor: tray_anchor(hwnd, bar.rect_of(&hit)?)?,
+                            dpi: bar.dpi,
+                            text: item.hint().to_string(),
+                            hidden_icon,
+                        })
                     })
                 }
                 _ => None,
             }
         } else {
+            from_popover = true;
             self.popover_owner(hwnd).and_then(|index| self.topbars[index].popover.as_ref()).and_then(|p| {
                 if !p.visible || p.press.is_some() { return None; }
                 let index = p.index_at(x, y)?;
                 let item = p.items.get(index)?;
                 hidden_icon = item.overflow;
-                Some(TipTarget { owner: hwnd, key: item.key.clone(), anchor: tray_anchor(hwnd, p.cell_rect(index)?)?,
-                    dpi: p.dpi, text: item.hint().to_string() })
+                Some(TipTarget {
+                    owner: hwnd,
+                    key: item.key.clone(),
+                    anchor: tray_anchor(hwnd, p.cell_rect(index)?)?,
+                    dpi: p.dpi,
+                    text: item.hint().to_string(),
+                    hidden_icon,
+                })
             })
         };
-        if hidden_icon && target.as_ref().is_some_and(|target| !self.tray_tip.tracks(target))
+        // 收纳格内直接触发托盘溢出详情刷新；顶部栏仅在悬停稳定满 100ms 后于 TIMER_TRAY_TIP 触发，防止鼠标快速划过引发系统溢出窗抢焦点
+        if from_popover
+            && hidden_icon
+            && target.as_ref().is_some_and(|target| !self.tray_tip.tracks(target))
             && self.last_tray_details.is_none_or(|last| last.elapsed() >= Duration::from_secs(3))
         {
             self.tray_details_pending = true;
@@ -3059,8 +3287,10 @@ impl App {
         if self.status_panel.visible && self.status_panel.kind == kind {
             self.status_panel.close();
             self.set_topbar_active(None, None);
+            self.flush_pending_color_samples();
             return;
         }
+        let prev_fg = HWND(self.snap.foreground as *mut _);
         self.close_popover();
         self.context_menu.close();
         self.window_preview.close();
@@ -3080,7 +3310,6 @@ impl App {
                 bar.dpi,
             )
         };
-        let prev_fg = HWND(self.snap.foreground as *mut _);
         let ptr = app_ptr();
         let main_hwnd = self.hwnd;
         let appearance = self.config.appearance.clone();
@@ -3092,6 +3321,7 @@ impl App {
         if !self.topbars.iter().any(|b| b.popover.as_ref().is_some_and(|p| p.visible)) {
             self.set_topbar_active(None, None);
         }
+        self.flush_pending_color_samples();
     }
 
     pub fn panel_mouse_move(&mut self, x: i32, y: i32) {
@@ -3241,6 +3471,7 @@ impl App {
                 bar.pinned.clone(),
             )
         };
+        let prev_fg = HWND(self.snap.foreground as *mut _);
         let ptr = app_ptr();
         let appearance = self.config.appearance.clone();
         let bar = &mut self.topbars[bi];
@@ -3254,7 +3485,7 @@ impl App {
             }
         }
         if let Some(p) = bar.popover.as_mut() {
-            p.open(anchor, items, pinned, &appearance);
+            p.open(anchor, items, pinned, prev_fg, &appearance);
         }
         self.set_topbar_active(Some(bi), Some(Hit::TrayToggle));
         self.refresh_tray();
@@ -3287,6 +3518,9 @@ impl App {
         }
         if closed && !self.status_panel.visible {
             self.set_topbar_active(None, None);
+        }
+        if closed {
+            self.flush_pending_color_samples();
         }
     }
 
@@ -3419,6 +3653,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
     with_app(hwnd, |app| match msg {
         WM_APP_TRAY => app.on_tray(lparam.0 as u32),
         WM_APP_COLOR => app.on_color(lparam.0),
+        WM_APP_DOCK_COLOR => app.on_dock_color(lparam.0),
         crate::dock::icons::WM_APP_ICON => app.on_icon(lparam.0),
         crate::monitor::WM_APP_MONITOR => app.on_monitor_event(),
         WM_APP_TASKBAR_RESHOW => app.taskbar.run_rehide(),
@@ -3459,4 +3694,56 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         _ => {}
     });
     DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::TopbarCfg;
+    use crate::monitor::MaximizedWindow;
+
+    #[test]
+    fn transient_popups_do_not_break_maximized_bar_fusion() {
+        let mut snap = MonitorState::default();
+        snap.maximized_windows.push(MaximizedWindow {
+            monitor: 1001,
+            hwnd: 5001,
+            exe: r"C:\Program Files\Google\Chrome\Application\chrome.exe".into(),
+            rect: RECT { left: 0, top: 30, right: 1920, bottom: 1080 },
+        });
+        snap.maximized_windows.push(MaximizedWindow {
+            monitor: 1002,
+            hwnd: 5002,
+            exe: r"C:\Users\demo\AppData\Local\Programs\Microsoft VS Code\Code.exe".into(),
+            rect: RECT { left: 1920, top: 30, right: 3840, bottom: 1080 },
+        });
+
+        let mut cfg = TopbarCfg::default();
+        cfg.adaptive_maximized_color = true;
+        cfg.adaptive_color_exclude = vec!["code.exe".into()];
+
+        // Monitor 1001 有最大化 Chrome 且未被排除，即使前台瞬态变为 0 或系统浮窗，仍保持融合 Chrome
+        assert_eq!(App::bar_fusion_target(&snap, 1001, &cfg), Some(5001));
+        // Monitor 1002 为排除列表内的 VS Code，返回 None
+        assert_eq!(App::bar_fusion_target(&snap, 1002, &cfg), None);
+        // 无最大化窗口的显示器返回 None
+        assert_eq!(App::bar_fusion_target(&snap, 9999, &cfg), None);
+
+        // 全屏或关闭自适应融合开关时应统一退回玻璃色
+        snap.fullscreen = true;
+        assert_eq!(App::bar_fusion_target(&snap, 1001, &cfg), None);
+        snap.fullscreen = false;
+        cfg.adaptive_maximized_color = false;
+        assert_eq!(App::bar_fusion_target(&snap, 1001, &cfg), None);
+    }
+
+    #[test]
+    fn desktop_and_tray_classes_are_filtered_from_foreground_actions() {
+        assert!(is_desktop_class("WinDockFinderTopBar"));
+        assert!(is_desktop_class("#32768"));
+        assert!(is_desktop_class("Windows.UI.Input.InputSite.WindowClass"));
+        assert!(is_desktop_class("TopLevelWindowForOverflowXamlIsland"));
+        assert!(is_desktop_class("Xaml_WindowedPopupClass"));
+        assert!(!is_desktop_class("Chrome_WidgetWin_1"));
+    }
 }

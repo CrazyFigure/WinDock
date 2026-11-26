@@ -279,10 +279,31 @@ impl Appearance {
         }
     }
 
+    /// Dock 默认回退基调（无背后应用窗时）：
+    /// 次选严格遵循 Windows 系统主题；仅当系统主题无法读取时才降级采用壁纸明暗。
+    pub fn dock_fallback_dark(&self) -> bool {
+        Self::resolve_dock_fallback_dark(&self.theme, crate::win32::system_theme_dark(), || {
+            crate::topbar::color_sync::desktop_wallpaper_palette(false).is_dark()
+        })
+    }
+
+    /// Dock 回退明暗纯函数：显式主题优先；"system" 下先采用系统主题，系统主题缺失再降级壁纸。
+    fn resolve_dock_fallback_dark(
+        theme: &str,
+        os_theme_dark: Option<bool>,
+        wallpaper_dark: impl FnOnce() -> bool,
+    ) -> bool {
+        match theme {
+            "light" => false,
+            "dark" => true,
+            _ => os_theme_dark.unwrap_or_else(wallpaper_dark),
+        }
+    }
+
     /// Dock 胶囊底色（深色基调：曜石深灰；浅色基调：柔和磨砂银灰）。
     pub fn dock_tint(&self) -> (f32, f32, f32, f32) {
         let a = self.opacity;
-        if self.desktop_is_dark() {
+        if self.dock_fallback_dark() {
             (0.09, 0.10, 0.12, a)
         } else {
             (0.86, 0.88, 0.91, a)
@@ -616,5 +637,17 @@ mod tests {
         assert_eq!(labels, ["文件管理器", "文件管理器", "我的文件", "应用管理器"]);
         let saved: DockItems = read_json(&store.dock_items_path(), "Dock 固定项").unwrap();
         assert_eq!(saved.items[0].label, "文件管理器");
+    }
+
+    #[test]
+    fn dock_fallback_prefers_os_theme_over_wallpaper() {
+        assert!(!Appearance::resolve_dock_fallback_dark("light", Some(true), || true));
+        assert!(Appearance::resolve_dock_fallback_dark("dark", Some(false), || false));
+        // 跟随系统时，只要读到 Windows 系统浅色主题，即使壁纸是深色也不变黑
+        assert!(!Appearance::resolve_dock_fallback_dark("system", Some(false), || true));
+        assert!(Appearance::resolve_dock_fallback_dark("system", Some(true), || false));
+        // 仅当系统主题不可读时才降级跟随壁纸明暗
+        assert!(Appearance::resolve_dock_fallback_dark("system", None, || true));
+        assert!(!Appearance::resolve_dock_fallback_dark("system", None, || false));
     }
 }

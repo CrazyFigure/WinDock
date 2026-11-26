@@ -135,8 +135,8 @@ pub fn render(dock: &mut Dock, ctx: &mut RenderCtx) {
         return;
     }
     let Some(dc) = dock.target.mem_dc else { return };
-    // 桌面 Dock 随壁纸/主题自动切换明暗，深色壁纸下自动呈现沉稳暗色胶囊
-    let dark = ctx.appearance.desktop_is_dark();
+    // Dock 明暗极性与胶囊色调：优先跟随背后窗口色，其次 Windows 系统主题，最后降级壁纸
+    let (dark, top_rgb, bot_rgb) = dock.capsule_colors();
     let fade = dock.show_t;
     if fade <= 0.001 {
         unsafe {
@@ -174,15 +174,15 @@ pub fn render(dock: &mut Dock, ctx: &mut RenderCtx) {
         };
         sf.fill_rrect(&sh, rad + ex as f32 * 0.4, (0.0, 0.0, 0.0, sa_base * alpha));
     }
-    // 纯净 macOS 托盘不透明度（深色沉稳曜石灰，浅色柔和磨砂银灰，避免刺眼惨白）
+    // 纯净 macOS 托盘不透明度与背景协调色（轻透不发泥）
     let op = ctx.appearance.opacity.clamp(0.35, 0.95) * alpha;
-    let (top_tint, bot_tint) = if dark {
-        // 深色 macOS Dock：纯净曜石深灰，不浑浊不发泥
-        ((0.14, 0.15, 0.18, (op * 0.94).min(0.88)), (0.09, 0.10, 0.13, (op * 1.00).min(0.92)))
+    let (top_a, bot_a) = if dark {
+        ((op * 0.94).min(0.88), (op * 1.00).min(0.92))
     } else {
-        // 浅色 macOS Dock：克制柔和的浅银灰半透明托盘，清透不刺眼
-        ((0.89, 0.905, 0.93, (op * 0.92).min(0.84)), (0.82, 0.84, 0.88, (op * 0.88).min(0.80)))
+        ((op * 0.92).min(0.84), (op * 0.88).min(0.80))
     };
+    let top_tint = (top_rgb.r as f32 / 255.0, top_rgb.g as f32 / 255.0, top_rgb.b as f32 / 255.0, top_a);
+    let bot_tint = (bot_rgb.r as f32 / 255.0, bot_rgb.g as f32 / 255.0, bot_rgb.b as f32 / 255.0, bot_a);
     sf.fill_rrect_vgrad(&cap_f, rad, top_tint, bot_tint);
     // 外极细柔和界线 + 内 1px 细腻高光边（复刻 macOS Dock 立体托盘边缘）
     sf.stroke_rrect(&cap_f, rad, 1.0, (0.0, 0.0, 0.0, (if dark { 0.42 } else { 0.14 }) * alpha));

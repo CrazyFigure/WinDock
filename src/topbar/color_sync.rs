@@ -8,7 +8,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{COLORREF, GENERIC_READ, HWND, RECT};
+use windows::Win32::Foundation::{COLORREF, GENERIC_READ, HWND, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
 };
@@ -26,8 +26,8 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowRect, SystemParametersInfoW, PW_RENDERFULLCONTENT, SPI_GETDESKWALLPAPER,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    GetAncestor, GetWindowRect, IsChild, SystemParametersInfoW, WindowFromPoint, GA_ROOT,
+    PW_RENDERFULLCONTENT, SPI_GETDESKWALLPAPER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,8 +103,66 @@ fn dib_section(w: i32, h: i32) -> Option<(HDC, HBITMAP, HGDIOBJ, *mut std::ffi::
     }
 }
 
-/// 主路径：仅截取标题栏中间待采样区屏幕条带（节省内存与带宽，兼容 Chrome/VS Code/Electron 等 GPU 加速软件）。
-pub fn sample_below_topbar(mon: RECT, topbar_h: i32) -> Option<Rgb> {
+/// 判断屏幕坐标点是否直接落在目标最大化窗口及其子控件上，自动剔除菜单/浮窗/气泡等顶层遮挡。
+unsafe fn point_belongs_to_window(hwnd: HWND, screen_x: i32, screen_y: i32) -> bool {
+    if hwnd.0.is_null() {
+        return true;
+    }
+    let pt_hwnd = WindowFromPoint(POINT {
+        x: screen_x,
+        y: screen_y,
+    });
+    if pt_hwnd.0.is_null() {
+        return false;
+    }
+    pt_hwnd == hwnd || GetAncestor(pt_hwnd, GA_ROOT) == hwnd || IsChild(hwnd, pt_hwnd).as_bool()
+}
+
+/// 从抓取到的标题栏像素条带中按右/左分区归桶提取主色，并跳过被顶层浮窗遮挡的采样列（纯函数，便于单测）。
+fn extract_dominant_strip_color(slice: &[u32], w: i32, h: i32, col_visible: &[bool]) -> Option<Rgb> {
+    if w <= 0 || h <= 0 || slice.len() < (w * h) as usize || col_visible.len() < w as usize {
+        return None;
+    }
+    // 跳过最左侧菜单与应用名；优先在右侧空白标题栏区域（60%..100%）查找，避免左侧标签栏干扰
+    let mid_split = (w as f32 * 0.60) as i32;
+    let ranges = [(mid_split, w), (0, mid_split)];
+    for (x0, x1) in ranges {
+        let mut bins: HashMap<(u8, u8, u8), (u32, u64, u64, u64)> = HashMap::new();
+        let step = ((x1 - x0) / 80).max(1);
+        for y in 0..h {
+            let mut x = x0;
+            while x < x1 {
+                if col_visible[x as usize] {
+                    let p = slice[(y * w + x) as usize];
+                    let b = (p & 0xFF) as u8;
+                    let g = ((p >> 8) & 0xFF) as u8;
+                    let r = ((p >> 16) & 0xFF) as u8;
+                    // 按 8 级量化归桶，精准抓出占大面积的纯色标题栏背景，自动忽略细字与图标噪点
+                    let key = (r >> 3, g >> 3, b >> 3);
+                    let e = bins.entry(key).or_insert((0, 0, 0, 0));
+                    e.0 += 1;
+                    e.1 += r as u64;
+                    e.2 += g as u64;
+                    e.3 += b as u64;
+                }
+                x += step;
+            }
+        }
+        if let Some((_, &(cnt, sr, sg, sb))) = bins.iter().max_by_key(|(_, v)| v.0) {
+            if cnt >= 24 {
+                return Some(Rgb::new(
+                    (sr / cnt as u64) as u8,
+                    (sg / cnt as u64) as u8,
+                    (sb / cnt as u64) as u8,
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// 主路径：仅截取目标最大化窗口顶部栏紧下方未受遮挡的标题栏条带（兼容 GPU 加速软件并避免采到浮窗黑底）。
+pub fn sample_below_topbar_for_window(hwnd: HWND, mon: RECT, topbar_h: i32) -> Option<Rgb> {
     let mon_w = (mon.right - mon.left).clamp(128, 8192);
     let x_start = (mon_w as f32 * 0.30) as i32;
     let x_end = (mon_w as f32 * 0.84) as i32;
@@ -113,50 +171,34 @@ pub fn sample_below_topbar(mon: RECT, topbar_h: i32) -> Option<Rgb> {
     let y_start = mon.top + topbar_h.max(1) + 4;
     let h = 10;
     unsafe {
+        // 先创建离线 DIB，避免 GetDC 后提前返回造成桌面 DC 泄漏
+        let (hdc, bmp, old, ptr) = dib_section(w, h)?;
         let screen = GetDC(None);
         if screen.is_invalid() {
+            let _ = SelectObject(hdc, old);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(hdc);
             return None;
         }
-        let (hdc, bmp, old, ptr) = dib_section(w, h)?;
         let ok = BitBlt(hdc, 0, 0, w, h, screen, mon.left + x_start, y_start, SRCCOPY).is_ok();
         ReleaseDC(None, screen);
         let _ = GdiFlush();
         let result = if ok {
-            let slice = std::slice::from_raw_parts(ptr as *const u32, (w * h) as usize);
+            let mut col_visible = vec![false; w as usize];
             let mid_split = (w as f32 * 0.60) as i32;
-            let ranges = [
-                (mid_split, w),
-                (0, mid_split),
-            ];
-            let mut best: Option<Rgb> = None;
-            for (x0, x1) in ranges {
-                let mut bins: HashMap<(u8, u8, u8), (u32, u64, u64, u64)> = HashMap::new();
+            for (x0, x1) in [(mid_split, w), (0, mid_split)] {
                 let step = ((x1 - x0) / 80).max(1);
-                for y in 0..h {
-                    let mut x = x0;
-                    while x < x1 {
-                        let p = slice[(y * w + x) as usize];
-                        let b = (p & 0xFF) as u8;
-                        let g = ((p >> 8) & 0xFF) as u8;
-                        let r = ((p >> 16) & 0xFF) as u8;
-                        // 按 8 级量化归桶，精准抓出占大面积的纯色标题栏背景，自动忽略细字与图标噪点
-                        let key = (r >> 3, g >> 3, b >> 3);
-                        let e = bins.entry(key).or_insert((0, 0, 0, 0));
-                        e.0 += 1;
-                        e.1 += r as u64;
-                        e.2 += g as u64;
-                        e.3 += b as u64;
-                        x += step;
-                    }
-                }
-                if let Some((_, &(cnt, sr, sg, sb))) = bins.iter().max_by_key(|(_, v)| v.0) {
-                    if cnt >= 24 {
-                        best = Some(Rgb::new((sr / cnt as u64) as u8, (sg / cnt as u64) as u8, (sb / cnt as u64) as u8));
-                        break;
-                    }
+                let mut x = x0;
+                while x < x1 {
+                    let sx = mon.left + x_start + x;
+                    col_visible[x as usize] =
+                        point_belongs_to_window(hwnd, sx, y_start)
+                            && point_belongs_to_window(hwnd, sx, y_start + h - 1);
+                    x += step;
                 }
             }
-            best
+            let slice = std::slice::from_raw_parts(ptr as *const u32, (w * h) as usize);
+            extract_dominant_strip_color(slice, w, h, &col_visible)
         } else {
             None
         };
@@ -220,8 +262,11 @@ pub fn sample_caption(hwnd: HWND) -> Option<Rgb> {
     }
 }
 
-/// 兜底路径：读取窗口 DWMWA_CAPTION_COLOR / 深色模式属性。
-pub fn caption_color_fallback(hwnd: HWND) -> Option<Rgb> {
+/// 读取 DWM 窗口自身声明的标题栏色或深浅模式属性（不含系统全局降级，便于区分单窗提示与 OS 主题）。
+fn dwm_window_color_hint(hwnd: HWND) -> Option<Rgb> {
+    if hwnd.0.is_null() {
+        return None;
+    }
     unsafe {
         let mut color = 0u32;
         if DwmGetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &mut color as *mut u32 as *mut _, 4).is_ok() {
@@ -234,20 +279,223 @@ pub fn caption_color_fallback(hwnd: HWND) -> Option<Rgb> {
         if DwmGetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &mut dark as *mut u32 as *mut _, 4).is_ok() {
             return Some(if dark != 0 { Rgb::new(0x20, 0x20, 0x20) } else { Rgb::new(0xF3, 0xF3, 0xF3) });
         }
-        if crate::win32::system_uses_dark_theme() {
-            Some(Rgb::new(0x20, 0x20, 0x20))
-        } else {
-            Some(Rgb::new(0xF3, 0xF3, 0xF3))
-        }
+    }
+    None
+}
+
+/// 兜底路径：读取窗口 DWMWA_CAPTION_COLOR / 深色模式属性。
+pub fn caption_color_fallback(hwnd: HWND) -> Option<Rgb> {
+    if let Some(c) = dwm_window_color_hint(hwnd) {
+        return Some(c);
+    }
+    if crate::win32::system_uses_dark_theme() {
+        Some(Rgb::new(0x20, 0x20, 0x20))
+    } else {
+        Some(Rgb::new(0xF3, 0xF3, 0xF3))
     }
 }
 
-/// 综合取色：优先采顶部栏紧下方真实标题栏条带，失败再回退 PrintWindow 与 DWM 属性。
+/// 综合取色：优先采顶部栏紧下方未受遮挡的真实标题栏条带，失败再回退 PrintWindow 与 DWM 属性。
 pub fn caption_color(hwnd: HWND, mon: Option<RECT>, topbar_h: i32) -> Rgb {
-    mon.and_then(|r| sample_below_topbar(r, topbar_h))
+    mon.and_then(|r| sample_below_topbar_for_window(hwnd, r, topbar_h))
         .or_else(|| sample_caption(hwnd))
         .or_else(|| caption_color_fallback(hwnd))
         .unwrap_or(Rgb::new(0xF3, 0xF3, 0xF3))
+}
+
+/// 判断屏幕坐标是否归属于目标背后应用窗口集合之一。
+unsafe fn point_belongs_to_any(roots: &[HWND], screen_x: i32, screen_y: i32) -> bool {
+    let pt_hwnd = WindowFromPoint(POINT {
+        x: screen_x,
+        y: screen_y,
+    });
+    if pt_hwnd.0.is_null() {
+        return false;
+    }
+    let root = GetAncestor(pt_hwnd, GA_ROOT);
+    roots.iter().any(|&hwnd| {
+        !hwnd.0.is_null() && (pt_hwnd == hwnd || root == hwnd || IsChild(hwnd, pt_hwnd).as_bool())
+    })
+}
+
+/// 从已过滤后的 BGRA 像素样本中提取主色：先按 8 级量化取占比最高纯色背景，若纹理复杂则取居中 60% 均值。
+fn dominant_bgra_color(pixels: &[u32], min_count: usize) -> Option<Rgb> {
+    if pixels.len() < min_count {
+        return None;
+    }
+    let mut bins: HashMap<(u8, u8, u8), (u32, u64, u64, u64)> = HashMap::new();
+    for &p in pixels {
+        let b = (p & 0xFF) as u8;
+        let g = ((p >> 8) & 0xFF) as u8;
+        let r = ((p >> 16) & 0xFF) as u8;
+        let e = bins.entry((r >> 3, g >> 3, b >> 3)).or_insert((0, 0, 0, 0));
+        e.0 += 1;
+        e.1 += r as u64;
+        e.2 += g as u64;
+        e.3 += b as u64;
+    }
+    if let Some((_, &(cnt, sr, sg, sb))) = bins.iter().max_by_key(|(_, v)| v.0) {
+        if cnt as usize >= (min_count / 2).max(1) && (cnt as usize * 3 >= pixels.len() || cnt >= 12) {
+            return Some(Rgb::new(
+                (sr / cnt as u64) as u8,
+                (sg / cnt as u64) as u8,
+                (sb / cnt as u64) as u8,
+            ));
+        }
+    }
+    // 对半透明磨砂/壁纸照片背景：按亮度排序后裁去极端文字/按钮高光，保留中段 60% 求平均
+    let mut sorted: Vec<(u16, u8, u8, u8)> = pixels
+        .iter()
+        .map(|&p| {
+            let b = (p & 0xFF) as u8;
+            let g = ((p >> 8) & 0xFF) as u8;
+            let r = ((p >> 16) & 0xFF) as u8;
+            let luma_fast = (r as u16 * 77 + g as u16 * 150 + b as u16 * 29) >> 8;
+            (luma_fast, r, g, b)
+        })
+        .collect();
+    sorted.sort_unstable_by_key(|v| v.0);
+    let trim = sorted.len() / 5;
+    let mid = &sorted[trim..sorted.len().saturating_sub(trim).max(trim + 1)];
+    let (mut sr, mut sg, mut sb) = (0u64, 0u64, 0u64);
+    for &(_, r, g, b) in mid {
+        sr += r as u64;
+        sg += g as u64;
+        sb += b as u64;
+    }
+    let cnt = mid.len() as u64;
+    Some(Rgb::new((sr / cnt) as u8, (sg / cnt) as u8, (sb / cnt) as u8))
+}
+
+/// 从屏幕区域按网格采集仅属于 `roots` 应用窗口的可见像素，彻底屏蔽桌面与 Dock 自身叠影。
+fn collect_strip_pixels(roots: &[HWND], rect: RECT, max_cols: i32, max_rows: i32, out: &mut Vec<u32>) {
+    let w = (rect.right - rect.left).min(4096);
+    let h = (rect.bottom - rect.top).min(512);
+    if w < 4 || h < 2 || roots.is_empty() {
+        return;
+    }
+    unsafe {
+        let Some((hdc, bmp, old, ptr)) = dib_section(w, h) else { return };
+        let screen = GetDC(None);
+        if screen.is_invalid() {
+            let _ = SelectObject(hdc, old);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(hdc);
+            return;
+        }
+        let ok = BitBlt(hdc, 0, 0, w, h, screen, rect.left, rect.top, SRCCOPY).is_ok();
+        ReleaseDC(None, screen);
+        let _ = GdiFlush();
+        if ok {
+            let slice = std::slice::from_raw_parts(ptr as *const u32, (w * h) as usize);
+            let step_x = (w / max_cols.max(1)).max(1);
+            let step_y = (h / max_rows.max(1)).max(1);
+            let mut y = step_y / 2;
+            while y < h {
+                let mut x = step_x / 2;
+                while x < w {
+                    if point_belongs_to_any(roots, rect.left + x, rect.top + y) {
+                        out.push(slice[(y * w + x) as usize]);
+                    }
+                    x += step_x;
+                }
+                y += step_y;
+            }
+        }
+        let _ = SelectObject(hdc, old);
+        let _ = DeleteObject(HGDIOBJ(bmp.0));
+        let _ = DeleteDC(hdc);
+    }
+}
+
+/// 采集 Dock 背后应用窗口的实时主色（无背后外部应用窗口时返回 None，以便降级系统主题）。
+///
+/// - Dock 隐藏期间直接采样正后方胶囊区域（零误差）；
+/// - Dock 可见期间优先采样窗口左右紧邻侧翼及紧上方窄条带，彻底避免自采样黑化正反馈环路。
+pub fn sample_dock_backdrop(cap_screen: RECT, dock_win_rect: RECT, mon_rect: RECT, dock_visible: bool) -> Option<Rgb> {
+    let roots = crate::monitor::dock_backdrop_windows(cap_screen);
+    if roots.is_empty() {
+        return None;
+    }
+    let mut pixels = Vec::with_capacity(256);
+    if !dock_visible {
+        collect_strip_pixels(&roots, cap_screen, 28, 5, &mut pixels);
+    } else {
+        let left_flank = RECT {
+            left: (dock_win_rect.left - 96).max(mon_rect.left),
+            top: cap_screen.top,
+            right: (dock_win_rect.left - 4).max(mon_rect.left),
+            bottom: cap_screen.bottom,
+        };
+        let right_flank = RECT {
+            left: (dock_win_rect.right + 4).min(mon_rect.right),
+            top: cap_screen.top,
+            right: (dock_win_rect.right + 96).min(mon_rect.right),
+            bottom: cap_screen.bottom,
+        };
+        collect_strip_pixels(&roots, left_flank, 14, 4, &mut pixels);
+        collect_strip_pixels(&roots, right_flank, 14, 4, &mut pixels);
+        if pixels.len() < 12 {
+            let above_strip = RECT {
+                left: cap_screen.left.max(mon_rect.left),
+                top: (dock_win_rect.top - 14).max(mon_rect.top),
+                right: cap_screen.right.min(mon_rect.right),
+                bottom: (dock_win_rect.top - 2).max(mon_rect.top),
+            };
+            collect_strip_pixels(&roots, above_strip, 24, 3, &mut pixels);
+        }
+    }
+    dominant_bgra_color(&pixels, 12).or_else(|| dwm_window_color_hint(roots[0]))
+}
+
+/// 根据背后色彩或回退策略生成和谐的 Dock 胶囊明暗极性与上下渐变 RGB（含防抖滞回区间）。
+pub fn harmonize_dock_backdrop(bg: Option<Rgb>, prev_dark: bool, fallback_dark: bool) -> (bool, Rgb, Rgb) {
+    let canonical_light = (Rgb::new(227, 231, 237), Rgb::new(209, 214, 224));
+    let canonical_dark = (Rgb::new(36, 38, 46), Rgb::new(23, 25, 33));
+    let Some(raw) = bg else {
+        let (t, b) = if fallback_dark { canonical_dark } else { canonical_light };
+        return (fallback_dark, t, b);
+    };
+
+    let luma = raw.luminance();
+    // 滞回区间 0.24..0.33（约 sRGB 52%..61% 灰）：避免中灰画面滚过 Dock 边缘时明暗频繁跳变
+    let dark = if luma < 0.24 {
+        true
+    } else if luma > 0.33 {
+        false
+    } else {
+        prev_dark
+    };
+
+    let gray = 0.299 * raw.r as f32 + 0.587 * raw.g as f32 + 0.114 * raw.b as f32;
+    let desat = |c: u8| -> f32 { gray + (c as f32 - gray) * 0.42 };
+    let (dr, dg, db) = (desat(raw.r), desat(raw.g), desat(raw.b));
+
+    if dark {
+        let max_c = dr.max(dg).max(db);
+        let scale = if max_c > 76.0 { 76.0 / max_c } else { 1.0 };
+        let muted = Rgb::new(
+            (dr * scale).clamp(14.0, 76.0).round() as u8,
+            (dg * scale).clamp(14.0, 76.0).round() as u8,
+            (db * scale).clamp(14.0, 76.0).round() as u8,
+        );
+        (
+            true,
+            Rgb::lerp(canonical_dark.0, muted, 0.34),
+            Rgb::lerp(canonical_dark.1, muted, 0.34),
+        )
+    } else {
+        let muted = Rgb::new(
+            dr.clamp(192.0, 248.0).round() as u8,
+            dg.clamp(192.0, 248.0).round() as u8,
+            db.clamp(192.0, 248.0).round() as u8,
+        );
+        (
+            false,
+            Rgb::lerp(canonical_light.0, muted, 0.36),
+            Rgb::lerp(canonical_light.1, muted, 0.36),
+        )
+    }
 }
 
 /// 判断应用是否位于最大化自动取色排除名单中。
@@ -494,5 +742,71 @@ mod tests {
         // 实机壁纸采样不崩溃
         let live = desktop_wallpaper_palette(true);
         assert!((0.0..=1.0).contains(&live.overall_luma));
+    }
+
+    #[test]
+    fn strip_sampling_skips_occluded_columns() {
+        let w = 200i32;
+        let h = 10i32;
+        // 整条标题栏实际为浅白色，但右半区被深色浮窗遮挡；标记右半区为遮挡后应从左中未遮挡区得到白色
+        let white_px = 0x00FF_FFFFu32;
+        let dark_popup_px = 0x0018_1818u32;
+        let mut slice = vec![white_px; (w * h) as usize];
+        let mut visible = vec![true; w as usize];
+        let split = (w as f32 * 0.60) as i32;
+        for x in split..w {
+            visible[x as usize] = false;
+            for y in 0..h {
+                slice[(y * w + x) as usize] = dark_popup_px;
+            }
+        }
+        assert_eq!(
+            extract_dominant_strip_color(&slice, w, h, &visible),
+            Some(Rgb::new(255, 255, 255))
+        );
+
+        // 若整条条带均被浮窗完全遮挡，应返回 None 以触发 PrintWindow 回退而不是返回黑色
+        let all_hidden = vec![false; w as usize];
+        assert_eq!(extract_dominant_strip_color(&slice, w, h, &all_hidden), None);
+        assert!(unsafe { point_belongs_to_window(HWND::default(), 0, 0) });
+    }
+
+    #[test]
+    fn dock_backdrop_harmonization_and_sampling() {
+        // 1. 无背后窗口时严格按回退极性（Windows 系统主题 -> 壁纸）输出标准亮/暗银黑托盘
+        let (d1, t1, _b1) = harmonize_dock_backdrop(None, true, false);
+        assert!(!d1);
+        assert!(t1.r > 210);
+        let (d2, t2, _b2) = harmonize_dock_backdrop(None, false, true);
+        assert!(d2);
+        assert!(t2.r < 60);
+
+        // 2. 背后为亮白/浅灰应用窗口时应自动切到浅色磨砂托盘
+        let (d_light, tl, bl) = harmonize_dock_backdrop(Some(Rgb::new(245, 246, 248)), true, true);
+        assert!(!d_light);
+        assert!(tl.r > 220 && bl.r > 205);
+
+        // 3. 背后为深色窗口时应切换深色曜石托盘
+        let (d_dark, td, bd) = harmonize_dock_backdrop(Some(Rgb::new(26, 28, 34)), false, false);
+        assert!(d_dark);
+        assert!(td.r < 55 && bd.r < 40);
+
+        // 4. 中灰滞回区（0.24..0.33，例如 #8C8C8C ≈ 0.26）保持原极性不闪烁
+        let (d_keep_dark, _, _) = harmonize_dock_backdrop(Some(Rgb::new(0x8C, 0x8C, 0x8C)), true, false);
+        assert!(d_keep_dark);
+        let (d_keep_light, _, _) = harmonize_dock_backdrop(Some(Rgb::new(0x8C, 0x8C, 0x8C)), false, true);
+        assert!(!d_keep_light);
+
+        // 5. 纯色/复杂纹理样本颜色提取
+        let bgra_white = vec![0x00F4_F6F8u32; 40];
+        assert_eq!(dominant_bgra_color(&bgra_white, 12), Some(Rgb::new(0xF4, 0xF6, 0xF8)));
+        // 复杂纹理（色彩分散但亮度偏亮）退化为中段均值仍稳定返回亮色
+        let mixed: Vec<u32> = (0..30).map(|i| {
+            let v = 210 + (i % 10) * 4;
+            ((v as u32) << 16) | ((v as u32) << 8) | (v as u32)
+        }).collect();
+        let mixed_rgb = dominant_bgra_color(&mixed, 12).unwrap();
+        assert!(mixed_rgb.r >= 210 && mixed_rgb.luminance() > 0.6);
+        assert_eq!(dominant_bgra_color(&bgra_white[..5], 12), None);
     }
 }

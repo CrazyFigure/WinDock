@@ -22,6 +22,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::config::{Appearance, DockCfg};
 use crate::dock::items::{EntryList, FuncKind};
 use crate::dock::layout::DockLayout;
+use crate::topbar::color_sync::{harmonize_dock_backdrop, Rgb};
 use crate::ui::{make_font, DibTarget};
 use crate::win32::{dp, MonitorInfo};
 
@@ -69,6 +70,17 @@ pub struct Dock {
     pub bounce: Option<(usize, f32)>,
     pub last_tick: Instant,
     pub drop_cookie: Option<u32>,
+    // Dock 自适应背后颜色状态（优先跟随背后窗色，其次 Windows 系统主题，最后降级壁纸）
+    pub backdrop_rgb: Option<Rgb>,
+    pub backdrop_dirty: bool,
+    pub color_dark: bool,
+    color_from_top: Rgb,
+    color_to_top: Rgb,
+    color_from_bot: Rgb,
+    color_to_bot: Rgb,
+    cur_top: Rgb,
+    cur_bot: Rgb,
+    color_t: f32,
     // 缓存的像素尺寸（relayout 时按 DPI 刷新）
     icon_px_cached: i32,
     gap_px: i32,
@@ -152,6 +164,8 @@ impl Dock {
                 Some(app_ptr as *const _),
             )
             .map_err(crate::win32::error_string)?;
+            let fallback_dark = appearance.dock_fallback_dark();
+            let (init_dark, init_top, init_bot) = harmonize_dock_backdrop(None, fallback_dark, fallback_dark);
             let mut dock = Dock {
                 hwnd_overlay: overlay,
                 hwnd_trigger: trigger,
@@ -183,6 +197,16 @@ impl Dock {
                 bounce: None,
                 last_tick: Instant::now(),
                 drop_cookie: None,
+                backdrop_rgb: None,
+                backdrop_dirty: true,
+                color_dark: init_dark,
+                color_from_top: init_top,
+                color_to_top: init_top,
+                color_from_bot: init_bot,
+                color_to_bot: init_bot,
+                cur_top: init_top,
+                cur_bot: init_bot,
+                color_t: 1.0,
                 icon_px_cached: 48,
                 gap_px: 8,
                 corner_dp: 18,
@@ -199,8 +223,51 @@ impl Dock {
         }
     }
 
-    pub fn apply_appearance(&mut self, _appearance: &Appearance) {
+    pub fn apply_appearance(&mut self, appearance: &Appearance) {
+        self.apply_backdrop_color(self.backdrop_rgb, appearance, true);
+        self.backdrop_dirty = true;
         self.dirty = true;
+    }
+
+    /// 根据背后采样色与外观回退链刷新 Dock 胶囊目标配色，并控制是否瞬切或平滑插值过渡。
+    pub fn apply_backdrop_color(&mut self, backdrop: Option<Rgb>, appearance: &Appearance, instant: bool) {
+        let effective = if appearance.theme == "system" { backdrop } else { None };
+        let fallback_dark = appearance.dock_fallback_dark();
+        let (dark, top, bot) = harmonize_dock_backdrop(effective, self.color_dark, fallback_dark);
+        self.backdrop_rgb = effective;
+        self.backdrop_dirty = false;
+        if dark == self.color_dark && top == self.color_to_top && bot == self.color_to_bot && self.color_t >= 1.0 {
+            return;
+        }
+        self.color_dark = dark;
+        self.color_from_top = self.cur_top;
+        self.color_from_bot = self.cur_bot;
+        self.color_to_top = top;
+        self.color_to_bot = bot;
+        if instant || appearance.reduce_motion {
+            self.color_t = 1.0;
+            self.cur_top = top;
+            self.cur_bot = bot;
+        } else {
+            self.color_t = 0.0;
+        }
+        self.dirty = true;
+    }
+
+    /// 返回当前帧渲染使用的 Dock 明暗极性与上下渐变色。
+    pub fn capsule_colors(&self) -> (bool, Rgb, Rgb) {
+        (self.color_dark, self.cur_top, self.cur_bot)
+    }
+
+    /// 返回胶囊在屏幕坐标系下的矩形区域（用于定位背后覆盖的应用窗口）。
+    pub fn capsule_screen_rect(&self) -> RECT {
+        let cap = self.capsule_rect();
+        RECT {
+            left: self.win_rect.left + cap.left,
+            top: self.win_rect.top + cap.top,
+            right: self.win_rect.left + cap.right,
+            bottom: self.win_rect.top + cap.bottom,
+        }
     }
 
     // ---------- 尺寸工具 ----------
@@ -360,6 +427,7 @@ impl Dock {
             );
         }
         self.dirty = true;
+        self.backdrop_dirty = true;
         if !self.target.ensure_at_least(w, h) {
             crate::log::log("Dock DIB 分配失败");
         }
@@ -401,13 +469,16 @@ impl Dock {
         self.vels.resize(n, 0.0);
         self.hover = self.hover.filter(|h| *h < n);
         self.dirty = true;
+        self.backdrop_dirty = true;
     }
 
     pub fn set_want_visible(&mut self, v: bool) {
         if self.want_visible != v {
             self.want_visible = v;
             self.dirty = true;
-            if !v {
+            if v {
+                self.backdrop_dirty = true;
+            } else {
                 self.hover = None;
                 self.tooltip_visible = false;
                 self.drag = None;
@@ -446,7 +517,7 @@ impl Dock {
     }
 
     /// 推进一帧动画；返回是否仍需继续动画。
-    pub fn tick(&mut self, dt_ms: f32, _cfg: &DockCfg, appearance: &Appearance) -> bool {
+    pub fn tick(&mut self, dt_ms: f32, _cfg: &DockCfg, appearance: &Appearance, transition_ms: u32) -> bool {
         let dt = dt_ms / 1000.0;
         let reduce = appearance.reduce_motion;
         let mut animating = false;
@@ -464,7 +535,28 @@ impl Dock {
                 }
                 self.window_visible = false;
             }
+            self.backdrop_dirty = true;
+            if self.color_t < 1.0 {
+                self.color_t = 1.0;
+                self.cur_top = self.color_to_top;
+                self.cur_bot = self.color_to_bot;
+            }
             return false;
+        }
+        // 背景融合色彩平滑过渡
+        if self.color_t < 1.0 {
+            let step = if reduce || transition_ms == 0 {
+                1.0
+            } else {
+                dt_ms / transition_ms.max(1) as f32
+            };
+            self.color_t = (self.color_t + step).min(1.0);
+            self.cur_top = Rgb::lerp(self.color_from_top, self.color_to_top, self.color_t);
+            self.cur_bot = Rgb::lerp(self.color_from_bot, self.color_to_bot, self.color_t);
+            self.dirty = true;
+            if self.color_t < 1.0 {
+                animating = true;
+            }
         }
         // 放大弹簧
         let mouse_x = if self.mouse_in { Some(self.mouse.0) } else { None };
@@ -536,6 +628,7 @@ impl Dock {
                 (s - t).abs() > 0.003
             })
             || (self.hover.is_some() && !self.tooltip_visible)
+            || self.color_t < 1.0
     }
 
     // ---------- 命中 ----------
