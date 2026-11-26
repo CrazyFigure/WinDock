@@ -801,12 +801,11 @@ impl App {
         if self.config.topbar.enabled {
             let mons = self.topbar_monitors();
             let label = self.active_app_label();
-            let pure_dark_text = self.config.appearance.topbar_base_rgb().use_dark_text();
             for m in mons {
                 if let Ok(mut bar) = TopBar::new(app_ptr(), m, &self.config.topbar, &self.config.appearance) {
                     bar.pinned = self.config.topbar.pinned_tray_keys.clone();
                     bar.active_app = label.clone();
-                    bar.dark_text = pure_dark_text;
+                    bar.dark_text = bar.desktop_dark_text;
                     bar.wanted_visible = self.topbar_visible;
                     bar.layout(&self.config.topbar);
                     if self.topbar_visible {
@@ -945,8 +944,6 @@ impl App {
         let label = self.active_app_label();
         let fullscreen = self.snap.fullscreen;
         let cfg = &self.config.topbar;
-        let base_rgb = self.config.appearance.topbar_base_rgb();
-        let pure_dark_text = base_rgb.use_dark_text();
         for bar in &mut self.topbars {
             bar.active_app = label.clone();
             bar.status.ime = if cfg.has_status("ime") {
@@ -987,8 +984,10 @@ impl App {
                     self.color_sampling = None;
                     invalidate_sampling = true;
                 }
+                let base_rgb = bar.desktop_base;
+                let desktop_dark = bar.desktop_dark_text;
                 bar.set_fused_target(None, base_rgb, true);
-                bar.dark_text = pure_dark_text;
+                bar.dark_text = desktop_dark;
                 invalidate(bar.hwnd);
                 if had_fused {
                     any_glass_changed = true;
@@ -1191,12 +1190,12 @@ impl App {
             }
             return;
         }
-        let base_rgb = self.config.appearance.topbar_base_rgb();
         let instant = self.config.topbar.color_transition_ms == 0 || self.config.appearance.reduce_motion;
         let mut applied = false;
         for bar in &mut self.topbars {
             if bar.monitor.hmonitor.0 as isize == hmon && bar.fused_hwnd == target && target != 0 {
                 bar.color_dirty = false;
+                let base_rgb = bar.desktop_base;
                 bar.set_fused_target(Some(rgb), base_rgb, instant);
                 invalidate(bar.hwnd);
                 applied = true;
@@ -1762,6 +1761,10 @@ impl App {
             if cur != 0 && cur != self.cursor_monitor {
                 self.rebuild_bars();
             }
+        }
+        // 每 5 秒轻量校验壁纸签名，覆盖 Windows 聚焦/幻灯片换壁纸未广播 WM_SETTINGCHANGE 的场景
+        if self.slow_ticks.is_multiple_of(5) && color_sync::check_wallpaper_changed() {
+            self.on_theme_changed();
         }
         // 最大化融合态每 10 秒低频复查一次标题栏颜色（浮窗展开期间自动跳过，避免采到黑底阴影）
         if self.slow_ticks % 10 == 0 {
@@ -3751,8 +3754,13 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             app.display_dirty_at = Some(Instant::now());
         }
         WM_SETTINGCHANGE => {
-            // 仅在系统主题切换时刷新配色，严格忽略 SPI_SETWORKAREA(0x002F) 防止 AppBar 死循环闪烁
-            if crate::topbar::is_theme_setting_change(lparam.0) {
+            // 仅在系统主题或壁纸切换时刷新配色，严格忽略 SPI_SETWORKAREA(0x002F) 防止 AppBar 死循环闪烁
+            if crate::topbar::is_wallpaper_setting_change(wparam.0, lparam.0) {
+                color_sync::invalidate_wallpaper_cache();
+                if app.topbars.is_empty() {
+                    app.on_theme_changed();
+                }
+            } else if crate::topbar::is_theme_setting_change(lparam.0) {
                 app.on_theme_changed();
             }
         }

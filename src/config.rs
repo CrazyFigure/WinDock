@@ -271,6 +271,7 @@ impl Appearance {
 
     /// 桌面常驻元素（顶部栏桌面态与 Dock 胶囊）是否使用深色基调：
     /// 跟随系统模式下自动感应当前壁纸明暗，深色壁纸不再亮出刺眼纯白栏。
+    #[allow(dead_code)]
     pub fn desktop_is_dark(&self) -> bool {
         match self.theme.as_str() {
             "light" => false,
@@ -318,7 +319,7 @@ impl Appearance {
                 if pal.is_dark() {
                     pal.topbar_rgb
                 } else {
-                    crate::topbar::color_sync::Rgb::new(0x1B, 0x1D, 0x23)
+                    crate::topbar::color_sync::Rgb::new(0x28, 0x2B, 0x34)
                 }
             }
             // 显式浅色模式也采用克制的柔和银灰，避免纯白强光刺眼

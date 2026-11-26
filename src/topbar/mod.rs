@@ -108,6 +108,13 @@ pub struct TopBar {
     pub fused_target: Option<Rgb>,
     pub cur_fused: Rgb,
     pub dark_text: bool,
+    // 当前显示器桌面壁纸模糊条带及对应的基础色/文字极性缓存
+    pub desktop_bgra: Vec<u32>,
+    pub desktop_w: i32,
+    pub desktop_h: i32,
+    pub desktop_base: Rgb,
+    pub desktop_dark_text: bool,
+    pub fused_from_desktop: bool,
     // 当前已融合或待采样的外部最大化窗口句柄，以及是否需要重新取色
     pub fused_hwnd: isize,
     pub color_dirty: bool,
@@ -148,7 +155,18 @@ impl TopBar {
                 Some(app_ptr as *const _),
             )
             .map_err(crate::win32::error_string)?;
-            let base_rgb = appearance.topbar_base_rgb();
+            let backdrop = crate::topbar::color_sync::desktop_topbar_backdrop(
+                monitor.rect,
+                height,
+                &appearance.theme,
+                appearance.opacity,
+                false,
+            );
+            let dw = monitor.width().max(1);
+            let dh = height.max(1);
+            let desktop_bgra = backdrop.render_to_size(dw, dh);
+            let base_rgb = backdrop.base_rgb;
+            let desktop_dark_text = backdrop.dark_text;
             let mut bar = TopBar {
                 hwnd,
                 dpi: monitor.dpi,
@@ -171,7 +189,13 @@ impl TopBar {
                 fused_t: 1.0,
                 fused_target: None,
                 cur_fused: base_rgb,
-                dark_text: base_rgb.use_dark_text(),
+                dark_text: desktop_dark_text,
+                desktop_bgra,
+                desktop_w: dw,
+                desktop_h: dh,
+                desktop_base: base_rgb,
+                desktop_dark_text,
+                fused_from_desktop: false,
                 fused_hwnd: 0,
                 color_dirty: false,
                 active_app: "桌面".into(),
@@ -190,10 +214,10 @@ impl TopBar {
         }
     }
 
-    fn setup_dwm(&mut self, appearance: &Appearance) {
+    fn setup_dwm(&mut self, _appearance: &Appearance) {
         use windows::Win32::Graphics::Dwm::*;
         unsafe {
-            let dark: u32 = if appearance.desktop_is_dark() { 1 } else { 0 };
+            let dark: u32 = if self.desktop_dark_text { 0 } else { 1 };
             let _ = DwmSetWindowAttribute(self.hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const u32 as *const _, 4);
             let bt = DWMSBT_NONE.0;
             let _ = DwmSetWindowAttribute(self.hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &bt as *const i32 as *const _, 4);
@@ -205,10 +229,35 @@ impl TopBar {
         }
     }
 
+    /// 重新采样并渲染当前显示器的桌面壁纸背景条带。
+    pub fn refresh_desktop_backdrop(&mut self, appearance: &Appearance) {
+        let backdrop = crate::topbar::color_sync::desktop_topbar_backdrop(
+            self.monitor.rect,
+            self.height,
+            &appearance.theme,
+            appearance.opacity,
+            false,
+        );
+        let dw = self.monitor.width().max(1);
+        let dh = self.height.max(1);
+        self.desktop_w = dw;
+        self.desktop_h = dh;
+        self.desktop_base = backdrop.base_rgb;
+        self.desktop_dark_text = backdrop.dark_text;
+        self.desktop_bgra = backdrop.render_to_size(dw, dh);
+        if self.mode == ColorMode::Glass {
+            self.fused_from = self.desktop_base;
+            self.fused_to = self.desktop_base;
+            self.cur_fused = self.desktop_base;
+            self.dark_text = self.desktop_dark_text;
+        }
+    }
+
     pub fn apply_config(&mut self, cfg: &TopbarCfg, appearance: &Appearance) {
         self.exclude = cfg.adaptive_color_exclude.clone();
-        self.setup_dwm(appearance);
         self.height = dp(cfg.height_dp, self.dpi);
+        self.refresh_desktop_backdrop(appearance);
+        self.setup_dwm(appearance);
         self.layout(cfg);
         if self.visible {
             self.register_appbar(true);
@@ -340,7 +389,7 @@ impl TopBar {
 
     // ---------- 取色融合 ----------
 
-    /// 设置最大化融合目标色（None = 回到桌面统一纯净色）。
+    /// 设置最大化融合目标色（None = 回到桌面壁纸贴合态）。
     pub fn set_fused_target(&mut self, target: Option<Rgb>, base: Rgb, instant: bool) {
         let same = match (target, self.fused_target) {
             (None, None) => self.mode == ColorMode::Glass && self.cur_fused == base,
@@ -350,12 +399,14 @@ impl TopBar {
         if same && self.fused_t >= 1.0 {
             return;
         }
-        // 从非融合态进入最大化时以当前桌面统一色为过渡起点，避免沿用陈旧窗口色闪烁
+        // 从非融合态进入最大化时记录桌面条带作像素级平滑过渡起点，避免沿用陈旧窗口色闪烁
+        let was_glass = self.mode == ColorMode::Glass;
         self.fused_from = if self.mode == ColorMode::Fused { self.cur_fused } else { base };
         self.fused_target = target;
         if let Some(t) = target {
             self.mode = ColorMode::Fused;
             self.fused_to = t;
+            self.fused_from_desktop = was_glass && !instant;
             self.fused_t = if instant { 1.0 } else { 0.0 };
             if instant {
                 self.cur_fused = t;
@@ -366,10 +417,11 @@ impl TopBar {
             }
         } else {
             self.mode = ColorMode::Glass;
+            self.fused_from_desktop = false;
             self.fused_to = base;
             self.cur_fused = base;
             self.fused_t = 1.0;
-            self.dark_text = base.use_dark_text();
+            self.dark_text = self.desktop_dark_text;
         }
         unsafe {
             let _ = InvalidateRect(self.hwnd, None, false);
@@ -379,11 +431,15 @@ impl TopBar {
     /// 推进颜色过渡（150ms 平滑插值）；返回是否仍在过渡。
     pub fn tick_color(&mut self, dt_ms: f32, transition_ms: u32) -> bool {
         if self.fused_t >= 1.0 || self.mode != ColorMode::Fused {
+            self.fused_from_desktop = false;
             return false;
         }
         self.fused_t = (self.fused_t + dt_ms / transition_ms.max(1) as f32).min(1.0);
         self.cur_fused = Rgb::lerp(self.fused_from, self.fused_to, self.fused_t);
         self.dark_text = self.cur_fused.use_dark_text();
+        if self.fused_t >= 1.0 {
+            self.fused_from_desktop = false;
+        }
         unsafe {
             let _ = InvalidateRect(self.hwnd, None, false);
         }

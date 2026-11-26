@@ -332,6 +332,52 @@ impl Surface {
         }
     }
 
+    /// 将预烘焙好的不透明 BGRA 像素块（w×h）直接拷贝到 Surface 左上角。
+    pub fn blit_opaque_bgra(&mut self, w: i32, h: i32, src: &[u32]) {
+        let cw = (w.max(0) as usize).min(self.w);
+        let ch = (h.max(0) as usize).min(self.h);
+        let sw = w.max(0) as usize;
+        if cw == 0 || ch == 0 || src.len() < ch.saturating_mul(sw) {
+            return;
+        }
+        let dst = unsafe { std::slice::from_raw_parts_mut(self.ptr, self.w * self.h) };
+        for y in 0..ch {
+            let srow = y * sw;
+            let drow = y * self.w;
+            dst[drow..drow + cw].copy_from_slice(&src[srow..srow + cw]);
+        }
+    }
+
+    /// 将预烘焙的壁纸条带与目标纯色按 `t (0..1)` 逐像素线性混合后写入 Surface。
+    pub fn blit_lerped_bgra(&mut self, w: i32, h: i32, src: &[u32], to: (u8, u8, u8), t: f32) {
+        let cw = (w.max(0) as usize).min(self.w);
+        let ch = (h.max(0) as usize).min(self.h);
+        let sw = w.max(0) as usize;
+        if cw == 0 || ch == 0 || src.len() < ch.saturating_mul(sw) {
+            return;
+        }
+        let t256 = (t.clamp(0.0, 1.0) * 256.0).round() as u32;
+        let inv256 = 256 - t256;
+        let tr = to.0 as u32 * t256;
+        let tg = to.1 as u32 * t256;
+        let tb = to.2 as u32 * t256;
+        let dst = unsafe { std::slice::from_raw_parts_mut(self.ptr, self.w * self.h) };
+        for y in 0..ch {
+            let srow = y * sw;
+            let drow = y * self.w;
+            for x in 0..cw {
+                let p = src[srow + x];
+                let sb = p & 0xFF;
+                let sg = (p >> 8) & 0xFF;
+                let sr = (p >> 16) & 0xFF;
+                let r = ((sr * inv256 + tr + 128) >> 8).min(255);
+                let g = ((sg * inv256 + tg + 128) >> 8).min(255);
+                let b = ((sb * inv256 + tb + 128) >> 8).min(255);
+                dst[drow + x] = 0xFF00_0000 | (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+
     /// 在透明表面上执行标准预乘 BGRA Porter-Duff OVER 合成，保证 RGB 始终 <= A。
     #[inline]
     pub fn blend_premul_over(&mut self, x: i32, y: i32, b: u32, g: u32, r: u32, a: u32) {

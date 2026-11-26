@@ -193,7 +193,7 @@ impl Field {
             Field::ColorSpeed => "进入 / 退出最大化时颜色过渡的时长。",
             Field::FullscreenYield => "全屏游戏或视频时隐藏顶部栏与 Dock。",
             Field::ShowWindowPreview => "悬停在运行中的应用图标上时，显示其打开窗口的实时缩略图。",
-            Field::Opacity => "调节纯净 macOS 材质 Dock 托盘的不透明度。",
+            Field::Opacity => "调节顶部栏壁纸融合通透度与 Dock 托盘不透明度。",
             Field::AccentColor => "自定义控件与高亮强调色，选择首项自动跟随 Windows 主题色。",
             Field::ReduceMotion => "关闭波浪弹簧与显隐滑动动画。",
             _ => "",

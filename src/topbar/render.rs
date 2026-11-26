@@ -42,16 +42,27 @@ pub fn paint(hwnd: HWND, bar: &mut TopBar, _cfg: &TopbarCfg, appearance: &Appear
     let text: Rgba = if bar.dark_text { rgb(0x1D1D1F, 1.0) } else { rgb(0xF5F5F7, 1.0) };
     let text_dim: Rgba = if bar.dark_text { rgb(0x3A3A3C, 1.0) } else { rgb(0xD1D1D6, 1.0) };
 
-    let bg_rgb = if bar.mode == ColorMode::Fused {
-        bar.cur_fused
+    let has_strip = bar.desktop_w == w && bar.desktop_h == h && bar.desktop_bgra.len() == (w as usize).saturating_mul(h as usize);
+    if bar.mode == ColorMode::Fused {
+        if bar.fused_from_desktop && bar.fused_t < 1.0 && has_strip {
+            sf.blit_lerped_bgra(w, h, &bar.desktop_bgra, (bar.fused_to.r, bar.fused_to.g, bar.fused_to.b), bar.fused_t);
+        } else {
+            let bg_rgb = bar.cur_fused;
+            sf.fill_rect(
+                &RECT { left: 0, top: 0, right: w, bottom: h },
+                (bg_rgb.r as f32 / 255.0, bg_rgb.g as f32 / 255.0, bg_rgb.b as f32 / 255.0, 1.0),
+            );
+        }
+    } else if has_strip {
+        // 桌面态直接使用高斯模糊 + macOS Vibrancy 调色的本地壁纸顶部条带，自然融于背景
+        sf.blit_opaque_bgra(w, h, &bar.desktop_bgra);
     } else {
-        appearance.topbar_base_rgb()
-    };
-    // 统一不透明纯色填充（桌面为纯净主题色，最大化为窗口融合色），保证整条顶栏颜色均匀一致
-    sf.fill_rect(
-        &RECT { left: 0, top: 0, right: w, bottom: h },
-        (bg_rgb.r as f32 / 255.0, bg_rgb.g as f32 / 255.0, bg_rgb.b as f32 / 255.0, 1.0),
-    );
+        let bg_rgb = appearance.topbar_base_rgb();
+        sf.fill_rect(
+            &RECT { left: 0, top: 0, right: w, bottom: h },
+            (bg_rgb.r as f32 / 255.0, bg_rgb.g as f32 / 255.0, bg_rgb.b as f32 / 255.0, 1.0),
+        );
+    }
 
     // 激活态高亮（面板/浮层展开时的常驻胶囊底色）
     if let Some(ah) = &bar.active_hit {
@@ -194,9 +205,9 @@ pub fn paint(hwnd: HWND, bar: &mut TopBar, _cfg: &TopbarCfg, appearance: &Appear
         }
     }
 
-    // 桌面统一态底边极细层次线
+    // 桌面壁纸融合态底边仅保留极微弱层次线，避免硬边割裂壁纸连续感
     if bar.mode == ColorMode::Glass {
-        let line_col = if bar.dark_text { (0.0, 0.0, 0.0, 0.08) } else { (1.0, 1.0, 1.0, 0.10) };
+        let line_col = if bar.dark_text { (0.0, 0.0, 0.0, 0.06) } else { (1.0, 1.0, 1.0, 0.04) };
         sf.fill_rect(&RECT { left: 0, top: h - 1, right: w, bottom: h }, line_col);
     }
     drop(sf);
