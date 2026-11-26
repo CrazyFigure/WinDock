@@ -390,9 +390,9 @@ impl Dock {
         );
         self.base_centers = base.slots.iter().map(|s| s.center_x).collect();
         self.layout = base.clone();
-        // 窗口尺寸：基础胶囊 + 最大放大增量 + 边距；高度：胶囊 + 向上突破 + Tooltip
+        // 窗口尺寸：基础胶囊 + 最大放大增量 + 边距（并保证极端精简 Dock 下也能完整容纳“WinDockFinder 设置”Tooltip）；高度：胶囊 + 向上突破 + Tooltip
         let grow_w = (self.icon_px() as f32 * (self.magnify_scale - 1.0) * self.magnify_range * 2.0 * 0.6).round() as i32;
-        let w = base.capsule_w.round() as i32 + grow_w + self.margin_x() * 2;
+        let w = (base.capsule_w.round() as i32 + grow_w + self.margin_x() * 2).max(dp(180, self.dpi));
         let h = base.capsule_h.round() as i32 + base.grow_top.round() as i32 + self.tooltip_h() + self.margin_y() * 2;
         let mon = self.monitor;
         let mut left = mon.rect.left + (mon.width() - w) / 2;

@@ -874,18 +874,8 @@ impl App {
                 }
             }
         }
-        if cfg.show_trash {
-            list.right.push(items::FuncEntry {
-                kind: FuncKind::Trash,
-                label: "回收站".into(),
-                icon_key: items::trash_icon_key().into(),
-            });
-        }
-        list.right.push(items::FuncEntry {
-            kind: FuncKind::Settings,
-            label: "设置".into(),
-            icon_key: items::settings_icon_key().into(),
-        });
+        // 在用户自定义文件夹之后追加内置功能区（回收站与最右侧的 WinDockFinder 设置）。
+        Self::append_builtin_right_entries(&mut list.right, cfg.show_trash);
         let appearance = &self.config.appearance;
         let mut changed = false;
         for dock in &mut self.docks {
@@ -902,6 +892,23 @@ impl App {
         if changed {
             self.ensure_frame();
         }
+    }
+
+    /// 追加 Dock 右侧内置功能条目，并将 WinDockFinder 设置固定在最右侧。
+    fn append_builtin_right_entries(right: &mut Vec<items::FuncEntry>, show_trash: bool) {
+        if show_trash {
+            right.push(items::FuncEntry {
+                kind: FuncKind::Trash,
+                label: "回收站".into(),
+                icon_key: items::trash_icon_key().into(),
+            });
+        }
+        // 使用明确的产品名称，避免在 Dock Tooltip 中与 Windows 系统“设置”混淆。
+        right.push(items::FuncEntry {
+            kind: FuncKind::Settings,
+            label: "WinDockFinder 设置".into(),
+            icon_key: items::settings_icon_key().into(),
+        });
     }
 
     fn pinned_item(&self, sorted_index: usize) -> Option<DockItem> {
@@ -3854,5 +3861,22 @@ mod tests {
             App::restart_wait_args(1234, 5678),
             vec!["--restart-wait", "--parent-pid", "1234", "--guard-pid", "5678"]
         );
+    }
+
+    #[test]
+    fn dock_rightmost_settings_entry_uses_product_name() {
+        let mut with_trash = Vec::new();
+        App::append_builtin_right_entries(&mut with_trash, true);
+        assert_eq!(with_trash.len(), 2);
+        assert_eq!(with_trash[0].kind, FuncKind::Trash);
+        assert_eq!(with_trash[0].label, "回收站");
+        assert_eq!(with_trash[1].kind, FuncKind::Settings);
+        assert_eq!(with_trash[1].label, "WinDockFinder 设置");
+
+        let mut without_trash = Vec::new();
+        App::append_builtin_right_entries(&mut without_trash, false);
+        assert_eq!(without_trash.len(), 1);
+        assert_eq!(without_trash[0].kind, FuncKind::Settings);
+        assert_eq!(without_trash[0].label, "WinDockFinder 设置");
     }
 }
