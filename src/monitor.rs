@@ -487,6 +487,22 @@ unsafe fn has_shell_def_view(hwnd: HWND) -> bool {
         .is_ok_and(|child| !child.0.is_null())
 }
 
+/// 判断屏幕坐标点是否直接命中真正露出的 Windows 桌面壁纸/图标表面（排除被应用窗或自身遮挡的情况）。
+pub unsafe fn is_desktop_surface_point(screen_x: i32, screen_y: i32) -> bool {
+    let pt_hwnd = WindowFromPoint(windows::Win32::Foundation::POINT {
+        x: screen_x,
+        y: screen_y,
+    });
+    if pt_hwnd.0.is_null() {
+        return false;
+    }
+    let root = GetAncestor(pt_hwnd, GA_ROOT);
+    let root_cls = class_name(root);
+    root_cls == "Progman"
+        || (root_cls == "WorkerW"
+            && (has_shell_def_view(root) || class_name(pt_hwnd) == "SysListView32"))
+}
+
 /// 计算两个矩形的重叠宽高（任意轴无重叠时返回 0, 0）。
 fn rect_overlap_size(a: RECT, b: RECT) -> (i32, i32) {
     let w = (a.right.min(b.right) - a.left.max(b.left)).max(0);
@@ -553,8 +569,8 @@ pub fn dock_backdrop_windows(cap_screen: RECT) -> Vec<HWND> {
     let cap_h = (cap_screen.bottom - cap_screen.top).max(1);
     let mut scan = BackdropScan {
         target: cap_screen,
-        min_w: (cap_w / 5).clamp(24, 96),
-        min_h: (cap_h / 2).clamp(12, 32),
+        min_w: (cap_w / 6).clamp(24, 96),
+        min_h: (cap_h / 3).clamp(10, 24),
         out: Vec::new(),
     };
     unsafe {

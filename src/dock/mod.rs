@@ -266,12 +266,39 @@ impl Dock {
         }
     }
 
-    /// 返回当前未受 Tooltip 与放大图标遮挡的上方采样下边界提示。
+    /// 返回当前未受 Tooltip、放大图标与投影遮挡的上方安全采样下边界。
     pub fn glass_above_y_hint(&self) -> Option<i32> {
-        if !self.tooltip_visible && self.hover.is_none() {
-            Some(self.capsule_screen_rect().top - 2)
+        if self.window_visible
+            && self.show_t >= 0.99
+            && !self.tooltip_visible
+            && self.hover.is_none()
+            && self.bounce.is_none()
+            && self.drag.is_none()
+        {
+            // ui::fill_liquid_glass_capsule 顶部外投影扩展 ceil(5 * s_dpi)，再留 3px 安全透明余量
+            let safe_pad = (6.0 * self.dpi_scale()).ceil() as i32 + 2;
+            Some(self.capsule_screen_rect().top - safe_pad)
         } else {
             None
+        }
+    }
+
+    /// 返回左右侧翼紧贴采样可安全使用的屏幕 X 区间 `(左翼右边界, 右翼左边界)`，避开阴影与悬停放大区。
+    pub fn glass_flank_x_bounds(&self) -> (i32, i32) {
+        if self.window_visible
+            && self.show_t >= 0.99
+            && self.hover.is_none()
+            && self.bounce.is_none()
+            && self.drag.is_none()
+        {
+            let cap = self.capsule_screen_rect();
+            let sh_pad = (12.0 * self.dpi_scale()).ceil() as i32 + 4;
+            (
+                (cap.left - sh_pad).max(self.win_rect.left - 4),
+                (cap.right + sh_pad).min(self.win_rect.right + 4),
+            )
+        } else {
+            (self.win_rect.left - 4, self.win_rect.right + 4)
         }
     }
 

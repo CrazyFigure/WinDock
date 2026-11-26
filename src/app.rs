@@ -1083,9 +1083,10 @@ impl App {
                     d.win_rect,
                     d.monitor.rect,
                     d.glass_above_y_hint(),
+                    d.glass_flank_x_bounds(),
                 )
             });
-        let Some((hmon, zone_rect, cap_screen, win_rect, mon_rect, above_y_hint)) = target else {
+        let Some((hmon, zone_rect, cap_screen, win_rect, mon_rect, above_y_hint, flank_bounds)) = target else {
             return;
         };
         self.dock_color_busy = true;
@@ -1103,6 +1104,7 @@ impl App {
                     true,
                     is_liquid,
                     above_y_hint,
+                    flank_bounds,
                 );
                 let payload = Box::new((token, hmon, rgb, glass));
                 unsafe {
@@ -1715,6 +1717,7 @@ impl App {
                     false,
                     is_liquid,
                     None,
+                    self.docks[i].glass_flank_x_bounds(),
                 )
             } else {
                 (None, None)
@@ -1722,12 +1725,14 @@ impl App {
             self.docks[i].apply_backdrop_color(bg, &appearance_snapshot, true);
             self.docks[i].apply_glass_strip(glass, &appearance_snapshot);
         } else if is_liquid && self.docks[i].want_visible && self.docks[i].glass_strip.is_none() {
-            // 设置页实时切换至液态玻璃或壁纸刚刷新时，先以缓存壁纸条带瞬时填充首帧再异步补采背后窗口
-            let strip = color_sync::dock_wallpaper_glass_strip(
-                self.docks[i].monitor.rect,
-                self.docks[i].glass_zone_rect(),
-            );
-            self.docks[i].apply_glass_strip(Some(strip), &appearance_snapshot);
+            // 仅当背后确认为纯桌面无外部窗口遮挡时才先填入缓存壁纸条带，有应用窗口遮挡时等待异步真实采样
+            if monitor::dock_backdrop_windows(self.docks[i].capsule_screen_rect()).is_empty() {
+                let strip = color_sync::dock_wallpaper_glass_strip(
+                    self.docks[i].monitor.rect,
+                    self.docks[i].glass_zone_rect(),
+                );
+                self.docks[i].apply_glass_strip(Some(strip), &appearance_snapshot);
+            }
             self.docks[i].glass_dirty = true;
             self.spawn_dock_backdrop_sample();
         }
@@ -1836,7 +1841,9 @@ impl App {
             let is_liquid = self.config.appearance.dock_material == "liquid_glass";
             let mut marked = false;
             for d in &mut self.docks {
-                if d.window_visible && d.want_visible {
+                // 悬停放大/Tooltip/拖拽期间跳过低频复查，防止自身放大图标或气泡遮挡破坏已有采样
+                let interacting = d.hover.is_some() || d.tooltip_visible || d.drag.is_some();
+                if d.window_visible && d.want_visible && !interacting {
                     d.backdrop_dirty = true;
                     if is_liquid {
                         d.glass_dirty = true;
