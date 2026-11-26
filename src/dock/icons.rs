@@ -31,7 +31,7 @@ use crate::ui::IconPixels;
 use crate::win32::{exe_path, fnv1a64, wide};
 
 pub const WM_APP_ICON: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 3;
-const ICON_CACHE_MAGIC: &[u8; 4] = b"WDF2";
+const ICON_CACHE_MAGIC: &[u8; 4] = b"WDF3";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// 图标像素缓存字节预算（8 MB）。
 pub const ICON_BUDGET_BYTES: usize = 8 * 1024 * 1024;
@@ -87,9 +87,9 @@ impl IconWorker {
 
     pub fn cache_path(cache_dir: &Path, key: &str, size: u32) -> PathBuf {
         let bucket = Self::bucket_size(size);
-        let sig = format!("wdf2|{}|{}", key.to_lowercase(), bucket);
+        let sig = format!("wdf3|{}|{}", key.to_lowercase(), bucket);
         let h = fnv1a64(sig.as_bytes());
-        cache_dir.join(format!("wdf2_{h:016x}_{bucket}.icache"))
+        cache_dir.join(format!("wdf3_{h:016x}_{bucket}.icache"))
     }
 
     /// 清空磁盘图标缓存。
@@ -443,7 +443,8 @@ pub fn extract_stock_icon_hd(stock_id: windows::Win32::UI::Shell::SHSTOCKICONID,
     None
 }
 
-/// 读取 HICON 原始未预乘 BGRA 像素（优先直接读取 hbmColor + hbmMask，保留原生抗锯齿 Alpha；失败回退 DrawIconEx）。
+/// 读取 HICON 原始未预乘 BGRA 像素：32bpp 含真 Alpha 时直接读取 hbmColor 保留原生抗锯齿；
+/// 无内置 Alpha 的传统图标统一交由 DrawIconEx 合成，确保掩码与各类窗口图标 100% 兼容。
 /// 调用后自动销毁传入的 `hicon`。
 fn hicon_to_straight_bgra(hicon: windows::Win32::UI::WindowsAndMessaging::HICON, fallback_size: u32) -> Option<(Vec<u8>, u32, u32)> {
     use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, DrawIconEx, GetIconInfo, DI_NORMAL, ICONINFO};
@@ -455,48 +456,20 @@ fn hicon_to_straight_bgra(hicon: windows::Win32::UI::WindowsAndMessaging::HICON,
             } else {
                 None
             };
-            let mask_res = if !ii.hbmMask.is_invalid() {
-                hbitmap_to_bgra(ii.hbmMask, false)
-            } else {
-                None
-            };
             if !ii.hbmColor.is_invalid() {
                 let _ = DeleteObject(HGDIOBJ(ii.hbmColor.0));
             }
             if !ii.hbmMask.is_invalid() {
                 let _ = DeleteObject(HGDIOBJ(ii.hbmMask.0));
             }
-            if let Some((mut px, w, h)) = color_res {
-                let has_alpha = px.chunks_exact(4).any(|p| p[3] != 0);
-                if !has_alpha {
-                    // 无内置 Alpha 通道的老式图标：用 hbmMask 白色(=透明)/黑色(=不透明)还原精确轮廓
-                    if let Some((mpx, mw, mh)) = mask_res {
-                        if mw == w && mh >= h {
-                            for y in 0..h as usize {
-                                for x in 0..w as usize {
-                                    let idx = (y * w as usize + x) * 4;
-                                    let mask_white = mpx[idx] > 127;
-                                    px[idx + 3] = if mask_white { 0 } else { 255 };
-                                    if mask_white {
-                                        px[idx] = 0;
-                                        px[idx + 1] = 0;
-                                        px[idx + 2] = 0;
-                                    }
-                                }
-                            }
-                        } else {
-                            for p in px.chunks_exact_mut(4) {
-                                p[3] = 255;
-                            }
-                        }
-                    } else {
-                        for p in px.chunks_exact_mut(4) {
-                            p[3] = 255;
-                        }
-                    }
+            if let Some((px, w, h)) = color_res {
+                // 仅当位图自带真实 Alpha 通道（含有效可见像素）时直出，否则交由 DrawIconEx 处理掩码
+                let has_alpha = px.chunks_exact(4).any(|p| p[3] > 0);
+                let has_transparent = px.chunks_exact(4).any(|p| p[3] < 255);
+                if has_alpha && has_transparent && w >= 8 && h >= 8 {
+                    let _ = DestroyIcon(hicon);
+                    return Some((px, w, h));
                 }
-                let _ = DestroyIcon(hicon);
-                return Some((px, w, h));
             }
         }
 
@@ -880,7 +853,8 @@ pub fn normalize_and_premultiply(px: Vec<u8>, w: u32, h: u32, target: u32) -> (V
     let trans_ratio = trans_px as f32 / total_box;
     let avg_luma = if vis_weight > 0.0 { luma_sum / vis_weight } else { 1.0 };
     let bright_ratio = if vis_weight > 0.0 { bright_or_color_weight / vis_weight } else { 1.0 };
-    let needs_light_card = !is_sharp_rect && trans_ratio > 0.16 && avg_luma < 0.38 && bright_ratio < 0.22;
+    // 非尖角实心方卡且整体为极暗无彩色透明图标（如 ChatGPT、Seer 等）自动衬上 macOS 浅色圆角卡片
+    let needs_light_card = !is_sharp_rect && trans_ratio > 0.05 && avg_luma < 0.38 && bright_ratio < 0.20;
 
     let mut out = vec![0u8; (target * target * 4) as usize];
     if needs_light_card {

@@ -731,10 +731,17 @@ fn collect_snapshot(
     let mut collect = |buttons: &[NativeButton]| {
         let mut printed = None;
         buttons.iter().map(|button| {
-            if let Some(pixels) = capture_button(button, covered, &mut printed).as_ref()
-                .and_then(crop_opaque).and_then(|p| normalize_square(&p, 32))
-            {
-                icons_changed |= cache.insert_if_changed(&button.item.key, pixels, generation);
+            // 溢出区已存在注册表高清快照时，不再用易受动画/边框干扰的屏幕抓图覆盖
+            let keep_registered_overflow = button.item.overflow && cache.get(&button.item.key).is_some();
+            if !keep_registered_overflow {
+                if let Some(pixels) = capture_button(button, covered, &mut printed)
+                    .as_ref()
+                    .and_then(crop_opaque)
+                    .filter(|cropped| looks_like_real_icon(cropped))
+                    .and_then(|p| normalize_square(&p, 32))
+                {
+                    icons_changed |= cache.insert_if_changed(&button.item.key, pixels, generation);
+                }
             }
             button.item.clone()
         }).collect()
@@ -800,7 +807,10 @@ fn sample_flashing(buttons: &[NativeButton], pinned: &HashSet<String>, cache: &T
                 continue;
             }
             if let Some(raw) = capture_button(button, true, &mut printed) {
-                let pixels = crop_opaque(&raw).and_then(|p| normalize_square(&p, 32)).unwrap_or_else(|| blank.clone());
+                let pixels = crop_opaque(&raw)
+                    .filter(|cropped| looks_like_real_icon(cropped))
+                    .and_then(|p| normalize_square(&p, 32))
+                    .unwrap_or_else(|| blank.clone());
                 let frame = FlashFrame { hash: fnv1a64(&pixels.px), pixels, since: Instant::now() };
                 *pattern = observe_flash(frames, frame);
             }
@@ -1251,6 +1261,40 @@ pub fn spawn_live_window_icon_refresh(target: HWND, jobs: Vec<(String, Vec<isize
         .ok();
 }
 
+/// 过滤掉任务栏隐藏/动画期间误采到的空白边框细线或纯水平灰条，避免覆盖注册表中的真实图标。
+fn looks_like_real_icon(cropped: &IconPixels) -> bool {
+    let (w, h) = (cropped.w as usize, cropped.h as usize);
+    // 过扁的横条（如 20×3 任务栏顶边灰线）或过细的碎片不可能是正常托盘图标
+    if w < 6 || h < 6 || w > h * 2 || h > w * 3 {
+        return false;
+    }
+    let data = cropped.px.as_slice();
+    if data.len() < w * h * 4 {
+        return false;
+    }
+    // 统计横向相邻像素颜色差异：纯水平渐变条纹/任务栏顶边每行像素几乎全同，无横向图案变化
+    let mut pairs = 0usize;
+    let mut diff_pairs = 0usize;
+    for y in 0..h {
+        let row = y * w * 4;
+        for x in 1..w {
+            let l = row + (x - 1) * 4;
+            let r = row + x * 4;
+            if data[l + 3] > 32 || data[r + 3] > 32 {
+                pairs += 1;
+                let d = data[l].abs_diff(data[r]) as u16
+                    + data[l + 1].abs_diff(data[r + 1]) as u16
+                    + data[l + 2].abs_diff(data[r + 2]) as u16
+                    + data[l + 3].abs_diff(data[r + 3]) as u16;
+                if d >= 24 {
+                    diff_pairs += 1;
+                }
+            }
+        }
+    }
+    pairs > 0 && diff_pairs * 100 >= pairs * 5
+}
+
 fn crop_opaque(px: &IconPixels) -> Option<IconPixels> {
     let (w, h) = (px.w as usize, px.h as usize);
     let data = px.px.as_slice();
@@ -1454,5 +1498,57 @@ mod tests {
         assert!(!verified_overflow_order(&[Some(0), None, Some(2)], 4));
         assert!(!verified_overflow_order(&[Some(2), None, Some(0)], 3));
         assert!(!verified_overflow_order(&[Some(0), None, None], 3));
+    }
+
+    #[test]
+    fn rejects_taskbar_border_stripes_and_accepts_real_tray_icons() {
+        // 1. 扁平 20x3 任务栏顶边细条必须过滤
+        let thin_bar = IconPixels {
+            w: 20,
+            h: 3,
+            px: Arc::new(vec![220u8; 20 * 3 * 4]),
+        };
+        assert!(!looks_like_real_icon(&thin_bar));
+
+        // 2. 20x16 三段水平灰白渐变条带（无横向图案变化）必须过滤
+        let mut bands = vec![0u8; 20 * 16 * 4];
+        for y in 0..16 {
+            let v = if y < 6 { 238 } else if y < 11 { 225 } else { 175 };
+            for x in 0..20 {
+                let i = (y * 20 + x) * 4;
+                bands[i..i + 4].copy_from_slice(&[v, v, v, 255]);
+            }
+        }
+        assert!(!looks_like_real_icon(&IconPixels { w: 20, h: 16, px: Arc::new(bands) }));
+
+        // 3. 20x7 横条仅左上角带 2px 残留噪点也必须过滤
+        let mut bar_with_tip = vec![0u8; 20 * 7 * 4];
+        for y in 4..7 {
+            for x in 0..20 {
+                let i = (y * 20 + x) * 4;
+                bar_with_tip[i..i + 4].copy_from_slice(&[230, 230, 230, 255]);
+            }
+        }
+        for y in 0..2 {
+            for x in 1..3 {
+                let i = (y * 20 + x) * 4;
+                bar_with_tip[i..i + 4].copy_from_slice(&[180, 180, 180, 255]);
+            }
+        }
+        assert!(!looks_like_real_icon(&IconPixels { w: 20, h: 7, px: Arc::new(bar_with_tip) }));
+
+        // 4. 正常 16x16 圆形彩色图标必须通过
+        let mut circle = vec![0u8; 16 * 16 * 4];
+        for y in 0..16 {
+            for x in 0..16 {
+                let dx = x as f32 - 7.5;
+                let dy = y as f32 - 7.5;
+                if (dx * dx + dy * dy).sqrt() <= 6.0 {
+                    let i = (y * 16 + x) * 4;
+                    circle[i..i + 4].copy_from_slice(&[240, 140, 40, 255]);
+                }
+            }
+        }
+        assert!(looks_like_real_icon(&IconPixels { w: 16, h: 16, px: Arc::new(circle) }));
     }
 }
