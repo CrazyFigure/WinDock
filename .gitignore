@@ -2,3 +2,4 @@
 /dist
 *.pdb
 /.qoder-input-images
+.openidea/
