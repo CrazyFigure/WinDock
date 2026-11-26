@@ -344,7 +344,7 @@ fn extract_item(key: &str, size: u32) -> Option<(Vec<u8>, u32, u32)> {
     }
 }
 
-/// HBITMAP → BGRA 像素；32bpp 无 alpha 时补齐不透明。
+/// HBITMAP → BGRA 像素；兼容 DIBSECTION 与 GetIconInfo 返回的 DDB 位图。
 pub fn hbitmap_to_bgra(hbm: HBITMAP, fill_alpha: bool) -> Option<(Vec<u8>, u32, u32)> {
     unsafe {
         let mut dib = DIBSECTION::default();
@@ -356,9 +356,14 @@ pub fn hbitmap_to_bgra(hbm: HBITMAP, fill_alpha: bool) -> Option<(Vec<u8>, u32, 
         if got == 0 {
             return None;
         }
-        let w = dib.dsBmih.biWidth.max(1);
-        let h = dib.dsBmih.biHeight.abs().max(1);
-        let has_alpha = dib.dsBmih.biBitCount == 32;
+        // DDB 位图仅填充 dsBm，dsBmih 为 0；优先取 dsBmih，缺失时回退 dsBm
+        let w = if dib.dsBmih.biWidth > 0 { dib.dsBmih.biWidth } else { dib.dsBm.bmWidth };
+        let h = if dib.dsBmih.biHeight != 0 { dib.dsBmih.biHeight.abs() } else { dib.dsBm.bmHeight.abs() };
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        let bpp = if dib.dsBmih.biBitCount != 0 { dib.dsBmih.biBitCount } else { dib.dsBm.bmBitsPixel };
+        let has_alpha = bpp == 32;
         let hdc = CreateCompatibleDC(windows::Win32::Graphics::Gdi::HDC::default());
         let mut bi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
@@ -759,11 +764,19 @@ fn sample_area_premul(
 /// 图标内容边界归一化：裁剪透明留白、尖角矩形圆角化、
 /// 纯暗色透明图标自动衬 macOS 浅色圆角卡片、全预乘精确区域重采样（绝不双重预乘）。
 pub fn normalize_and_premultiply(px: Vec<u8>, w: u32, h: u32, target: u32) -> (Vec<u8>, u32, u32) {
+    let target = target.max(1);
+    let expected = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+    if w == 0 || h == 0 || expected == 0 || px.len() < expected {
+        return (vec![0u8; (target * target * 4) as usize], target, target);
+    }
     let iw = w as i32;
     let ih = h as i32;
-    let premul = to_premul_f32(&px);
+    let premul = to_premul_f32(&px[..expected]);
+    // 边界钳位访问，防止 1×1 等极小位图在角点/边距探测时越界
     let at = |x: i32, y: i32| -> [u8; 4] {
-        let i = ((y * iw + x) * 4) as usize;
+        let cx = x.clamp(0, iw - 1);
+        let cy = y.clamp(0, ih - 1);
+        let i = ((cy * iw + cx) * 4) as usize;
         [px[i], px[i + 1], px[i + 2], px[i + 3]]
     };
 
@@ -1157,5 +1170,21 @@ mod tests {
         let center = ((32 * 64 + 32) * 4) as usize;
         assert!(out[center + 3] > 240);
         assert!(out[center + 2] > 220 && out[center + 1] > 220 && out[center] > 220);
+    }
+
+    #[test]
+    fn tiny_and_stock_icons_never_panic() {
+        let (out, w, h) = normalize_and_premultiply(vec![10, 20, 30, 255], 1, 1, 32);
+        assert_eq!((w, h), (32, 32));
+        assert_eq!(out.len(), 32 * 32 * 4);
+
+        // 验证系统内置回收站图标（DDB HICON）可正常高清提取且不崩溃
+        let stock = extract_stock_icon_hd(
+            windows::Win32::UI::Shell::SHSTOCKICONID(windows::Win32::UI::Shell::SIID_RECYCLER.0),
+            DOCK_ICON_SRC_SIZE,
+        )
+        .expect("应成功提取回收站高清图标");
+        assert_eq!((stock.w, stock.h), (DOCK_ICON_SRC_SIZE, DOCK_ICON_SRC_SIZE));
+        assert!(stock.px.chunks_exact(4).any(|p| p[3] > 200));
     }
 }
