@@ -6,7 +6,7 @@
 use std::cell::Cell;
 use std::os::windows::io::IntoRawHandle;
 use std::os::windows::process::CommandExt;
-use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -34,8 +34,9 @@ use crate::taskbar::{self, TaskbarController, WM_APP_TASKBAR_RESHOW};
 use crate::topbar::color_sync::{self, Rgb};
 use crate::topbar::panel::{NetworkData, PanelAction, PanelKind, StatusPanel};
 use crate::topbar::status;
-use crate::topbar::tray_mirror::{self, TrayIconCache, TrayInvocation, TrayItem, TrayRefresh, TraySnapshot};
+use crate::topbar::tray_mirror::{self, TrayIconCache, TrayInvocation, TrayItem, TrayRefreshRequest, TraySnapshot};
 use crate::topbar::tray_popover::Popover;
+use crate::topbar::tray_tooltip::{TipTarget, TrayTooltip, TIMER_TRAY_TIP};
 use crate::topbar::{Hit, TopBar, TopbarDrag};
 use crate::tray::Tray;
 use crate::ui::DibTarget;
@@ -56,6 +57,8 @@ pub const IPC_RESTORE_TASKBAR: usize = 4;
 const TIMER_FRAME: usize = 1;
 const TIMER_SLOW: usize = 2;
 const TIMER_EDGE: usize = 3;
+const TIMER_TRAY_CONTEXT: usize = 4;
+const TIMER_TRAY_FLASH: usize = 6;
 const HK_DOCK: i32 = 7001;
 const HK_TOPBAR: i32 = 7002;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -247,10 +250,21 @@ fn entries_equal(a: &crate::dock::items::EntryList, b: &crate::dock::items::Entr
         && a.apps.iter().zip(b.apps.iter()).all(|(x, y)| x.label == y.label)
 }
 
+struct TrayClick {
+    item: TrayItem,
+    anchor: Option<RECT>,
+    popover: Option<HWND>,
+}
+
 enum TrayWork {
     // 图标采样中的用户点击排在其后，避免两个后台线程同时操作同一个原生托盘。
-    Refresh { queued_click: Option<(TrayItem, Option<RECT>)> },
-    Click { right: bool, screen: POINT, queued_click: Option<(TrayItem, Option<RECT>)> },
+    Refresh { canceled: Arc<AtomicBool>, reading_overflow: bool, queued_click: Option<TrayClick> },
+    Click { right: bool, screen: POINT, popover: Option<HWND>, queued_click: Option<TrayClick> },
+}
+
+struct TrayContext {
+    popover: HWND,
+    menu: Option<HWND>,
 }
 
 enum TraySeed {
@@ -318,8 +332,12 @@ pub struct App {
     pub tray_raw_items: Vec<TrayItem>,
     tray_snapshot_generation: u64,
     pub last_tray_refresh: Option<Instant>,
+    last_tray_details: Option<Instant>,
+    tray_details_pending: bool,
     tray_work: Option<TrayWork>,
     tray_seed: TraySeed,
+    tray_context: Option<TrayContext>,
+    tray_tip: TrayTooltip,
     pub temp_show_until: Option<Instant>,
     pub display_dirty_at: Option<Instant>,
     pub cursor_monitor: isize,
@@ -448,8 +466,12 @@ pub fn run(open_settings: bool) -> i32 {
         tray_raw_items: Vec::new(),
         tray_snapshot_generation: 0,
         last_tray_refresh: None,
+        last_tray_details: None,
+        tray_details_pending: false,
         tray_work: None,
         tray_seed: TraySeed::Ready,
+        tray_context: None,
+        tray_tip: TrayTooltip::default(),
         temp_show_until: None,
         display_dirty_at: None,
         cursor_monitor: 0,
@@ -689,6 +711,8 @@ impl App {
     }
 
     fn rebuild_bars(&mut self) {
+        self.close_popover();
+        self.tray_tip.clear(self.hwnd);
         self.context_menu.close();
         self.status_panel.close();
         self.window_preview.close();
@@ -1029,33 +1053,51 @@ impl App {
 
     pub fn refresh_tray(&mut self) {
         if self.topbars.is_empty() || self.tray_work.is_some() || self.snap.fullscreen
-            || matches!(self.tray_seed, TraySeed::Loading(_))
+            || self.tray_context.is_some() || matches!(self.tray_seed, TraySeed::Loading(_))
         {
             return;
         }
         let peek = self.taskbar.begin_tray_peek();
-        let peeked = peek.is_some();
-        if tray_mirror::spawn_refresh(self.hwnd, self.tray_icons.clone(), peek) {
+        let canceled = Arc::new(AtomicBool::new(false));
+        let reading_overflow = self.tray_details_pending;
+        let pinned = self.topbars.iter().flat_map(|bar| bar.tray_items.iter().filter_map(|item| {
+            bar.pinned.contains(&item.key).then(|| item.uia_key.clone()).flatten()
+        })).collect();
+        let request = TrayRefreshRequest { peek, canceled: canceled.clone(), overflow: reading_overflow, pinned };
+        if tray_mirror::spawn_refresh(self.hwnd, self.tray_icons.clone(), request) {
             self.last_tray_refresh = Some(Instant::now());
-            if peeked {
-                self.tray_work = Some(TrayWork::Refresh { queued_click: None });
+            if reading_overflow {
+                self.tray_details_pending = false;
+                self.last_tray_details = self.last_tray_refresh;
             }
-        } else if peeked {
+            self.tray_work = Some(TrayWork::Refresh { canceled, reading_overflow, queued_click: None });
+        } else {
             self.taskbar.end_tray_peek();
         }
     }
 
     /// 后台采样退还主任务栏后，立即处理这段时间收到的图标点击。
-    fn on_tray_refresh(&mut self, result: TrayRefresh) {
-        if result.peeked {
-            let Some(TrayWork::Refresh { queued_click }) = self.tray_work.take() else { return };
-            self.taskbar.end_tray_peek();
-            self.apply_tray_snapshot(result.snapshot);
-            if let Some((item, anchor)) = queued_click {
-                self.invoke_tray_native(item, anchor);
+    fn on_tray_refresh(&mut self, snapshot: TraySnapshot) {
+        let Some(TrayWork::Refresh { queued_click, .. }) = self.tray_work.take() else { return };
+        self.taskbar.end_tray_peek();
+        self.apply_tray_snapshot(snapshot);
+        let (active, _) = self.tray_icons.advance_flash_frames();
+        if active {
+            unsafe { let _ = SetTimer(self.hwnd, TIMER_TRAY_FLASH, 85, None); }
+            self.repaint_tray_frames();
+        }
+        if let Some(click) = queued_click {
+            self.invoke_tray(click);
+        } else if self.tray_details_pending {
+            self.refresh_tray();
+        }
+    }
+
+    fn repaint_tray_frames(&mut self) {
+        for bar in &self.topbars {
+            if !bar.pinned.is_empty() {
+                invalidate(bar.hwnd);
             }
-        } else if self.tray_work.is_none() {
-            self.apply_tray_snapshot(result.snapshot);
         }
     }
 
@@ -1130,6 +1172,7 @@ impl App {
         if let Some(s) = &self.settings {
             s.invalidate();
         }
+        self.refresh_tray_tip();
     }
 
     // ---------- Dock 显隐状态机 ----------
@@ -1519,8 +1562,14 @@ impl App {
             }
             // 顶部固定的图标与收纳面板中的图标也需要跟随原生状态更新。
             let tracks_visible_icons = popover_open || !self.config.topbar.pinned_tray_keys.is_empty();
-            let due = self.last_tray_refresh.map(|t| t.elapsed() >= Duration::from_secs(if taskbar_open { 2 } else { 6 })).unwrap_or(true);
-            if (tracks_visible_icons || taskbar_open) && due && !foreground_has_menu() {
+            let samples_notifications = self.topbars.first().is_some_and(|bar| bar.tray_items.iter().any(|item| {
+                !item.overflow && item.uia_key.is_some() && bar.pinned.contains(&item.key)
+            }));
+            let poll_seconds = if taskbar_open { 2 } else if samples_notifications { 3 } else { 6 };
+            let due = self.last_tray_refresh.is_none_or(|last| last.elapsed() >= Duration::from_secs(poll_seconds));
+            if (tracks_visible_icons || taskbar_open) && due && !foreground_has_menu()
+                && !(self.frame_on && self.docks.iter().any(Dock::animating))
+            {
                 self.refresh_tray();
             }
         }
@@ -1739,6 +1788,23 @@ impl App {
             TIMER_FRAME => self.on_frame(),
             TIMER_SLOW => self.on_slow(),
             TIMER_EDGE => self.on_edge_timer(),
+            TIMER_TRAY_CONTEXT => self.track_tray_context(),
+            TIMER_TRAY_TIP => {
+                if matches!(self.tray_work, Some(TrayWork::Click { right: true, .. })) {
+                    self.tray_tip.clear(self.hwnd);
+                } else {
+                    self.tray_tip.on_timer(self.hwnd, self.config.appearance.is_dark());
+                }
+            }
+            TIMER_TRAY_FLASH => {
+                let (active, changed) = self.tray_icons.advance_flash_frames();
+                if !active {
+                    unsafe { let _ = KillTimer(self.hwnd, TIMER_TRAY_FLASH); }
+                }
+                if changed || !active {
+                    self.repaint_tray_frames();
+                }
+            }
             _ => {}
         }
     }
@@ -2105,6 +2171,10 @@ impl App {
 
     pub fn dock_mouse_move(&mut self, hwnd: HWND, x: f32, y: f32) {
         let Some(i) = self.dock_index(hwnd) else { return };
+        // Dock 放大动画优先于后台托盘采样，右键和悬停详情仍照常处理。
+        if let Some(TrayWork::Refresh { canceled, reading_overflow: false, .. }) = &self.tray_work {
+            canceled.store(true, Ordering::Relaxed);
+        }
         self.mouse_in_dock = true;
         self.hide_at = None;
         self.edge_since = None;
@@ -2444,6 +2514,7 @@ impl App {
                         insert_x: ins_x,
                     });
                     invalidate(bar.hwnd);
+                    self.tray_tip.clear(self.hwnd);
                     return;
                 }
             }
@@ -2461,6 +2532,56 @@ impl App {
         }
         let hit = bar.hit_test(x, y);
         bar.set_hover(hit);
+        self.update_tray_tip(hwnd, x, y);
+    }
+
+    /// 根据当前命中的格子提取实际托盘提示，而非替换成窗口的显示名称。
+    fn update_tray_tip(&mut self, hwnd: HWND, x: i32, y: i32) {
+        let mut hidden_icon = false;
+        let target = if self.tray_context.is_some() {
+            None
+        } else if let Some(index) = self.topbar_index(hwnd) {
+            let bar = &self.topbars[index];
+            match bar.hit_test(x, y) {
+                Some(hit @ Hit::TrayIcon(_)) if bar.press_icon.is_none() && bar.drag.is_none() => {
+                    let Hit::TrayIcon(key) = &hit else { return };
+                    bar.tray_items.iter().find(|item| &item.key == key).and_then(|item| {
+                        hidden_icon = item.overflow;
+                        Some(TipTarget { owner: hwnd, key: key.clone(), anchor: tray_anchor(hwnd, bar.rect_of(&hit)?)?,
+                            dpi: bar.dpi, text: item.hint().to_string() })
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            self.popover_owner(hwnd).and_then(|index| self.topbars[index].popover.as_ref()).and_then(|p| {
+                if !p.visible || p.press.is_some() { return None; }
+                let index = p.index_at(x, y)?;
+                let item = p.items.get(index)?;
+                hidden_icon = item.overflow;
+                Some(TipTarget { owner: hwnd, key: item.key.clone(), anchor: tray_anchor(hwnd, p.cell_rect(index)?)?,
+                    dpi: p.dpi, text: item.hint().to_string() })
+            })
+        };
+        if hidden_icon && target.as_ref().is_some_and(|target| !self.tray_tip.tracks(target))
+            && self.last_tray_details.is_none_or(|last| last.elapsed() >= Duration::from_secs(3))
+        {
+            self.tray_details_pending = true;
+            if let Some(TrayWork::Refresh { canceled, reading_overflow: false, .. }) = &self.tray_work {
+                canceled.store(true, Ordering::Relaxed);
+            }
+            self.refresh_tray();
+        }
+        self.tray_tip.track(self.hwnd, target, self.config.appearance.is_dark());
+    }
+
+    fn refresh_tray_tip(&mut self) {
+        let Some(owner) = self.tray_tip.owner() else { return };
+        let mut point = POINT::default();
+        let mut rect = RECT::default();
+        if unsafe { GetCursorPos(&mut point).is_ok() && GetWindowRect(owner, &mut rect).is_ok() } {
+            self.update_tray_tip(owner, point.x - rect.left, point.y - rect.top);
+        }
     }
 
     fn compute_topbar_insert(bar: &TopBar, drag_key: &str, x: i32) -> (Option<String>, i32) {
@@ -2504,6 +2625,9 @@ impl App {
     }
 
     pub fn topbar_mouse_leave(&mut self, hwnd: HWND) {
+        if self.tray_tip.owner() == Some(hwnd) {
+            self.tray_tip.clear(self.hwnd);
+        }
         let Some(i) = self.topbar_index(hwnd) else { return };
         if self.topbars[i].drag.is_none() {
             self.topbars[i].set_hover(None);
@@ -2511,6 +2635,7 @@ impl App {
     }
 
     pub fn topbar_lbutton_down(&mut self, hwnd: HWND, x: i32, y: i32) {
+        self.tray_tip.clear(self.hwnd);
         let Some(i) = self.topbar_index(hwnd) else { return };
         if let Some(Hit::TrayIcon(key)) = self.topbars[i].hit_test(x, y) {
             self.topbars[i].press_icon = Some((key, x, y));
@@ -2560,6 +2685,12 @@ impl App {
 
     /// 顶部栏和收纳格共用原生托盘交互。普通窗口仍有自己的窗口菜单。
     fn invoke_tray_native(&mut self, item: TrayItem, anchor: Option<RECT>) {
+        self.invoke_tray(TrayClick { item, anchor, popover: None });
+    }
+
+    fn invoke_tray(&mut self, click: TrayClick) {
+        self.tray_tip.clear(self.hwnd);
+        let TrayClick { item, anchor, popover } = click;
         let right = anchor.is_some();
         let screen = anchor.map_or(POINT::default(), |icon| POINT { x: icon.left, y: icon.bottom });
         if !right && !item.app_hwnds.is_empty() {
@@ -2568,31 +2699,54 @@ impl App {
         }
         if let Some(work) = &mut self.tray_work {
             let queued_click = match work {
-                TrayWork::Refresh { queued_click } | TrayWork::Click { queued_click, .. } => queued_click,
+                TrayWork::Refresh { canceled, queued_click, .. } => {
+                    canceled.store(true, Ordering::Relaxed);
+                    queued_click
+                }
+                TrayWork::Click { queued_click, .. } => queued_click,
             };
-            *queued_click = Some((item, anchor));
+            *queued_click = Some(TrayClick { item, anchor, popover });
             return;
         }
         let peek = self.taskbar.begin_tray_peek();
         if tray_mirror::spawn_invocation(self.hwnd, item.clone(), anchor, peek, self.tray_icons.clone()) {
-            self.tray_work = Some(TrayWork::Click { right, screen, queued_click: None });
+            self.tray_work = Some(TrayWork::Click { right, screen, popover, queued_click: None });
         } else {
             self.taskbar.end_tray_peek();
             self.invoke_window_shelf_item(&item, right, screen);
+            if popover.is_some() {
+                self.close_popover();
+            }
         }
     }
 
     fn on_tray_invoked(&mut self, result: TrayInvocation) {
-        let Some(TrayWork::Click { right, screen, queued_click }) = self.tray_work.take() else { return };
+        let Some(TrayWork::Click { right, screen, popover, queued_click }) = self.tray_work.take() else { return };
         self.taskbar.end_tray_peek();
         self.apply_tray_snapshot(result.snapshot);
-        if let Some((item, anchor)) = queued_click {
-            self.invoke_tray_native(item, anchor);
+        if let Some(click) = queued_click {
+            self.invoke_tray(click);
             return;
         }
         // 普通窗口才回退到窗口菜单。
         if result.ordinary_window {
             self.invoke_window_shelf_item(&result.target, right, screen);
+        }
+        if popover.is_some_and(|owner| self.tray_context.as_ref().is_some_and(|ctx| ctx.popover == owner)) {
+            if result.ordinary_window {
+                self.close_popover();
+            } else if let (Some(ctx), Some(menu)) = (&mut self.tray_context, result.menu) {
+                ctx.menu = Some(HWND(menu as *mut _));
+                // 原生菜单拥有自己的消息循环。只在它打开时检查显隐，子菜单展开期间保留收纳格。
+                unsafe { let _ = SetTimer(self.hwnd, TIMER_TRAY_CONTEXT, 45, None); }
+                self.track_tray_context();
+            } else if let Some(ctx) = self.tray_context.take() {
+                if let Some(index) = self.popover_owner(ctx.popover) {
+                    if let Some(p) = self.topbars[index].popover.as_mut() {
+                        p.set_context_key(None);
+                    }
+                }
+            }
         }
     }
 
@@ -3073,6 +3227,11 @@ impl App {
     }
 
     pub fn close_popover(&mut self) {
+        if self.tray_tip.owner().is_some_and(|owner| self.popover_owner(owner).is_some()) {
+            self.tray_tip.clear(self.hwnd);
+        }
+        self.tray_context = None;
+        unsafe { let _ = KillTimer(self.hwnd, TIMER_TRAY_CONTEXT); }
         if let TraySeed::Loading(pending) = &mut self.tray_seed {
             *pending = None;
         }
@@ -3097,10 +3256,23 @@ impl App {
         }
     }
 
-    pub fn popover_tip_timer(&mut self, hwnd: HWND) {
-        let Some(bi) = self.popover_owner(hwnd) else { return };
-        if let Some(p) = self.topbars[bi].popover.as_mut() {
-            p.on_tip_timer();
+    /// Explorer 或应用菜单接管焦点时收纳格仍然可见，菜单自行关闭后再收起。
+    pub fn popover_deactivated(&mut self, hwnd: HWND, next: HWND) {
+        let next = if next.0.is_null() { unsafe { GetForegroundWindow() } } else { next };
+        if matches!(self.tray_work, Some(TrayWork::Refresh { reading_overflow: true, .. }))
+            && (next.0.is_null()
+                || taskbar::primary_taskbar().is_some_and(|tray| taskbar::window_pid(tray) == taskbar::window_pid(next)))
+        {
+            return;
+        }
+        if !self.tray_context.as_ref().is_some_and(|ctx| ctx.popover == hwnd) {
+            self.close_popover();
+        }
+    }
+
+    fn track_tray_context(&mut self) {
+        if self.tray_context.as_ref().and_then(|ctx| ctx.menu).is_some_and(|menu| !taskbar::is_visible(menu)) {
+            self.close_popover();
         }
     }
 
@@ -3109,9 +3281,13 @@ impl App {
         if let Some(p) = self.topbars[bi].popover.as_mut() {
             p.on_mouse_move(x, y);
         }
+        self.update_tray_tip(hwnd, x, y);
     }
 
     pub fn popover_mouse_leave(&mut self, hwnd: HWND) {
+        if self.tray_tip.owner() == Some(hwnd) {
+            self.tray_tip.clear(self.hwnd);
+        }
         let Some(bi) = self.popover_owner(hwnd) else { return };
         if let Some(p) = self.topbars[bi].popover.as_mut() {
             p.on_mouse_leave();
@@ -3119,12 +3295,14 @@ impl App {
     }
 
     pub fn popover_wheel(&mut self, hwnd: HWND, delta: i16) {
+        self.tray_tip.clear(self.hwnd);
         let Some(bi) = self.popover_owner(hwnd) else { return };
         let bar = &mut self.topbars[bi];
         if let Some(p) = bar.popover.as_mut() {
             let step = if delta > 0 { -1i32 } else { 1i32 };
             let next = (p.scroll as i32 + step).clamp(0, p.scroll_max() as i32) as usize;
             if next != p.scroll {
+                p.press = None;
                 p.scroll = next;
                 p.render();
             }
@@ -3132,68 +3310,24 @@ impl App {
     }
 
     pub fn popover_lbutton_down(&mut self, hwnd: HWND, x: i32, y: i32) {
+        self.tray_tip.clear(self.hwnd);
         let Some(bi) = self.popover_owner(hwnd) else { return };
         if let Some(p) = self.topbars[bi].popover.as_mut() {
-            p.press = p.index_at(x, y).map(|idx| (idx, x, y));
+            p.press = p.index_at(x, y);
             p.render();
         }
     }
 
     pub fn popover_lbutton_up(&mut self, hwnd: HWND, x: i32, y: i32) {
         let Some(bi) = self.popover_owner(hwnd) else { return };
-        let (press, drag, from_key, over_key, after_flag) = {
-            let Some(p) = self.topbars[bi].popover.as_mut() else { return };
-            let press = p.press.take();
-            let drag = p.drag.take();
-            unsafe {
-                if windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() == hwnd {
-                    let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
-                }
-            }
-            let (fk, ok, after) = if let Some(d) = &drag {
-                let fk = p.items.get(d.from).map(|i| i.key.clone());
-                let ok = d.over.and_then(|o| p.items.get(o)).map(|i| i.key.clone());
-                let after = d.over.and_then(|o| p.cell_rect(o)).map(|r| x > (r.left + r.right) / 2).unwrap_or(false);
-                (fk, ok, after)
-            } else {
-                (None, None, false)
-            };
-            let hit = p.index_at(x, y);
-            let clicked_key = if drag.is_none() {
-                press.and_then(|(pi, _, _)| if hit == Some(pi) { p.items.get(pi).map(|i| i.key.clone()) } else { None })
-            } else {
-                None
-            };
-            (clicked_key, drag.is_some(), fk, ok, after)
-        };
-
-        if drag {
-            if let (Some(fk), Some(ok)) = (from_key, over_key) {
-                if fk != ok {
-                    let mut keys = self.config.topbar.pinned_tray_keys.clone();
-                    if !keys.contains(&fk) {
-                        keys.push(fk.clone());
-                    }
-                    if !keys.contains(&ok) {
-                        keys.push(ok.clone());
-                    }
-                    keys.retain(|k| k != &fk);
-                    if let Some(pos) = keys.iter().position(|k| k == &ok) {
-                        let insert_at = if after_flag { pos + 1 } else { pos };
-                        keys.insert(insert_at.min(keys.len()), fk);
-                    } else {
-                        keys.push(fk);
-                    }
-                    self.apply_pinned_tray_keys(keys);
-                    return;
-                }
-            }
-            if let Some(p) = self.topbars[bi].popover.as_mut() {
-                p.render();
-            }
-        } else if let Some(key) = press {
-            // 点击图标：切换固定到顶部栏 / 取消固定
+        let Some(p) = self.topbars[bi].popover.as_mut() else { return };
+        let Some(index) = p.press.take() else { return };
+        // 只在原图标格内完成点击时切换固定状态。
+        if p.index_at(x, y) == Some(index) {
+            let key = p.items[index].key.clone();
             self.toggle_tray_pin(&key);
+        } else {
+            p.render();
         }
     }
 
@@ -3203,19 +3337,10 @@ impl App {
         let Some(index) = p.index_at(x, y) else { return };
         let Some(item) = p.items.get(index).cloned() else { return };
         let Some(anchor) = p.cell_rect(index).and_then(|icon| tray_anchor(hwnd, icon)) else { return };
-        // 使用实际点中的格子与条目，关闭浮层后仍能在该图标附近打开菜单。
-        self.close_popover();
-        self.invoke_tray_native(item, Some(anchor));
-    }
-
-    pub fn popover_capture_lost(&mut self, hwnd: HWND) {
-        if let Some(bi) = self.popover_owner(hwnd) {
-            if let Some(p) = self.topbars[bi].popover.as_mut() {
-                p.press = None;
-                p.drag = None;
-                p.render();
-            }
-        }
+        let Some(p) = self.topbars[bi].popover.as_mut() else { return };
+        p.set_context_key(Some(item.key.clone()));
+        self.tray_context = Some(TrayContext { popover: hwnd, menu: None });
+        self.invoke_tray(TrayClick { item, anchor: Some(anchor), popover: Some(hwnd) });
     }
 
     /// 切换某应用/托盘图标「固定到顶部栏 / 收进折叠区」。
@@ -3266,7 +3391,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         crate::topbar::status::WM_APP_STATUS => {}
         crate::topbar::tray_mirror::WM_APP_TRAY_ITEMS => {
             if lparam.0 != 0 {
-                app.on_tray_refresh(*Box::from_raw(lparam.0 as *mut TrayRefresh));
+                app.on_tray_refresh(*Box::from_raw(lparam.0 as *mut TraySnapshot));
             }
         }
         crate::topbar::tray_mirror::WM_APP_TRAY_SEED => {

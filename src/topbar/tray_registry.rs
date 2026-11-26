@@ -33,11 +33,13 @@ pub(super) struct Registration {
     pub id: u64,
     pub exe: String,
     pub names: Vec<String>,
+    pub initial_tip: Option<String>,
     pub pids: Vec<u32>,
     pub rect: RECT,
     pub overflow: bool,
     pub order: Option<usize>,
     pub pixels: Option<IconPixels>,
+    identity: (isize, u32, GUID),
 }
 
 impl Registration {
@@ -57,6 +59,16 @@ impl Registration {
             .rsplit(['\\', '/'])
             .next()
             .is_some_and(|name| name.eq_ignore_ascii_case("explorer.exe"))
+    }
+
+    /// 点击时直接核对目标的 Shell 坐标与显隐设置，防止使用已经调整过的旧槽位。
+    pub fn current_placement(&self) -> Option<(RECT, bool)> {
+        let (hwnd, uid, guid) = self.identity;
+        let rect = active_rect(HWND(hwnd as *mut _), uid, guid)?;
+        let key = settings()?;
+        let child: Vec<_> = self.id.to_string().encode_utf16().chain([0]).collect();
+        let overflow = dword(key.0, PCWSTR(child.as_ptr()), w!("IsPromoted")) != Some(1);
+        Some((rect, overflow))
     }
 }
 
@@ -277,6 +289,7 @@ fn decode_snapshot(factory: &IWICImagingFactory, data: &[u8]) -> Option<IconPixe
 pub(super) fn active_registrations(
     tray: HWND,
     has_pixels: impl Fn(u64) -> bool,
+    canceled: impl Fn() -> bool,
 ) -> Option<Vec<Registration>> {
     if unsafe { IsHungAppWindow(tray).as_bool() } {
         return None;
@@ -294,6 +307,9 @@ pub(super) fn active_registrations(
     let mut seen = HashSet::new();
     let mut registered = Vec::new();
     for index in 0..MAX_SETTINGS {
+        if canceled() {
+            return None;
+        }
         let mut subkey = [0u16; 32];
         let mut len = subkey.len() as u32;
         let status = unsafe {
@@ -330,7 +346,7 @@ pub(super) fn active_registrations(
             continue;
         }
         let windows = by_exe.get(&exe_key).map(Vec::as_slice).unwrap_or_default();
-        let (rect, pids) = if let Some(guid) = string(key.0, child, w!("IconGuid"))
+        let (rect, pids, identity) = if let Some(guid) = string(key.0, child, w!("IconGuid"))
             .as_deref()
             .and_then(parse_guid)
             .filter(|guid| *guid != GUID::zeroed())
@@ -341,7 +357,7 @@ pub(super) fn active_registrations(
             if !seen.insert((0, u128::from(guid))) {
                 continue;
             }
-            (rect, windows.iter().map(|&hwnd| window_pid(hwnd)).collect())
+            (rect, windows.iter().map(|&hwnd| window_pid(hwnd)).collect(), (0, 0, guid))
         } else {
             let Some(uid) = dword(key.0, child, w!("UID")) else {
                 continue;
@@ -358,13 +374,12 @@ pub(super) fn active_registrations(
             let mut owners: Vec<_> = windows.iter().map(|&window| window_pid(window)).collect();
             owners.sort_unstable();
             owners.dedup();
-            (rect, owners)
+            (rect, owners, (hwnd.0 as isize, uid, GUID::zeroed()))
         };
         let mut names = Vec::new();
-        if let Some(tip) =
-            string(key.0, child, w!("InitialTooltip")).filter(|tip| !tip.trim().is_empty())
-        {
-            names.push(tip);
+        let initial_tip = string(key.0, child, w!("InitialTooltip")).filter(|tip| !tip.trim().is_empty());
+        if let Some(tip) = &initial_tip {
+            names.push(tip.clone());
         }
         if file != "explorer.exe" {
             names.push(crate::monitor::exe_display_name(&exe));
@@ -383,11 +398,13 @@ pub(super) fn active_registrations(
             id,
             exe,
             names,
+            initial_tip,
             pids,
             rect,
             overflow,
             order: order.get(&id).copied(),
             pixels,
+            identity,
         });
     }
     registered.sort_by_key(|item| (item.overflow, item.order.unwrap_or(usize::MAX), item.id));

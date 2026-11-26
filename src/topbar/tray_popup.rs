@@ -363,7 +363,13 @@ pub(super) struct MenuPlacement {
     anchor: RECT,
     source: POINT,
     placed: bool,
-    observed: bool,
+    observed: Option<HWND>,
+}
+
+pub(super) struct OpenedMenu {
+    pub dispatched: bool,
+    pub window: Option<HWND>,
+    pub used_mouse: bool,
 }
 
 thread_local! {
@@ -406,12 +412,12 @@ impl MenuPlacement {
             anchor,
             source,
             placed: false,
-            observed: false,
+            observed: None,
         }
     }
 
     /// 先监听应用菜单的出现事件再发送输入，尽早搬移窗口。旧版菜单缺少事件时短时补查。
-    pub fn open_at(self, open: impl FnOnce() -> bool, fallback: impl FnOnce() -> bool) -> bool {
+    pub fn open_at(self, mouse_first: bool, uia: impl FnOnce() -> bool, mouse: impl FnOnce() -> bool) -> OpenedMenu {
         let pid = if self.owner_pids.len() == 1 {
             *self.owner_pids.iter().next().unwrap_or(&0)
         } else {
@@ -431,20 +437,35 @@ impl MenuPlacement {
                 )
             })
         };
-        let requested = open();
-        // 部分程序只消费右键鼠标通知。UIA 返回成功但没有应用菜单时再透传鼠标。
-        let observed = requested && Self::wait_for_menu(Duration::from_millis(270));
-        let sent_mouse = !observed && fallback();
-        if sent_mouse {
-            Self::wait_for_menu(Duration::from_millis(450));
-        }
+        // 先走该图标最近成功的方式。收到真实菜单窗口后立即结束等待。
+        let (first, second) = if mouse_first {
+            Self::try_routes(mouse, uia)
+        } else {
+            Self::try_routes(uia, mouse)
+        };
         for hook in hooks.into_iter().filter(|hook| !hook.is_invalid()) {
             unsafe {
                 let _ = UnhookWinEvent(hook);
             }
         }
-        PENDING_MENU.with(|slot| slot.replace(None));
-        requested || sent_mouse
+        let state = PENDING_MENU.with(|slot| slot.replace(None));
+        OpenedMenu {
+            dispatched: first || second,
+            window: state.and_then(|state| state.observed),
+            used_mouse: if second { !mouse_first } else { mouse_first },
+        }
+    }
+
+    fn try_routes(first: impl FnOnce() -> bool, second: impl FnOnce() -> bool) -> (bool, bool) {
+        let dispatched = first();
+        if dispatched && Self::wait_for_menu(Duration::from_millis(180)) {
+            return (true, false);
+        }
+        let retried = second();
+        if retried {
+            Self::wait_for_menu(Duration::from_millis(370));
+        }
+        (dispatched, retried)
     }
 
     fn wait_for_menu(timeout: Duration) -> bool {
@@ -469,7 +490,7 @@ impl MenuPlacement {
                         }
                     }
                 }
-                (placement.placed, placement.observed)
+                (placement.placed, placement.observed.is_some())
             });
             if placed || Instant::now() >= deadline {
                 return observed;
@@ -517,7 +538,7 @@ impl MenuPlacement {
         if !matches || unsafe { IsHungAppWindow(hwnd).as_bool() } {
             return false;
         }
-        self.observed = true;
+        self.observed = Some(hwnd);
         let point = menu_position(
             self.anchor,
             monitor.work,

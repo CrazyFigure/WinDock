@@ -618,7 +618,12 @@ unsafe extern "system" fn on_event(
             return;
         }
     }
-    if is_our_window(&class_name(hwnd)) {
+    let class = class_name(hwnd);
+    if is_our_window(&class)
+        || (class == "Static" && window_pid(hwnd) == std::process::id())
+        || (event != EVENT_SYSTEM_FOREGROUND && is_desktop_class(&class))
+    {
+        // 遮罩、提示和原生托盘显隐都不改变运行应用列表，避免重复刷新 Dock。
         return;
     }
     // 前台切换事件立即投递不丢帧，其余高频移动事件保留 35ms 节流

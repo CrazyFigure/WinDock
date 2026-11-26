@@ -1,17 +1,16 @@
 //! 顶部栏「展开按钮」紧凑图标收纳浮层：
-//! 展示当前打开的应用图标与托盘图标，支持 100ms 自定义 Tooltip、点击固定到顶部栏、
-//! 拖拽调整顶部栏顺序，以及右键快捷操作。关闭即释放 DIB 缓冲。
+//! 按名称展示当前应用和托盘图标，支持点击固定到顶部栏和右键快捷操作。
+//! 关闭即释放 DIB 缓冲。
 
+use std::cmp;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 
-use windows::core::w;
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Globalization::{CompareStringEx, CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN, NORM_IGNORECASE, SORT_DIGITSASNUMBERS};
 use windows::Win32::Graphics::Gdi::{AC_SRC_OVER, BLENDFUNCTION, HFONT};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE,
-};
+use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::config::Appearance;
@@ -24,14 +23,49 @@ pub const CLASS_POPOVER: &str = "WinDockFinderPopover";
 
 const COLS: usize = 6;
 const MAX_VISIBLE_ROWS: usize = 4;
-const TIMER_TIP: usize = 401;
 
-#[derive(Clone, Debug)]
-pub struct PopoverDrag {
-    pub from: usize,
-    pub x: i32,
-    pub y: i32,
-    pub over: Option<usize>,
+/// 使用 Windows 当前区域的名称顺序。同名图标用固定键打破平局，前台切换时也不会换位。
+fn sort_items(items: &mut [TrayItem]) {
+    let names: std::collections::HashMap<_, Vec<_>> = items.iter().map(|item| {
+        (item.key.clone(), item.sort_name().encode_utf16().collect())
+    }).collect();
+    items.sort_by(|a, b| {
+        let left = &names[&a.key];
+        let right = &names[&b.key];
+        let order = match unsafe { CompareStringEx(PCWSTR::null(), NORM_IGNORECASE | SORT_DIGITSASNUMBERS, left, right, None, None, LPARAM(0)) } {
+            CSTR_LESS_THAN => cmp::Ordering::Less,
+            CSTR_GREATER_THAN => cmp::Ordering::Greater,
+            CSTR_EQUAL => cmp::Ordering::Equal,
+            _ => left.cmp(right),
+        };
+        order.then_with(|| a.key.cmp(&b.key))
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(key: &str, name: &str) -> TrayItem {
+        TrayItem {
+            key: key.into(), name: name.into(), native_tip: Some("随时变化的托盘状态".into()),
+            uia_key: None, registration: None, legacy_keys: Vec::new(), overflow: false,
+            app_exe: None, app_hwnds: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn names_keep_order_across_window_and_status_changes() {
+        let mut items = [item("b", "Magpie - 2"), item("c", "App10"), item("a", "magpie - 1"), item("d", "app2")];
+        sort_items(&mut items);
+        assert_eq!(items.each_ref().map(|item| item.key.as_str()), ["d", "c", "a", "b"]);
+
+        items.reverse();
+        items[0].name = "Magpie - 3".into();
+        items[0].native_tip = Some("Magpie\n3 个请求".into());
+        sort_items(&mut items);
+        assert_eq!(items.each_ref().map(|item| item.key.as_str()), ["d", "c", "a", "b"]);
+    }
 }
 
 pub struct Popover {
@@ -39,23 +73,20 @@ pub struct Popover {
     pub target: DibTarget,
     pub scratch: DibTarget,
     pub font: HFONT,
-    pub tip_font: HFONT,
     pub dpi: u32,
     pub w: i32,
     pub h: i32,
     pub card_top: i32,
     pub scroll: usize,
     pub hover_idx: Option<usize>,
-    pub hover_since: Option<Instant>,
-    pub tip_visible: bool,
-    pub press: Option<(usize, i32, i32)>,
-    pub drag: Option<PopoverDrag>,
+    pub press: Option<usize>,
     pub visible: bool,
     pub items: Vec<TrayItem>,
     pub pinned: Vec<String>,
     pub dark: bool,
     pub accent: (f32, f32, f32),
     anchor: RECT,
+    context_key: Option<String>,
 }
 
 static REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -97,23 +128,20 @@ impl Popover {
                 target: DibTarget::default(),
                 scratch: DibTarget::default(),
                 font: make_font(dp(12, dpi), 400),
-                tip_font: make_font(dp(12, dpi), 400),
                 dpi,
                 w: 0,
                 h: 0,
                 card_top: 0,
                 scroll: 0,
                 hover_idx: None,
-                hover_since: None,
-                tip_visible: false,
                 press: None,
-                drag: None,
                 visible: false,
                 items: Vec::new(),
                 pinned: Vec::new(),
                 dark: false,
                 accent: (0.04, 0.52, 1.0),
                 anchor: RECT::default(),
+                context_key: None,
             })
         }
     }
@@ -130,11 +158,6 @@ impl Popover {
         dp(10, self.dpi)
     }
 
-    /// 图标网格上方预留少许透明区，用于显示 100ms 悬停 Tooltip，不遮挡图标本身。
-    fn tip_reserve(&self) -> i32 {
-        dp(30, self.dpi)
-    }
-
     fn total_rows(&self) -> usize {
         if self.items.is_empty() {
             1
@@ -148,15 +171,14 @@ impl Popover {
     }
 
     /// 打开浮层：锚定在顶部栏 `<` 按钮正下方、右对齐，自动避让屏幕边界。
-    pub fn open(&mut self, anchor: RECT, items: Vec<TrayItem>, pinned: Vec<String>, appearance: &Appearance) {
+    pub fn open(&mut self, anchor: RECT, mut items: Vec<TrayItem>, pinned: Vec<String>, appearance: &Appearance) {
+        sort_items(&mut items);
         self.items = items;
         self.pinned = pinned;
         self.scroll = 0;
         self.hover_idx = None;
-        self.hover_since = None;
-        self.tip_visible = false;
         self.press = None;
-        self.drag = None;
+        self.context_key = None;
         self.dark = appearance.is_dark();
         self.accent = accent_from_config(appearance);
         self.anchor = anchor;
@@ -172,23 +194,13 @@ impl Popover {
 
     /// 注册项后续增减时同步格子与窗口范围，避免留下旧的鼠标命中位置。
     pub fn update_items(&mut self, mut items: Vec<TrayItem>) {
-        // 前台切换会改变运行窗口枚举顺序，已打开的收纳格保持原相对位置。
-        items.sort_by_key(|item| self.items.iter().position(|old| old.key == item.key).unwrap_or(usize::MAX));
+        sort_items(&mut items);
         let layout_changed = !self.items.iter().map(|item| &item.key).eq(items.iter().map(|item| &item.key));
         self.items = items;
         if layout_changed {
             self.scroll = self.scroll.min(self.scroll_max());
             self.hover_idx = None;
-            self.hover_since = None;
-            self.tip_visible = false;
             self.press = None;
-            self.drag = None;
-            unsafe {
-                let _ = KillTimer(self.hwnd, TIMER_TIP);
-                if windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() == self.hwnd {
-                    let _ = ReleaseCapture();
-                }
-            }
             self.resize_to_items();
         }
         self.render();
@@ -207,11 +219,11 @@ impl Popover {
         let gap = self.cell_gap();
         let card_w = pad * 2 + cols as i32 * cell + (cols as i32 - 1).max(0) * gap;
         let card_h = pad * 2 + rows as i32 * cell + (rows as i32 - 1).max(0) * gap;
-        let tip_res = self.tip_reserve();
+
 
         self.w = card_w.max(dp(190, self.dpi));
         self.card_top = 0;
-        self.h = card_h + tip_res;
+        self.h = card_h;
 
         let mut left = anchor.right - self.w;
         let mut top = anchor.bottom + dp(4, self.dpi);
@@ -230,20 +242,18 @@ impl Popover {
         }
     }
 
+    /// 右键菜单接管焦点后继续高亮来源图标。
+    pub fn set_context_key(&mut self, key: Option<String>) {
+        self.context_key = key;
+        self.render();
+    }
+
     pub fn close(&mut self) {
-        unsafe {
-            let _ = KillTimer(self.hwnd, TIMER_TIP);
-            if windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() == self.hwnd {
-                let _ = ReleaseCapture();
-            }
-        }
         if self.visible {
             self.visible = false;
             self.hover_idx = None;
-            self.hover_since = None;
-            self.tip_visible = false;
             self.press = None;
-            self.drag = None;
+            self.context_key = None;
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }
@@ -257,10 +267,8 @@ impl Popover {
         unsafe {
             let _ = SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
             let _ = DestroyWindow(self.hwnd);
-            for f in [self.font, self.tip_font] {
-                if !f.is_invalid() {
-                    let _ = windows::Win32::Graphics::Gdi::DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(f.0));
-                }
+            if !self.font.is_invalid() {
+                let _ = windows::Win32::Graphics::Gdi::DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(self.font.0));
             }
         }
     }
@@ -270,7 +278,7 @@ impl Popover {
             left: 0,
             top: self.card_top,
             right: self.w,
-            bottom: self.h - self.tip_reserve(),
+            bottom: self.h,
         }
     }
 
@@ -309,75 +317,28 @@ impl Popover {
         None
     }
 
+    /// 按住移出原图标格时取消点击，防止跨格移动改变固定状态。
     pub fn on_mouse_move(&mut self, x: i32, y: i32) {
-        if let Some((pi, px, py)) = self.press {
-            if self.drag.is_none() {
-                let dist = (((x - px).pow(2) + (y - py).pow(2)) as f32).sqrt();
-                if dist >= 5.0 * (self.dpi as f32 / 96.0) {
-                    self.drag = Some(PopoverDrag {
-                        from: pi,
-                        x,
-                        y,
-                        over: self.index_at(x, y),
-                    });
-                    self.tip_visible = false;
-                    unsafe {
-                        let _ = KillTimer(self.hwnd, TIMER_TIP);
-                        let _ = SetCapture(self.hwnd);
-                    }
-                }
-            }
-        }
-        if self.drag.is_some() {
-            let over = self.index_at(x, y);
-            if let Some(d) = self.drag.as_mut() {
-                d.x = x;
-                d.y = y;
-                d.over = over;
-            }
-            self.render();
-            return;
-        }
         let hit = self.index_at(x, y);
-        if hit != self.hover_idx {
+        let canceled = self.press.is_some() && self.press != hit;
+        if canceled {
+            self.press = None;
+        }
+        if canceled || hit != self.hover_idx {
             self.hover_idx = hit;
-            self.tip_visible = false;
-            unsafe {
-                let _ = KillTimer(self.hwnd, TIMER_TIP);
-                if hit.is_some() {
-                    self.hover_since = Some(Instant::now());
-                    let _ = SetTimer(self.hwnd, TIMER_TIP, 100, None);
-                } else {
-                    self.hover_since = None;
-                }
-            }
             self.render();
         }
     }
 
     pub fn on_mouse_leave(&mut self) {
-        if self.drag.is_none() {
-            self.hover_idx = None;
-            self.hover_since = None;
-            self.tip_visible = false;
-            unsafe {
-                let _ = KillTimer(self.hwnd, TIMER_TIP);
-            }
+        let was_hovering = self.hover_idx.take().is_some();
+        let was_pressed = self.press.take().is_some();
+        if was_hovering || was_pressed {
             self.render();
         }
     }
 
-    pub fn on_tip_timer(&mut self) {
-        unsafe {
-            let _ = KillTimer(self.hwnd, TIMER_TIP);
-        }
-        if self.hover_idx.is_some() && self.drag.is_none() && !self.tip_visible {
-            self.tip_visible = true;
-            self.render();
-        }
-    }
-
-    /// 渲染紧凑图标网格、固定圆点、拖拽指示与底部 100ms Tooltip 气泡。
+    /// 渲染紧凑图标网格、固定圆点以及悬停和按下反馈。
     pub fn render(&mut self) {
         if !self.visible || self.w <= 0 || self.h <= 0 {
             return;
@@ -413,23 +374,21 @@ impl Popover {
             let tray_icons = crate::app::tray_icon_cache();
 
             for idx in start..end {
-                if self.drag.as_ref().is_some_and(|d| d.from == idx) {
-                    continue;
-                }
                 let Some(r) = self.cell_rect(idx) else { continue };
                 let item = &self.items[idx];
                 let is_pinned = self.pinned.iter().any(|k| k == &item.key);
                 let is_hover = self.hover_idx == Some(idx);
-                let is_press = self.press.is_some_and(|(pi, _, _)| pi == idx) && self.drag.is_none();
+                let is_press = self.press == Some(idx);
+                let is_context = self.context_key.as_deref() == Some(item.key.as_str());
 
-                if is_press {
+                if is_press || is_context {
                     sf.fill_rrect(&r, 9.0 * s, press_bg);
                 } else if is_hover {
                     sf.fill_rrect(&r, 9.0 * s, hover_bg);
                 } else if is_pinned {
                     sf.fill_rrect(&r, 9.0 * s, accent_bg);
                 }
-                if is_pinned {
+                if is_pinned || is_context {
                     sf.stroke_rrect(&r, 9.0 * s, 1.0, accent_bd);
                 }
 
@@ -445,82 +404,9 @@ impl Popover {
                     sf.fill_circle(dx, dy, 2.8 * s, (self.accent.0, self.accent.1, self.accent.2, 0.98));
                 }
 
-                // 拖拽目标插入线
-                if let Some(d) = &self.drag {
-                    if d.over == Some(idx) && d.from != idx {
-                        let line_x = if d.x < cx as i32 { r.left - 1 } else { r.right - 1 };
-                        sf.fill_rrect(
-                            &RECT {
-                                left: line_x - 1,
-                                top: r.top + dp(5, self.dpi),
-                                right: line_x + 2,
-                                bottom: r.bottom - dp(5, self.dpi),
-                            },
-                            1.5 * s,
-                            (self.accent.0, self.accent.1, self.accent.2, 0.98),
-                        );
-                    }
-                }
-            }
-
-            // 拖拽跟随幽灵图标
-            if let Some(d) = &self.drag {
-                if let Some(item) = self.items.get(d.from) {
-                    draw_shelf_item_icon(
-                        &mut sf,
-                        &mut self.scratch,
-                        self.font,
-                        item,
-                        &app_icons,
-                        &tray_icons,
-                        d.x as f32,
-                        d.y as f32,
-                        24.0 * s,
-                        self.dark,
-                        s,
-                    );
-                }
             }
         }
 
-        // 100ms 自定义 Tooltip（绘制在底部预留透明区中，带指向角标）
-        if self.tip_visible && self.drag.is_none() {
-            if let Some(idx) = self.hover_idx {
-                if let (Some(item), Some(anchor)) = (self.items.get(idx), self.cell_rect(idx)) {
-                    let is_pinned = self.pinned.iter().any(|k| k == &item.key);
-                    let short_name: String = item.name.chars().take(24).collect();
-                    let tip_text = if is_pinned {
-                        format!("{short_name} · 已固定")
-                    } else {
-                        format!("{short_name} · 点击固定")
-                    };
-                    let (tw, th) = measure_text(dc, &tip_text, self.tip_font);
-                    let pad_x = dp(9, self.dpi);
-                    let pad_y = dp(4, self.dpi);
-                    let bw = (tw + pad_x * 2).min(w - 8);
-                    let bh = th + pad_y * 2;
-                    let cx = (anchor.left + anchor.right) / 2;
-                    let left = (cx - bw / 2).clamp(4, (w - bw - 4).max(4));
-                    let top = (card.bottom + dp(4, self.dpi)).min(h - bh - 2);
-                    let box_r = RECT {
-                        left,
-                        top,
-                        right: left + bw,
-                        bottom: top + bh,
-                    };
-                    let tip_bg = rgb(0x181C24, 0.95);
-                    sf.fill_rrect(&box_r, 6.0 * s, tip_bg);
-                    sf.stroke_rrect(&box_r, 6.0 * s, 1.0, (1.0, 1.0, 1.0, 0.16));
-                    let trc = RECT {
-                        left: box_r.left + pad_x,
-                        top: box_r.top,
-                        right: box_r.right - pad_x,
-                        bottom: box_r.bottom,
-                    };
-                    draw_transparent_text_aligned(&mut sf, &mut self.scratch, &tip_text, self.tip_font, &trc, rgb(0xF8FAFC, 0.98), TextAlign::Center, false, s);
-                }
-            }
-        }
         let _ = fg;
 
         drop(sf);
@@ -558,7 +444,7 @@ pub fn draw_shelf_item_icon(
     if let Some(px) = item
         .uia_key
         .as_deref()
-        .and_then(|k| tray_icons.get(k))
+        .and_then(|k| tray_icons.displayed_icon(k))
         .or_else(|| tray_icons.get(&format!("win:{}", item.key)))
         .or_else(|| tray_icons.get(&item.key))
     {
@@ -590,12 +476,6 @@ pub fn draw_shelf_item_icon(
 
 unsafe extern "system" fn popover_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
-        WM_TIMER => {
-            if wparam.0 == TIMER_TIP {
-                crate::app::with_app(hwnd, |app| app.popover_tip_timer(hwnd));
-                return LRESULT(0);
-            }
-        }
         WM_MOUSEMOVE => {
             let x = get_x_lparam(lparam.0);
             let y = get_y_lparam(lparam.0);
@@ -644,12 +524,9 @@ unsafe extern "system" fn popover_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         }
         WM_ACTIVATE => {
             if (wparam.0 & 0xFFFF) == 0 {
-                crate::app::with_app(hwnd, |app| app.close_popover());
+                crate::app::with_app(hwnd, |app| app.popover_deactivated(hwnd, HWND(lparam.0 as *mut _)));
             }
             return LRESULT(0);
-        }
-        WM_CAPTURECHANGED => {
-            crate::app::with_app(hwnd, |app| app.popover_capture_lost(hwnd));
         }
         _ => {}
     }
