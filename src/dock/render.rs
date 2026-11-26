@@ -1,7 +1,6 @@
 //! Dock 渲染：图标绘制、阴影、运行点、分隔线、回收站、100ms Tooltip、拖拽幽灵。
 //!
-//! 所有内容绘制到 32bpp 预乘 Alpha DIB，再 `UpdateLayeredWindow` 到图标交互窗；
-//! 毛玻璃由独立底层窗口提供（或轻量模式下由本层自绘半透明胶囊）。
+//! 所有内容绘制到 32bpp 预乘 Alpha DIB，再 `UpdateLayeredWindow` 到纯净 macOS 分层交互窗。
 
 use std::sync::Arc;
 
@@ -25,7 +24,6 @@ pub struct RenderCtx<'a> {
     pub worker: &'a Arc<IconWorker>,
     pub text_scratch: &'a mut DibTarget,
     pub tooltip_font: HFONT,
-    pub light_backdrop: bool,
     pub trash_full: bool,
     pub suppress_tooltip: bool,
 }
@@ -174,11 +172,8 @@ pub fn render(dock: &mut Dock, ctx: &mut RenderCtx) {
         };
         sf.fill_rrect(&sh, rad + ex as f32 * 0.4, (0.0, 0.0, 0.0, sa_base * alpha));
     }
-    let op = if ctx.light_backdrop {
-        ctx.appearance.opacity.clamp(0.35, 0.95) * alpha
-    } else {
-        (ctx.appearance.opacity * 0.52).clamp(0.20, 0.65) * alpha
-    };
+    // 纯净 macOS 托盘不透明度
+    let op = ctx.appearance.opacity.clamp(0.35, 0.95) * alpha;
     let (top_tint, bot_tint) = if dark {
         // 深色 macOS Dock：纯净曜石深灰，不浑浊不发泥
         ((0.18, 0.19, 0.22, (op * 0.96).min(0.92)), (0.12, 0.13, 0.16, (op * 1.04).min(0.94)))
@@ -352,11 +347,8 @@ pub fn render(dock: &mut Dock, ctx: &mut RenderCtx) {
             let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(dock.hwnd_overlay, windows::Win32::UI::WindowsAndMessaging::SW_SHOWNA);
         }
         dock.window_visible = true;
-        dock.backdrop_synced = None;
     }
     dock.dirty = false;
-    // 底层毛玻璃窗口跟随胶囊（仅尺寸/位置变化超过 1px 时更新）
-    dock.sync_backdrop(&cap_f);
 }
 
 /// 将 DIB 内容 Blit 到普通窗口 DC（设置页/浮层等非分层窗口使用）。

@@ -188,20 +188,14 @@ impl TopBar {
     fn setup_dwm(&mut self, appearance: &Appearance) {
         use windows::Win32::Graphics::Dwm::*;
         unsafe {
-            let margins = windows::Win32::UI::Controls::MARGINS {
-                cxLeftWidth: -1,
-                cxRightWidth: -1,
-                cyTopHeight: -1,
-                cyBottomHeight: -1,
-            };
-            let _ = DwmExtendFrameIntoClientArea(self.hwnd, &margins);
             let dark: u32 = if appearance.is_dark() { 1 } else { 0 };
             let _ = DwmSetWindowAttribute(self.hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const u32 as *const _, 4);
-            let bt = if appearance.backdrop == "acrylic" { DWMSBT_TRANSIENTWINDOW.0 } else { DWMSBT_NONE.0 };
+            let bt = DWMSBT_NONE.0;
             let _ = DwmSetWindowAttribute(self.hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &bt as *const i32 as *const _, 4);
             let pref = DWMWCP_DONOTROUND.0 as u32;
             let _ = DwmSetWindowAttribute(self.hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &pref as *const u32 as *const _, 4);
-            let border: u32 = 0x20000000;
+            // 关闭系统默认窗口边框色，避免无边框顶部栏出现杂色细框
+            let border: u32 = DWMWA_COLOR_NONE;
             let _ = DwmSetWindowAttribute(self.hwnd, DWMWA_BORDER_COLOR, &border as *const u32 as *const _, 4);
         }
     }

@@ -203,8 +203,6 @@ impl TopbarCfg {
 pub struct Appearance {
     /// system | light | dark
     pub theme: String,
-    /// acrylic | light
-    pub backdrop: String,
     pub opacity: f32,
     pub dock_corner_radius_dp: i32,
     /// macos | none
@@ -218,8 +216,6 @@ impl Default for Appearance {
     fn default() -> Self {
         Self {
             theme: "system".into(),
-            // 默认使用纯净 macOS 磨砂托盘（不依赖浑浊发灰的 Win11 Acrylic，用户仍可在外观设置切换）
-            backdrop: "light".into(),
             opacity: 0.78,
             dock_corner_radius_dp: 15,
             icon_roundness: "macos".into(),
@@ -233,9 +229,6 @@ impl Appearance {
     pub fn normalized(mut self) -> Self {
         if !matches!(self.theme.as_str(), "system" | "light" | "dark") {
             self.theme = "system".into();
-        }
-        if !matches!(self.backdrop.as_str(), "acrylic" | "light") {
-            self.backdrop = "acrylic".into();
         }
         if !self.opacity.is_finite() {
             self.opacity = 0.78;

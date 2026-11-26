@@ -4,7 +4,6 @@
 //! 绝不每帧截屏。采样区域避开顶部栏下沿 2..8px、右侧标题栏按钮区与左侧菜单图标区。
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 use windows::Win32::Foundation::{COLORREF, HWND, RECT};
 use windows::Win32::Graphics::Dwm::{
@@ -16,8 +15,6 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, PW_RENDERFULLCONTENT};
-
-use crate::win32::MonitorInfo;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rgb {
@@ -239,84 +236,7 @@ pub fn caption_color(hwnd: HWND, mon: Option<RECT>, topbar_h: i32) -> Rgb {
         .unwrap_or(Rgb::new(0xF3, 0xF3, 0xF3))
 }
 
-// ---------- 壁纸顶部亮度采样 ----------
-
-static WALLPAPER_LUMA: std::sync::OnceLock<Mutex<HashMap<isize, f32>>> = std::sync::OnceLock::new();
-
-fn wallpaper_luma_map() -> &'static Mutex<HashMap<isize, f32>> {
-    WALLPAPER_LUMA.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// 屏幕顶部条带亮度（仅在顶部栏尚未显示时调用，避免采到自身）。
-pub fn sample_screen_luma(rect: RECT) -> Option<f32> {
-    let w = rect.right - rect.left;
-    let h = (rect.bottom - rect.top).clamp(1, 64);
-    if w <= 0 {
-        return None;
-    }
-    unsafe {
-        let screen = GetDC(None);
-        if screen.is_invalid() {
-            return None;
-        }
-        let (hdc, bmp, old, ptr) = dib_section(w, h)?;
-        let ok = BitBlt(hdc, 0, 0, w, h, screen, rect.left, rect.top, SRCCOPY).is_ok();
-        ReleaseDC(None, screen);
-        // 必须先刷新 GDI 并读取完 DIB 像素，再释放 bmp，避免 Use-After-Free 崩溃
-        let _ = GdiFlush();
-        let result = if ok {
-            let slice = std::slice::from_raw_parts(ptr as *const u32, (w * h) as usize);
-            let mut sum = 0f32;
-            let mut n = 0usize;
-            let step = (w / 96).max(1) as usize;
-            for y in 0..h as usize {
-                for x in (0..w as usize).step_by(step) {
-                    let p = slice[y * w as usize + x];
-                    let lum = Rgb::new(((p >> 16) & 0xFF) as u8, ((p >> 8) & 0xFF) as u8, (p & 0xFF) as u8).luminance();
-                    sum += lum;
-                    n += 1;
-                }
-            }
-            if n == 0 { None } else { Some(sum / n as f32) }
-        } else {
-            None
-        };
-        let _ = SelectObject(hdc, old);
-        let _ = DeleteObject(HGDIOBJ(bmp.0));
-        let _ = DeleteDC(hdc);
-        result
-    }
-}
-
-pub fn remember_wallpaper_luma(hmon: isize, luma: f32) {
-    wallpaper_luma_map().lock().unwrap_or_else(|e| e.into_inner()).insert(hmon, luma);
-}
-
-pub fn wallpaper_luma(hmon: isize) -> Option<f32> {
-    wallpaper_luma_map().lock().unwrap_or_else(|e| e.into_inner()).get(&hmon).copied()
-}
-
-/// 为一组显示器采样壁纸顶部亮度（在顶部栏显示之前调用）。
-pub fn capture_wallpaper_lumas(monitors: &[MonitorInfo]) {
-    for m in monitors {
-        let strip = RECT {
-            left: m.rect.left,
-            top: m.rect.top + 2,
-            right: m.rect.right,
-            bottom: m.rect.top + 14,
-        };
-        if let Some(l) = sample_screen_luma(strip) {
-            remember_wallpaper_luma(m.hmonitor.0 as isize, l);
-        }
-    }
-}
-
-pub fn sample_wallpaper_luma() -> Option<f32> {
-    let m = crate::win32::primary_monitor()?;
-    wallpaper_luma(m.hmonitor.0 as isize)
-}
-
-/// 采样结果是否可信（不是采到了顶部栏自身）：顶部栏显示期间不做采样。
+/// 判断应用是否位于最大化自动取色排除名单中。
 pub fn is_excluded(exe: &str, exclude: &[String]) -> bool {
     let lower = exe.to_lowercase();
     exclude.iter().any(|e| {

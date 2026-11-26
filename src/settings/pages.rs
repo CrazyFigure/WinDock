@@ -95,7 +95,6 @@ pub fn rows(page: Page) -> Vec<Row> {
         ],
         Page::Appearance => vec![
             Row::Choice(Field::Theme),
-            Row::Choice(Field::Backdrop),
             Row::Choice(Field::Opacity),
             Row::Section("Dock 胶囊"),
             Row::Choice(Field::DockRadius),

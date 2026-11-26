@@ -1,4 +1,4 @@
-//! Dock 窗口管理：双层（DWM 毛玻璃底层 + 分层图标交互层）+ 底部边缘触发窗、
+//! Dock 窗口管理：纯净 macOS 分层图标交互窗 + 底部边缘触发窗、
 //! 智能避让、波浪放大动画、拖放排序/取消固定/外部拖入、OLE 回收站拖放。
 
 pub mod icons;
@@ -11,19 +11,10 @@ use std::time::Instant;
 use windows::core::{implement, Result};
 
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
-use windows::Win32::Graphics::Dwm::{
-    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_BORDER_COLOR,
-    DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
-    DWMSBT_NONE, DWMSBT_TRANSIENTWINDOW, DWMWCP_ROUND,
-};
-use windows::Win32::Graphics::Gdi::{
-    CreateRoundRectRgn, GetStockObject, SetWindowRgn, BLACK_BRUSH, HBRUSH, HFONT, HGDIOBJ,
-    AC_SRC_OVER, BLENDFUNCTION, HDC,
-};
+use windows::Win32::Graphics::Gdi::{HBRUSH, HFONT, HGDIOBJ, AC_SRC_OVER, BLENDFUNCTION, HDC};
 use windows::Win32::System::Com::{IDataObject, FORMATETC, TYMED_HGLOBAL, DVASPECT_CONTENT};
 use windows::Win32::System::Ole::{RegisterDragDrop, IDropTarget, IDropTarget_Impl, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE, CF_HDROP};
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
-use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -35,7 +26,6 @@ use crate::ui::{make_font, DibTarget};
 use crate::win32::{dp, MonitorInfo};
 
 pub const CLASS_OVERLAY: &str = "WinDockFinderDockOverlay";
-pub const CLASS_BACKDROP: &str = "WinDockFinderDockBackdrop";
 pub const CLASS_TRIGGER: &str = "WinDockFinderDockTrigger";
 pub const WM_APP_FRAME: u32 = WM_APP + 10;
 
@@ -49,7 +39,6 @@ pub struct DragState {
 
 pub struct Dock {
     pub hwnd_overlay: HWND,
-    pub hwnd_backdrop: HWND,
     pub hwnd_trigger: HWND,
     pub monitor: MonitorInfo,
     pub dpi: u32,
@@ -64,9 +53,6 @@ pub struct Dock {
     pub base_centers: Vec<f32>,
     pub win_rect: RECT,
     pub win_size: (i32, i32),
-    backdrop_synced: Option<RECT>,
-    pub backdrop_visible: bool,
-    pub light_backdrop: bool,
     pub window_visible: bool,
     pub trigger_visible: bool,
     pub dirty: bool,
@@ -101,7 +87,6 @@ fn register_classes(hinst: windows::Win32::Foundation::HINSTANCE) {
         return;
     }
     unsafe {
-        let brush: HBRUSH = std::mem::transmute(GetStockObject(BLACK_BRUSH));
         let hCursor = LoadCursorW(HINSTANCE::default(), IDC_ARROW).unwrap_or_default();
         let overlay = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -114,16 +99,6 @@ fn register_classes(hinst: windows::Win32::Foundation::HINSTANCE) {
             ..Default::default()
         };
         let _ = RegisterClassExW(&overlay);
-        let backdrop = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(backdrop_proc),
-            hInstance: hinst,
-            hCursor,
-            hbrBackground: brush,
-            lpszClassName: crate::win32::wide_static(CLASS_BACKDROP),
-            ..Default::default()
-        };
-        let _ = RegisterClassExW(&backdrop);
         let trigger = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(trigger_proc),
@@ -147,21 +122,6 @@ impl Dock {
         register_classes(hinst);
         unsafe {
             let ex_common = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST;
-            let backdrop = CreateWindowExW(
-                ex_common,
-                crate::win32::wide_static(CLASS_BACKDROP),
-                windows::core::w!(""),
-                WS_POPUP,
-                0,
-                0,
-                10,
-                10,
-                HWND::default(),
-                HMENU::default(),
-                hinst,
-                Some(app_ptr as *const _),
-            )
-            .map_err(crate::win32::error_string)?;
             let overlay = CreateWindowExW(
                 ex_common | WS_EX_LAYERED,
                 crate::win32::wide_static(CLASS_OVERLAY),
@@ -194,7 +154,6 @@ impl Dock {
             .map_err(crate::win32::error_string)?;
             let mut dock = Dock {
                 hwnd_overlay: overlay,
-                hwnd_backdrop: backdrop,
                 hwnd_trigger: trigger,
                 dpi: monitor.dpi,
                 monitor,
@@ -209,9 +168,6 @@ impl Dock {
                 base_centers: Vec::new(),
                 win_rect: RECT::default(),
                 win_size: (0, 0),
-                backdrop_synced: None,
-                backdrop_visible: false,
-                light_backdrop: false,
                 window_visible: false,
                 trigger_visible: false,
                 dirty: true,
@@ -236,50 +192,15 @@ impl Dock {
                 magnify_range: 2.5,
                 hide_mode: String::new(),
             };
-            dock.setup_backdrop(appearance);
             let _ = SetWindowLongPtrW(overlay, GWLP_USERDATA, app_ptr as isize);
-            let _ = SetWindowLongPtrW(backdrop, GWLP_USERDATA, app_ptr as isize);
             let _ = SetWindowLongPtrW(trigger, GWLP_USERDATA, app_ptr as isize);
             dock.relayout(cfg, appearance);
             Ok(dock)
         }
     }
 
-    /// 底层窗口启用 Win11 原生毛玻璃（失败则回退轻量自绘模式）。
-    fn setup_backdrop(&mut self, appearance: &Appearance) {
-        self.light_backdrop = appearance.backdrop != "acrylic";
-        unsafe {
-            let margins = MARGINS {
-                cxLeftWidth: -1,
-                cxRightWidth: -1,
-                cyTopHeight: -1,
-                cyBottomHeight: -1,
-            };
-            let _ = DwmExtendFrameIntoClientArea(self.hwnd_backdrop, &margins);
-            let dark: u32 = if appearance.is_dark() { 1 } else { 0 };
-            let _ = DwmSetWindowAttribute(self.hwnd_backdrop, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const u32 as *const _, 4);
-            let pref = DWMWCP_ROUND.0 as u32;
-            let _ = DwmSetWindowAttribute(self.hwnd_backdrop, DWMWA_WINDOW_CORNER_PREFERENCE, &pref as *const u32 as *const _, 4);
-            let border: u32 = 0x28FFFFFF;
-            let _ = DwmSetWindowAttribute(self.hwnd_backdrop, DWMWA_BORDER_COLOR, &border as *const u32 as *const _, 4);
-            if !self.light_backdrop {
-                let bt = DWMSBT_TRANSIENTWINDOW.0 as i32;
-                if DwmSetWindowAttribute(self.hwnd_backdrop, DWMWA_SYSTEMBACKDROP_TYPE, &bt as *const i32 as *const _, 4).is_err() {
-                    self.light_backdrop = true;
-                } else {
-                    // 再次读取确认系统接受了 Acrylic（旧系统会静默忽略）
-                    let mut got = DWMSBT_NONE.0 as i32;
-                    if DwmGetWindowAttributeSafe(self.hwnd_backdrop, &mut got).is_err() || got != bt {
-                        self.light_backdrop = true;
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn apply_appearance(&mut self, appearance: &Appearance) {
-        self.setup_backdrop(appearance);
-        self.backdrop_synced = None;
+    pub fn apply_appearance(&mut self, _appearance: &Appearance) {
+        self.dirty = true;
     }
 
     // ---------- 尺寸工具 ----------
@@ -438,7 +359,6 @@ impl Dock {
                 SWP_NOACTIVATE | SWP_NOSENDCHANGING,
             );
         }
-        self.backdrop_synced = None;
         self.dirty = true;
         if !self.target.ensure_at_least(w, h) {
             crate::log::log("Dock DIB 分配失败");
@@ -544,12 +464,6 @@ impl Dock {
                 }
                 self.window_visible = false;
             }
-            if self.backdrop_visible {
-                unsafe {
-                    let _ = ShowWindow(self.hwnd_backdrop, SW_HIDE);
-                }
-                self.backdrop_visible = false;
-            }
             return false;
         }
         // 放大弹簧
@@ -624,74 +538,6 @@ impl Dock {
             || (self.hover.is_some() && !self.tooltip_visible)
     }
 
-    pub fn sync_backdrop(&mut self, cap: &RECT) {
-        // 轻量自绘模式或主图层不可见时隐藏毛玻璃底层窗口
-        if self.light_backdrop || !self.window_visible {
-            if self.backdrop_visible {
-                unsafe {
-                    let _ = ShowWindow(self.hwnd_backdrop, SW_HIDE);
-                }
-                self.backdrop_visible = false;
-            }
-            return;
-        }
-        let screen = RECT {
-            left: self.win_rect.left + cap.left,
-            top: self.win_rect.top + cap.top,
-            right: self.win_rect.left + cap.right,
-            bottom: self.win_rect.top + cap.bottom,
-        };
-        let moved = match self.backdrop_synced {
-            Some(p) => (p.left - screen.left).abs() > 1
-                || (p.top - screen.top).abs() > 1
-                || (p.right - screen.right).abs() > 1
-                || (p.bottom - screen.bottom).abs() > 1,
-            None => true,
-        };
-        if !moved && self.backdrop_visible {
-            return;
-        }
-        self.backdrop_synced = Some(screen);
-        unsafe {
-            let bw = (screen.right - screen.left).max(1);
-            let bh = (screen.bottom - screen.top).max(1);
-            // 将底层 DWM Acrylic 窗口裁切为与 macOS 胶囊一致的大圆角，内缩 1px 消除系统硬边框露边
-            let diam = (self.corner_radius() * 2.0).round() as i32;
-            let rgn = CreateRoundRectRgn(1, 1, bw, bh, diam, diam);
-            if !rgn.is_invalid() {
-                let _ = SetWindowRgn(self.hwnd_backdrop, rgn, true);
-            }
-            let _ = SetWindowPos(
-                self.hwnd_backdrop,
-                self.hwnd_overlay,
-                screen.left,
-                screen.top,
-                bw,
-                bh,
-                SWP_NOACTIVATE | SWP_NOSENDCHANGING,
-            );
-            if !self.backdrop_visible {
-                let _ = ShowWindow(self.hwnd_backdrop, SW_SHOWNA);
-                self.backdrop_visible = true;
-            }
-        }
-    }
-
-    pub fn show_backdrop(&mut self) {
-        unsafe {
-            let _ = ShowWindow(self.hwnd_backdrop, SW_SHOWNA);
-            let _ = SetWindowPos(
-                self.hwnd_backdrop,
-                self.hwnd_overlay,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOSENDCHANGING,
-            );
-        }
-    }
-
     // ---------- 命中 ----------
 
     pub fn hit(&self, x: f32, y: f32) -> Option<usize> {
@@ -720,7 +566,6 @@ impl Dock {
         unsafe {
             let _ = windows::Win32::System::Ole::RevokeDragDrop(self.hwnd_overlay);
             let _ = DestroyWindow(self.hwnd_overlay);
-            let _ = DestroyWindow(self.hwnd_backdrop);
             let _ = DestroyWindow(self.hwnd_trigger);
             if !self.tooltip_font.is_invalid() {
                 let _ = windows::Win32::Graphics::Gdi::DeleteObject(HGDIOBJ(self.tooltip_font.0));
@@ -730,17 +575,6 @@ impl Dock {
         self.text_scratch.release();
         self.trigger_target.release();
     }
-}
-
-// ---------- DWM 辅助 ----------
-
-unsafe fn DwmGetWindowAttributeSafe(hwnd: HWND, out: &mut i32) -> Result<()> {
-    windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
-        hwnd,
-        DWMWA_SYSTEMBACKDROP_TYPE,
-        out as *mut i32 as *mut _,
-        4,
-    )
 }
 
 // ---------- OLE IDropTarget ----------
@@ -818,25 +652,6 @@ impl IDropTarget_Impl for DropTarget_Impl {
 }
 
 // ---------- 窗口过程 ----------
-
-unsafe extern "system" fn backdrop_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    match msg {
-        WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
-        WM_ERASEBKGND => {
-            // 全黑 = 透出 DWM 系统毛玻璃
-            let hdc = HDC(wparam.0 as *mut _);
-            let mut rc = RECT::default();
-            let _ = GetClientRect(hwnd, &mut rc);
-            let brush = GetStockObject(BLACK_BRUSH);
-            let old = windows::Win32::Graphics::Gdi::SelectObject(hdc, brush);
-            let _ = windows::Win32::Graphics::Gdi::PatBlt(hdc, 0, 0, rc.right, rc.bottom, windows::Win32::Graphics::Gdi::PATCOPY);
-            let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc, old);
-            return LRESULT(1);
-        }
-        _ => {}
-    }
-    DefWindowProcW(hwnd, msg, wparam, lparam)
-}
 
 unsafe extern "system" fn trigger_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {

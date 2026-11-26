@@ -385,11 +385,3 @@ pub fn system_uses_dark_theme() -> bool {
     };
     r.is_ok() && data == 0
 }
-
-/// 桌面壁纸亮度（取顶部采样点近似值：读取壁纸文件并粗采样），失败时回退浅色。
-pub fn wallpaper_is_dark() -> bool {
-    match crate::topbar::color_sync::sample_wallpaper_luma() {
-        Some(l) => l < 0.5,
-        None => system_uses_dark_theme(),
-    }
-}

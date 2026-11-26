@@ -48,18 +48,10 @@ pub fn paint(hwnd: HWND, bar: &mut TopBar, _cfg: &TopbarCfg, appearance: &Appear
             &RECT { left: 0, top: 0, right: w, bottom: h },
             (c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0, 1.0),
         );
-    } else if appearance.backdrop != "acrylic" {
-        let a = appearance.opacity;
-        let (r, g, b, _) = appearance.dock_tint();
-        sf.fill_rect(&RECT { left: 0, top: 0, right: w, bottom: h }, (r, g, b, a));
     } else {
-        // DWM Acrylic 毛玻璃之上叠加一层柔和玻璃调色罩，避免暗壁纸发死黑、亮壁纸对比度不足
-        let glass_tint = if bar.dark_text {
-            (1.0, 1.0, 1.0, 0.38)
-        } else {
-            (0.08, 0.09, 0.11, 0.36)
-        };
-        sf.fill_rect(&RECT { left: 0, top: 0, right: w, bottom: h }, glass_tint);
+        // 纯净 macOS 材质：固定纯色底，避免透出壁纸造成左右颜色不统一
+        let (r, g, b, _) = appearance.dock_tint();
+        sf.fill_rect(&RECT { left: 0, top: 0, right: w, bottom: h }, (r, g, b, 1.0));
     }
 
     // 激活态高亮（面板/浮层展开时的常驻胶囊底色）

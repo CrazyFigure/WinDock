@@ -654,7 +654,6 @@ impl App {
         for dock in &mut self.docks {
             Self::silence(dock.hwnd_overlay);
             Self::silence(dock.hwnd_trigger);
-            Self::silence(dock.hwnd_backdrop);
             dock.destroy();
         }
         self.docks.clear();
@@ -727,30 +726,19 @@ impl App {
         for dock in &mut self.docks {
             Self::silence(dock.hwnd_overlay);
             Self::silence(dock.hwnd_trigger);
-            Self::silence(dock.hwnd_backdrop);
             dock.destroy();
         }
         self.docks.clear();
 
         if self.config.topbar.enabled {
             let mons = self.topbar_monitors();
-            if self.config.appearance.backdrop == "acrylic" {
-                // 顶部栏显示前采样壁纸顶部亮度，避免采到自身
-                color_sync::capture_wallpaper_lumas(&mons);
-            }
             let label = self.active_app_label();
             let pure_dark_text = !self.config.appearance.is_dark();
             for m in mons {
                 if let Ok(mut bar) = TopBar::new(app_ptr(), m, &self.config.topbar, &self.config.appearance) {
                     bar.pinned = self.config.topbar.pinned_tray_keys.clone();
                     bar.active_app = label.clone();
-                    bar.dark_text = if self.config.appearance.backdrop != "acrylic" {
-                        pure_dark_text
-                    } else {
-                        color_sync::wallpaper_luma(m.hmonitor.0 as isize)
-                            .map(|l| l > 0.45)
-                            .unwrap_or(pure_dark_text)
-                    };
+                    bar.dark_text = pure_dark_text;
                     bar.wanted_visible = self.topbar_visible;
                     bar.layout(&self.config.topbar);
                     if self.topbar_visible {
@@ -871,7 +859,6 @@ impl App {
         let fullscreen = self.snap.fullscreen;
         let cfg = &self.config.topbar;
         let pure_dark_text = !self.config.appearance.is_dark();
-        let is_acrylic = self.config.appearance.backdrop == "acrylic";
         for bar in &mut self.topbars {
             bar.active_app = label.clone();
             bar.status.ime = if cfg.has_status("ime") {
@@ -906,13 +893,7 @@ impl App {
             self.color_token += 1; // 使在途采样失效
             for bar in &mut self.topbars {
                 bar.set_fused_target(None, false);
-                bar.dark_text = if !is_acrylic {
-                    pure_dark_text
-                } else {
-                    color_sync::wallpaper_luma(bar.monitor.hmonitor.0 as isize)
-                        .map(|l| l > 0.45)
-                        .unwrap_or(pure_dark_text)
-                };
+                bar.dark_text = pure_dark_text;
                 invalidate(bar.hwnd);
             }
             if had_fused {
@@ -1450,7 +1431,6 @@ impl App {
         let suppress_tooltip = self.window_preview.visible;
         let scratch = &mut self.text_scratch;
         let font = self.docks[i].tooltip_font;
-        let light = self.docks[i].light_backdrop;
         let dock = &mut self.docks[i];
         let mut ctx = RenderCtx {
             cfg,
@@ -1459,7 +1439,6 @@ impl App {
             worker: &worker,
             text_scratch: scratch,
             tooltip_font: font,
-            light_backdrop: light,
             trash_full: trash,
             suppress_tooltip,
         };
@@ -2166,7 +2145,7 @@ impl App {
     // ---------- Dock 事件 ----------
 
     fn dock_index(&self, hwnd: HWND) -> Option<usize> {
-        self.docks.iter().position(|d| d.hwnd_overlay == hwnd || d.hwnd_trigger == hwnd || d.hwnd_backdrop == hwnd)
+        self.docks.iter().position(|d| d.hwnd_overlay == hwnd || d.hwnd_trigger == hwnd)
     }
 
     pub fn dock_mouse_move(&mut self, hwnd: HWND, x: f32, y: f32) {
