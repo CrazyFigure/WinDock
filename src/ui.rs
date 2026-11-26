@@ -949,6 +949,31 @@ impl Surface {
         }
     }
 
+    /// 使用浮点边界填充抗锯齿圆角矩形，避免小尺寸与动画缩放时出现整数取整抖动。
+    pub fn fill_rrect_f(&mut self, left: f32, top: f32, right: f32, bottom: f32, radius: f32, c: Rgba) {
+        if c.3 <= 0.001 || right <= left || bottom <= top {
+            return;
+        }
+        let max_r = ((right - left).min(bottom - top) * 0.5).max(0.0);
+        let radius = radius.min(max_r);
+        let (x0, y0, x1, y1) = self.clamp_bounds(
+            left.floor() as i32 - 1,
+            top.floor() as i32 - 1,
+            right.ceil() as i32 + 1,
+            bottom.ceil() as i32 + 1,
+        );
+        for y in y0..y1 {
+            let fy = y as f32 + 0.5;
+            for x in x0..x1 {
+                let d = Self::sd_rrect(x as f32 + 0.5, fy, left, top, right, bottom, radius);
+                if d < 0.5 {
+                    let cov = (0.5 - d).clamp(0.0, 1.0);
+                    self.blend(x, y, (c.0, c.1, c.2, c.3 * cov));
+                }
+            }
+        }
+    }
+
     pub fn stroke_rrect(&mut self, r: &RECT, radius: f32, width: f32, c: Rgba) {
         if c.3 <= 0.001 || r.right <= r.left || r.bottom <= r.top {
             return;
@@ -2700,38 +2725,56 @@ pub fn draw_settings_icon(sf: &mut Surface, cx: f32, cy: f32, size: f32) {
     sf.stroke_circle(cx, cy, size * 0.115, 1.0, (1.0, 1.0, 1.0, 0.35));
 }
 
-/// 绘制精致仿 macOS 风格「启动台」多彩圆角九宫格图标。
+/// 绘制与 WinLaunchpad 一致的「启动台」图标（45° 蓝紫渐变圆角方框 + 居中 3×3 白色圆角网格）。
 pub fn draw_launchpad_icon(sf: &mut Surface, cx: f32, cy: f32, size: f32) {
-    let half = size * 0.46;
-    let r = RECT {
-        left: (cx - half).round() as i32,
-        top: (cy - half).round() as i32,
-        right: (cx + half).round() as i32,
-        bottom: (cy + half).round() as i32,
-    };
-    let rad = size * 0.21;
-    let sh = RECT { left: r.left, top: r.top + (size * 0.05) as i32, right: r.right, bottom: r.bottom + (size * 0.06) as i32 };
-    sf.fill_rrect(&sh, rad, (0.0, 0.0, 0.0, 0.24));
-    sf.fill_rrect_vgrad(&r, rad, rgb(0x3B404C, 1.0), rgb(0x1E222B, 1.0));
-    sf.stroke_rrect(&r, rad, 1.0, (1.0, 1.0, 1.0, 0.28));
-    let palette9 = [
-        0xFF5F57u32, 0xFEBC2E, 0x28C840,
-        0x32ADE6, 0x0A84FF, 0xBF5AF2,
-        0xFF375F, 0xFF9F0A, 0x64D2FF,
-    ];
-    let tile = size * 0.18;
-    let step = size * 0.23;
+    if size <= 1.0 {
+        return;
+    }
+    // 复用 WinLaunchpad/assets/app.ico 与 draw_app_badge 的比例，外框占图标槽位 92%（与设置图标等宽）
+    let box_size = size * 0.92;
+    let half = box_size * 0.5;
+    let (fl, ft, fr, fb) = (cx - half, cy - half, cx + half, cy + half);
+    let rad = box_size * (29.0 / 240.0);
+
+    // 45° 对角线渐变底板（左上 #4F7CFF → 右下 #7B3FE4），按像素 SDF 精确抗锯齿
+    let (x0, y0, x1, y1) = sf.clamp_bounds(
+        fl.floor() as i32 - 1,
+        ft.floor() as i32 - 1,
+        fr.ceil() as i32 + 1,
+        fb.ceil() as i32 + 1,
+    );
+    let span = (box_size * 2.0).max(1.0);
+    let (c1r, c1g, c1b) = (0x4F as f32 / 255.0, 0x7C as f32 / 255.0, 1.0);
+    let (c2r, c2g, c2b) = (0x7B as f32 / 255.0, 0x3F as f32 / 255.0, 0xE4 as f32 / 255.0);
+    for y in y0..y1 {
+        let fy = y as f32 + 0.5;
+        for x in x0..x1 {
+            let fx = x as f32 + 0.5;
+            let d = Surface::sd_rrect(fx, fy, fl, ft, fr, fb, rad);
+            if d < 0.5 {
+                let cov = (0.5 - d).clamp(0.0, 1.0);
+                let t = (((fx - fl) + (fy - ft)) / span).clamp(0.0, 1.0);
+                let cr = c1r + (c2r - c1r) * t;
+                let cg = c1g + (c2g - c1g) * t;
+                let cb = c1b + (c2b - c1b) * t;
+                sf.blend(x, y, (cr, cg, cb, cov));
+            }
+        }
+    }
+
+    // 居中 3×3 白色圆角网格（格宽 52、间距 16、圆角半径 6 / 240，全浮点坐标杜绝缩放抖动）
+    let cell = box_size * (52.0 / 240.0);
+    let gap = box_size * (16.0 / 240.0);
+    let cell_rad = (box_size * (6.0 / 240.0)).max(0.9);
+    let total = cell * 3.0 + gap * 2.0;
+    let ox = cx - total * 0.5;
+    let oy = cy - total * 0.5;
+    let white = rgb(0xFFFFFF, 1.0);
     for row in 0..3 {
         for col in 0..3 {
-            let tx = cx + (col as f32 - 1.0) * step;
-            let ty = cy + (row as f32 - 1.0) * step;
-            let tr = RECT {
-                left: (tx - tile * 0.5).round() as i32,
-                top: (ty - tile * 0.5).round() as i32,
-                right: (tx + tile * 0.5).round() as i32,
-                bottom: (ty + tile * 0.5).round() as i32,
-            };
-            sf.fill_rrect(&tr, tile * 0.26, rgb(palette9[row * 3 + col], 1.0));
+            let gx = ox + col as f32 * (cell + gap);
+            let gy = oy + row as f32 * (cell + gap);
+            sf.fill_rrect_f(gx, gy, gx + cell, gy + cell, cell_rad, white);
         }
     }
 }
@@ -2800,6 +2843,55 @@ mod tests {
         assert!(((dock >> 16) & 0xFF) > 240 && (dock & 0xFF) > 240);
         // 徽标外角保持原背景（白色不透明）
         assert_eq!(buf[0], 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn launchpad_icon_renders_blue_purple_gradient_and_white_grid() {
+        let (w, h) = (128, 128);
+        let mut buf = vec![0u32; w * h];
+        let mut sf = Surface {
+            w,
+            h,
+            ptr: buf.as_mut_ptr(),
+            clip: None,
+        };
+        draw_launchpad_icon(&mut sf, 64.0, 64.0, 128.0);
+
+        // 正中心属于 3×3 九宫格第 (1,1) 个白色方块，应呈纯白不透明
+        let center = buf[64 * w + 64];
+        assert_eq!(center >> 24, 0xFF);
+        assert!(((center >> 16) & 0xFF) > 250);
+        assert!(((center >> 8) & 0xFF) > 250);
+        assert!((center & 0xFF) > 250);
+
+        // 九宫格行间隙中心（(1,1) 与 (0,1) 方块之间）应透出渐变底色而非纯白
+        let gap_px = buf[47 * w + 64];
+        assert_eq!(gap_px >> 24, 0xFF);
+        assert!((gap_px & 0xFF) > ((gap_px >> 8) & 0xFF));
+
+        // 左上角内框渐变区域偏蓝（#4F7CFF），右下角内框渐变区域偏紫（#7B3FE4）
+        let tl = buf[12 * w + 12];
+        assert_eq!(tl >> 24, 0xFF);
+        assert!((tl & 0xFF) > ((tl >> 16) & 0xFF));
+        let br = buf[116 * w + 116];
+        assert_eq!(br >> 24, 0xFF);
+        assert!(((br >> 16) & 0xFF) > ((br >> 8) & 0xFF));
+        assert!((br & 0xFF) > ((br >> 8) & 0xFF));
+
+        // 画布最外角保持全透明
+        assert_eq!(buf[0], 0);
+
+        // 设置页小尺寸（24px）与悬停小数尺寸均应稳定渲染且中心为白格
+        let mut small = vec![0u32; 32 * 32];
+        let mut sf_small = Surface {
+            w: 32,
+            h: 32,
+            ptr: small.as_mut_ptr(),
+            clip: None,
+        };
+        draw_launchpad_icon(&mut sf_small, 16.0, 16.0, 24.0);
+        let sc = small[16 * 32 + 16];
+        assert!(((sc >> 16) & 0xFF) > 245 && ((sc >> 8) & 0xFF) > 245 && (sc & 0xFF) > 245);
     }
 
     #[test]
