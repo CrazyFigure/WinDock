@@ -63,6 +63,53 @@ pub struct IconPixels {
     pub px: std::sync::Arc<Vec<u8>>,
 }
 
+/// 判断预乘 BGRA 图标是否为「带透明底的纯暗色低饱和单色图标」（如 ChatGPT / Seer 黑色线稿）。
+/// 这类图标在深色背景上几乎不可见，绘制时应自动提亮为柔和浅白。
+pub fn is_dark_monochrome_icon(icon: &IconPixels) -> bool {
+    let total = (icon.w as usize).saturating_mul(icon.h as usize);
+    if total == 0 || icon.px.len() < total * 4 {
+        return false;
+    }
+    // 对高分辨率图标按步长采样，单次检测仅数百像素、微秒级开销
+    let step = (total / 512).max(1);
+    let mut trans = 0usize;
+    let mut sampled = 0usize;
+    let mut vis_w = 0.0f32;
+    let mut luma_sum = 0.0f32;
+    let mut bright_or_color = 0.0f32;
+    let px = icon.px.as_slice();
+    let mut idx = 0usize;
+    while idx < total {
+        let off = idx * 4;
+        let a = px[off + 3];
+        sampled += 1;
+        if a <= 20 {
+            trans += 1;
+        } else if a >= 40 {
+            let af = a as f32;
+            let b = (px[off] as f32 / af).clamp(0.0, 1.0);
+            let g = (px[off + 1] as f32 / af).clamp(0.0, 1.0);
+            let r = (px[off + 2] as f32 / af).clamp(0.0, 1.0);
+            let luma = 0.114 * b + 0.587 * g + 0.299 * r;
+            let sat = b.max(g).max(r) - b.min(g).min(r);
+            let w = af / 255.0;
+            vis_w += w;
+            luma_sum += luma * w;
+            if luma > 0.42 || sat > 0.24 {
+                bright_or_color += w;
+            }
+        }
+        idx += step;
+    }
+    if sampled == 0 || vis_w <= 0.5 {
+        return false;
+    }
+    let trans_ratio = trans as f32 / sampled as f32;
+    let avg_luma = luma_sum / vis_w;
+    let bright_ratio = bright_or_color / vis_w;
+    trans_ratio > 0.12 && avg_luma < 0.34 && bright_ratio < 0.18
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CheckState {
     Unchecked,
@@ -702,8 +749,37 @@ impl Surface {
         }
     }
 
-    /// 双线性缩放并绘制预乘 BGRA 图标，可选柔和投影（用于启动台图标质感增强）。
+    /// 高质量缩放并绘制预乘 BGRA 图标：缩小时使用精确像素足迹区域平均消除锯齿，放大时使用预乘双线性插值。
     pub fn draw_icon_bilinear(&mut self, icon: &IconPixels, cx: f32, cy: f32, target_size: f32, with_shadow: bool, shadow_offset: f32) {
+        self.draw_icon_resampled(icon, cx, cy, target_size, with_shadow, shadow_offset, false);
+    }
+
+    /// 自适应背景深浅的高质量图标绘制：深色背景上遇到纯暗色透明图标（如 ChatGPT / Seer）时自动提亮保证清晰可读。
+    pub fn draw_icon_adaptive(
+        &mut self,
+        icon: &IconPixels,
+        cx: f32,
+        cy: f32,
+        target_size: f32,
+        dark_bg: bool,
+        with_shadow: bool,
+        shadow_offset: f32,
+    ) {
+        let lift_dark = dark_bg && is_dark_monochrome_icon(icon);
+        self.draw_icon_resampled(icon, cx, cy, target_size, with_shadow, shadow_offset, lift_dark);
+    }
+
+    /// 核心图标缩放渲染实现（全预乘空间，支持区域盒滤缩小、柔和双线性投影与暗色图标提亮）。
+    fn draw_icon_resampled(
+        &mut self,
+        icon: &IconPixels,
+        cx: f32,
+        cy: f32,
+        target_size: f32,
+        with_shadow: bool,
+        shadow_offset: f32,
+        lift_dark: bool,
+    ) {
         if icon.w == 0 || icon.h == 0 || target_size <= 1.0 {
             return;
         }
@@ -719,20 +795,38 @@ impl Surface {
         let inv_x = iw as f32 / dw as f32;
         let inv_y = ih as f32 / dh as f32;
 
-        // 先绘制柔和阴影，再叠加图标本体
+        // 柔和双线性投影（仅用于浅色模式等需要轻微层次感的场景，避免最近邻硬边锯齿）
         if with_shadow && shadow_offset >= 1.0 {
             let so = shadow_offset.round() as i32;
-            let (sx0, sy0, sx1, sy1) = self.clamp_bounds(dx0 - 1, dy0 + so - 1, dx0 + dw + 1, dy0 + dh + so + 2);
+            let (sx0, sy0, sx1, sy1) = self.clamp_bounds(dx0, dy0 + so, dx0 + dw, dy0 + dh + so);
             for y in sy0..sy1 {
                 let fy = ((y - (dy0 + so)) as f32 + 0.5) * inv_y - 0.5;
-                let iy = (fy.round() as i32).clamp(0, ih - 1);
-                let row_off = (iy as usize * icon.w as usize) * 4;
+                let y0 = (fy.floor() as i32).clamp(0, ih - 1);
+                let y1 = (y0 + 1).min(ih - 1);
+                let ty = (fy - y0 as f32).clamp(0.0, 1.0);
+                let wy1 = (ty * 256.0).round() as u32;
+                let wy0 = 256 - wy1;
+                let row0 = (y0 as usize * icon.w as usize) * 4;
+                let row1 = (y1 as usize * icon.w as usize) * 4;
                 for x in sx0..sx1 {
                     let fx = ((x - dx0) as f32 + 0.5) * inv_x - 0.5;
-                    let ix = (fx.round() as i32).clamp(0, iw - 1);
-                    let a = src[row_off + ix as usize * 4 + 3] as u32;
-                    if a > 16 {
-                        let sa = (a * 68) >> 8; // ~26% 柔和黑影
+                    let x0 = (fx.floor() as i32).clamp(0, iw - 1);
+                    let x1 = (x0 + 1).min(iw - 1);
+                    let tx = (fx - x0 as f32).clamp(0.0, 1.0);
+                    let wx1 = (tx * 256.0).round() as u32;
+                    let wx0 = 256 - wx1;
+                    let w00 = (wx0 * wy0) >> 8;
+                    let w10 = (wx1 * wy0) >> 8;
+                    let w01 = (wx0 * wy1) >> 8;
+                    let w11 = (wx1 * wy1) >> 8;
+                    let a = (src[row0 + x0 as usize * 4 + 3] as u32 * w00
+                        + src[row0 + x1 as usize * 4 + 3] as u32 * w10
+                        + src[row1 + x0 as usize * 4 + 3] as u32 * w01
+                        + src[row1 + x1 as usize * 4 + 3] as u32 * w11
+                        + 128)
+                        >> 8;
+                    if a > 12 {
+                        let sa = (a * 36) >> 8; // ~14% 柔和投影
                         self.blend_premul_u8(x, y, 0, 0, 0, sa);
                     }
                 }
@@ -743,6 +837,72 @@ impl Surface {
         if bx0 >= bx1 || by0 >= by1 {
             return;
         }
+
+        // 缩小渲染（如 128px → 42px / 18px / 16px）：使用精确像素足迹区域盒滤，杜绝锯齿与线条断裂
+        if inv_x > 1.05 || inv_y > 1.05 {
+            for y in by0..by1 {
+                let sy0 = ((y - dy0) as f32 * inv_y).clamp(0.0, ih as f32);
+                let sy1 = ((y - dy0 + 1) as f32 * inv_y).clamp(0.0, ih as f32);
+                let iy0 = (sy0.floor() as i32).clamp(0, ih - 1);
+                let iy1 = ((sy1 - 1e-4).floor() as i32).clamp(0, ih - 1);
+                for x in bx0..bx1 {
+                    let sx0 = ((x - dx0) as f32 * inv_x).clamp(0.0, iw as f32);
+                    let sx1 = ((x - dx0 + 1) as f32 * inv_x).clamp(0.0, iw as f32);
+                    let ix0 = (sx0.floor() as i32).clamp(0, iw - 1);
+                    let ix1 = ((sx1 - 1e-4).floor() as i32).clamp(0, iw - 1);
+                    let (mut sb, mut sg, mut sr, mut sa, mut wsum) = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                    for iy in iy0..=iy1 {
+                        let wy = ((iy as f32 + 1.0).min(sy1) - (iy as f32).max(sy0)).max(0.0);
+                        if wy <= 0.0 {
+                            continue;
+                        }
+                        let row = (iy as usize * icon.w as usize) * 4;
+                        for ix in ix0..=ix1 {
+                            let wx = ((ix as f32 + 1.0).min(sx1) - (ix as f32).max(sx0)).max(0.0);
+                            let w = wx * wy;
+                            if w <= 0.0 {
+                                continue;
+                            }
+                            let idx = row + ix as usize * 4;
+                            sb += src[idx] as f32 * w;
+                            sg += src[idx + 1] as f32 * w;
+                            sr += src[idx + 2] as f32 * w;
+                            sa += src[idx + 3] as f32 * w;
+                            wsum += w;
+                        }
+                    }
+                    if wsum <= 1e-6 {
+                        continue;
+                    }
+                    let inv_w = 1.0 / wsum;
+                    let a = (sa * inv_w).round().clamp(0.0, 255.0) as u32;
+                    if a == 0 {
+                        continue;
+                    }
+                    let (b, g, r) = if lift_dark {
+                        // 将深色单色透明图标提亮为柔和浅白，保留完整抗锯齿边缘
+                        let af = a as f32;
+                        let lb = ((sb * inv_w) / af).clamp(0.0, 1.0);
+                        let lg = ((sg * inv_w) / af).clamp(0.0, 1.0);
+                        let lr = ((sr * inv_w) / af).clamp(0.0, 1.0);
+                        let nb = ((0.96 - 0.45 * lb) * af).round().clamp(0.0, af) as u32;
+                        let ng = ((0.95 - 0.45 * lg) * af).round().clamp(0.0, af) as u32;
+                        let nr = ((0.95 - 0.45 * lr) * af).round().clamp(0.0, af) as u32;
+                        (nb, ng, nr)
+                    } else {
+                        (
+                            (sb * inv_w).round().clamp(0.0, a as f32) as u32,
+                            (sg * inv_w).round().clamp(0.0, a as f32) as u32,
+                            (sr * inv_w).round().clamp(0.0, a as f32) as u32,
+                        )
+                    };
+                    self.blend_premul_u8(x, y, b, g, r, a);
+                }
+            }
+            return;
+        }
+
+        // 放大或 1:1：使用预乘双线性插值
         for y in by0..by1 {
             let fy = ((y - dy0) as f32 + 0.5) * inv_y - 0.5;
             let y0 = (fy.floor() as i32).clamp(0, ih - 1);
@@ -770,10 +930,22 @@ impl Surface {
                 let w01 = (wx0 * wy1) >> 8;
                 let w11 = (wx1 * wy1) >> 8;
 
-                let b = (src[i00] as u32 * w00 + src[i10] as u32 * w10 + src[i01] as u32 * w01 + src[i11] as u32 * w11 + 128) >> 8;
-                let g = (src[i00 + 1] as u32 * w00 + src[i10 + 1] as u32 * w10 + src[i01 + 1] as u32 * w01 + src[i11 + 1] as u32 * w11 + 128) >> 8;
-                let r = (src[i00 + 2] as u32 * w00 + src[i10 + 2] as u32 * w10 + src[i01 + 2] as u32 * w01 + src[i11 + 2] as u32 * w11 + 128) >> 8;
-                let a = (src[i00 + 3] as u32 * w00 + src[i10 + 3] as u32 * w10 + src[i01 + 3] as u32 * w01 + src[i11 + 3] as u32 * w11 + 128) >> 8;
+                let a = ((src[i00 + 3] as u32 * w00 + src[i10 + 3] as u32 * w10 + src[i01 + 3] as u32 * w01 + src[i11 + 3] as u32 * w11 + 128) >> 8).min(255);
+                if a == 0 {
+                    continue;
+                }
+                let raw_b = ((src[i00] as u32 * w00 + src[i10] as u32 * w10 + src[i01] as u32 * w01 + src[i11] as u32 * w11 + 128) >> 8).min(a);
+                let raw_g = ((src[i00 + 1] as u32 * w00 + src[i10 + 1] as u32 * w10 + src[i01 + 1] as u32 * w01 + src[i11 + 1] as u32 * w11 + 128) >> 8).min(a);
+                let raw_r = ((src[i00 + 2] as u32 * w00 + src[i10 + 2] as u32 * w10 + src[i01 + 2] as u32 * w01 + src[i11 + 2] as u32 * w11 + 128) >> 8).min(a);
+                let (b, g, r) = if lift_dark {
+                    let af = a as f32;
+                    let nb = ((0.96 - 0.45 * (raw_b as f32 / af)) * af).round().clamp(0.0, af) as u32;
+                    let ng = ((0.95 - 0.45 * (raw_g as f32 / af)) * af).round().clamp(0.0, af) as u32;
+                    let nr = ((0.95 - 0.45 * (raw_r as f32 / af)) * af).round().clamp(0.0, af) as u32;
+                    (nb, ng, nr)
+                } else {
+                    (raw_b, raw_g, raw_r)
+                };
                 self.blend_premul_u8(x, y, b, g, r, a);
             }
         }

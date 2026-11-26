@@ -118,7 +118,8 @@ fn draw_entry_icon(
     }
     if let Some(p) = icon_pixels(key, ctx) {
         let s = size.max(8.0);
-        surface.draw_icon_bilinear(&p, cx, cy, s, true, (s * 0.055).max(1.5));
+        // 浅色模式保留轻柔微投影，深色模式关闭黑影并启用暗色透明图标自适应可见性保护
+        surface.draw_icon_adaptive(&p, cx, cy, s, dark, !dark, (s * 0.045).max(1.2));
         return;
     }
     let font = ctx.tooltip_font;

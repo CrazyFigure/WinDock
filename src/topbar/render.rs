@@ -125,9 +125,9 @@ pub fn paint(hwnd: HWND, bar: &mut TopBar, _cfg: &TopbarCfg, appearance: &Appear
                 let cx = (r.left + r.right) as f32 * 0.5;
                 let cy = h as f32 * 0.5;
                 if let Some(item) = bar.tray_items.iter().find(|t| &t.key == key) {
-                    crate::topbar::tray_popover::draw_shelf_item_icon(&mut sf, &mut bar.scratch, bar.font, item, &app_icons, tray_icons, cx, cy, 16.0 * s, bar.dark_text, s);
+                    crate::topbar::tray_popover::draw_shelf_item_icon(&mut sf, &mut bar.scratch, bar.font, item, &app_icons, tray_icons, cx, cy, 16.0 * s, !bar.dark_text, s);
                 } else if let Some(p) = tray_icons.get(key) {
-                    sf.draw_icon_bilinear(&p, cx, cy, 16.0 * s, false, 0.0);
+                    sf.draw_icon_adaptive(&p, cx, cy, 16.0 * s, !bar.dark_text, false, 0.0);
                 }
             }
             Hit::Ime => {
@@ -190,7 +190,7 @@ pub fn paint(hwnd: HWND, bar: &mut TopBar, _cfg: &TopbarCfg, appearance: &Appear
             (accent.0, accent.1, accent.2, 0.98),
         );
         if let Some(item) = bar.tray_items.iter().find(|t| t.key == drag.key) {
-            crate::topbar::tray_popover::draw_shelf_item_icon(&mut sf, &mut bar.scratch, bar.font, item, &app_icons, tray_icons, drag.x as f32, h as f32 * 0.5, 18.0 * s, bar.dark_text, s);
+            crate::topbar::tray_popover::draw_shelf_item_icon(&mut sf, &mut bar.scratch, bar.font, item, &app_icons, tray_icons, drag.x as f32, h as f32 * 0.5, 18.0 * s, !bar.dark_text, s);
         }
     }
 

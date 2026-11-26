@@ -453,12 +453,12 @@ pub fn draw_shelf_item_icon(
         .or_else(|| tray_icons.get(&format!("win:{}", item.key)))
         .or_else(|| tray_icons.get(&item.key))
     {
-        sf.draw_icon_bilinear(&px, cx, cy, size, false, 0.0);
+        sf.draw_icon_adaptive(&px, cx, cy, size, dark, false, 0.0);
         return;
     }
     if let Some(exe) = &item.app_exe {
         if let Some(px) = app_icons.pixels(exe, DOCK_ICON_SRC_SIZE) {
-            sf.draw_icon_bilinear(&px, cx, cy, size, false, 0.0);
+            sf.draw_icon_adaptive(&px, cx, cy, size, dark, false, 0.0);
             return;
         }
     }

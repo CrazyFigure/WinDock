@@ -31,7 +31,7 @@ use crate::ui::IconPixels;
 use crate::win32::{exe_path, fnv1a64, wide};
 
 pub const WM_APP_ICON: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 3;
-const ICON_CACHE_MAGIC: &[u8; 4] = b"WDF1";
+const ICON_CACHE_MAGIC: &[u8; 4] = b"WDF2";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// 图标像素缓存字节预算（8 MB）。
 pub const ICON_BUDGET_BYTES: usize = 8 * 1024 * 1024;
@@ -87,9 +87,9 @@ impl IconWorker {
 
     pub fn cache_path(cache_dir: &Path, key: &str, size: u32) -> PathBuf {
         let bucket = Self::bucket_size(size);
-        let sig = format!("wdf1|{}|{}", key.to_lowercase(), bucket);
+        let sig = format!("wdf2|{}|{}", key.to_lowercase(), bucket);
         let h = fnv1a64(sig.as_bytes());
-        cache_dir.join(format!("wdf1_{h:016x}_{bucket}.icache"))
+        cache_dir.join(format!("wdf2_{h:016x}_{bucket}.icache"))
     }
 
     /// 清空磁盘图标缓存。
@@ -313,11 +313,13 @@ pub fn read_lnk_target(path: &Path) -> Option<String> {
 /// 返回 (归一化预乘 BGRA 像素, 宽, 高)。仅在工作进程中调用。
 pub fn extract(key: &str, size: u32) -> Option<(Vec<u8>, u32, u32)> {
     let target = size.clamp(32, 192);
-    let raw = extract_item(key, target).or_else(|| {
+    // 请求 256px 高清原图后再经精确区域重采样缩小，显著提升细节锐度与抗锯齿质量
+    let fetch_sz = target.max(256);
+    let raw = extract_item(key, fetch_sz).or_else(|| {
         if Path::new(key).extension().map(|e| e.eq_ignore_ascii_case("lnk")).unwrap_or(false) {
             if let Some(t) = read_lnk_target(Path::new(key)) {
                 if Path::new(&t).exists() {
-                    return extract_item(&t, target);
+                    return extract_item(&t, fetch_sz);
                 }
             }
         }
@@ -417,8 +419,9 @@ pub fn extract_stock_icon_hd(stock_id: windows::Win32::UI::Shell::SHSTOCKICONID,
                 if let Ok(list) = SHGetImageList::<IImageList>(list_id as i32) {
                     if let Ok(hicon) = list.GetIcon(info.iSysImageIndex, ILD_TRANSPARENT.0) {
                         let raw_sz = if list_id == SHIL_JUMBO { 256 } else { 48 };
-                        if let Some(p) = hicon_to_pixels(hicon, raw_sz) {
-                            let (norm, w, h) = normalize_and_premultiply(p.px.as_ref().clone(), p.w, p.h, target);
+                        // 直接提取未预乘源像素再归一化，杜绝双重预乘导致的边缘黑边与粗糙锯齿
+                        if let Some((raw_px, rw, rh)) = hicon_to_straight_bgra(hicon, raw_sz) {
+                            let (norm, w, h) = normalize_and_premultiply(raw_px, rw, rh, target);
                             return Some(IconPixels { w, h, px: Arc::new(norm) });
                         }
                     }
@@ -426,20 +429,76 @@ pub fn extract_stock_icon_hd(stock_id: windows::Win32::UI::Shell::SHSTOCKICONID,
             }
         }
         if SHGetStockIconInfo(stock_id, SHGSI_ICON | SHGSI_LARGEICON, &mut info).is_ok() {
-            if let Some(p) = hicon_to_pixels(info.hIcon, target) {
-                return Some(p);
+            if let Some((raw_px, rw, rh)) = hicon_to_straight_bgra(info.hIcon, target) {
+                let (norm, w, h) = normalize_and_premultiply(raw_px, rw, rh, target);
+                return Some(IconPixels { w, h, px: Arc::new(norm) });
             }
         }
     }
     None
 }
 
-/// HICON → 预乘 BGRA 正方形像素（回收站、文件夹等系统图标）。
-pub fn hicon_to_pixels(hicon: windows::Win32::UI::WindowsAndMessaging::HICON, size: u32) -> Option<IconPixels> {
-    use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, DrawIconEx, DI_NORMAL};
+/// 读取 HICON 原始未预乘 BGRA 像素（优先直接读取 hbmColor + hbmMask，保留原生抗锯齿 Alpha；失败回退 DrawIconEx）。
+/// 调用后自动销毁传入的 `hicon`。
+fn hicon_to_straight_bgra(hicon: windows::Win32::UI::WindowsAndMessaging::HICON, fallback_size: u32) -> Option<(Vec<u8>, u32, u32)> {
+    use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, DrawIconEx, GetIconInfo, DI_NORMAL, ICONINFO};
     unsafe {
+        let mut ii = ICONINFO::default();
+        if GetIconInfo(hicon, &mut ii).is_ok() {
+            let color_res = if !ii.hbmColor.is_invalid() {
+                hbitmap_to_bgra(ii.hbmColor, false)
+            } else {
+                None
+            };
+            let mask_res = if !ii.hbmMask.is_invalid() {
+                hbitmap_to_bgra(ii.hbmMask, false)
+            } else {
+                None
+            };
+            if !ii.hbmColor.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(ii.hbmColor.0));
+            }
+            if !ii.hbmMask.is_invalid() {
+                let _ = DeleteObject(HGDIOBJ(ii.hbmMask.0));
+            }
+            if let Some((mut px, w, h)) = color_res {
+                let has_alpha = px.chunks_exact(4).any(|p| p[3] != 0);
+                if !has_alpha {
+                    // 无内置 Alpha 通道的老式图标：用 hbmMask 白色(=透明)/黑色(=不透明)还原精确轮廓
+                    if let Some((mpx, mw, mh)) = mask_res {
+                        if mw == w && mh >= h {
+                            for y in 0..h as usize {
+                                for x in 0..w as usize {
+                                    let idx = (y * w as usize + x) * 4;
+                                    let mask_white = mpx[idx] > 127;
+                                    px[idx + 3] = if mask_white { 0 } else { 255 };
+                                    if mask_white {
+                                        px[idx] = 0;
+                                        px[idx + 1] = 0;
+                                        px[idx + 2] = 0;
+                                    }
+                                }
+                            }
+                        } else {
+                            for p in px.chunks_exact_mut(4) {
+                                p[3] = 255;
+                            }
+                        }
+                    } else {
+                        for p in px.chunks_exact_mut(4) {
+                            p[3] = 255;
+                        }
+                    }
+                }
+                let _ = DestroyIcon(hicon);
+                return Some((px, w, h));
+            }
+        }
+
+        // 回退路径：DrawIconEx 绘制到 32bpp DIB
+        let size = fallback_size.max(16);
         let hdc = CreateCompatibleDC(windows::Win32::Graphics::Gdi::HDC::default());
-        let mut bi = BITMAPINFO {
+        let bi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
                 biWidth: size as i32,
@@ -463,39 +522,58 @@ pub fn hicon_to_pixels(hicon: windows::Win32::UI::WindowsAndMessaging::HICON, si
             return None;
         }
         let slice = std::slice::from_raw_parts(ptr as *const u8, (size * size * 4) as usize);
-        let mut px = vec![0u8; slice.len()];
-        let mut any_alpha = false;
-        for i in (0..slice.len()).step_by(4) {
-            if slice[i + 3] != 0 {
-                any_alpha = true;
-                break;
+        let mut px = slice.to_vec();
+        let any_alpha = px.chunks_exact(4).any(|p| p[3] != 0);
+        if !any_alpha {
+            for p in px.chunks_exact_mut(4) {
+                p[3] = 255;
             }
-        }
-        for i in (0..px.len()).step_by(4) {
-            let mut b = slice[i] as u32;
-            let mut g = slice[i + 1] as u32;
-            let mut r = slice[i + 2] as u32;
-            let mut a = slice[i + 3] as u32;
-            if !any_alpha {
-                a = 255;
-            }
-            // 预乘
-            b = ((b * a + 127) / 255).min(a);
-            g = ((g * a + 127) / 255).min(a);
-            r = ((r * a + 127) / 255).min(a);
-            px[i] = b as u8;
-            px[i + 1] = g as u8;
-            px[i + 2] = r as u8;
-            px[i + 3] = a as u8;
         }
         let _ = DeleteObject(HGDIOBJ(bmp.0));
         let _ = DestroyIcon(hicon);
-        Some(IconPixels {
-            w: size,
-            h: size,
-            px: Arc::new(px),
-        })
+        Some((px, size, size))
     }
+}
+
+/// HICON → 预乘 BGRA 正方形像素（托盘/窗口实时图标使用）。
+pub fn hicon_to_pixels(hicon: windows::Win32::UI::WindowsAndMessaging::HICON, size: u32) -> Option<IconPixels> {
+    let (raw, rw, rh) = hicon_to_straight_bgra(hicon, size)?;
+    let target = size.clamp(16, 256);
+    if rw == target && rh == target {
+        let mut px = raw;
+        let is_straight = detect_straight_alpha(&px);
+        for p in px.chunks_exact_mut(4) {
+            let a = p[3] as u32;
+            if is_straight {
+                p[0] = ((p[0] as u32 * a + 127) / 255).min(a) as u8;
+                p[1] = ((p[1] as u32 * a + 127) / 255).min(a) as u8;
+                p[2] = ((p[2] as u32 * a + 127) / 255).min(a) as u8;
+            } else {
+                p[0] = p[0].min(p[3]);
+                p[1] = p[1].min(p[3]);
+                p[2] = p[2].min(p[3]);
+            }
+        }
+        return Some(IconPixels { w: rw, h: rh, px: Arc::new(px) });
+    }
+    let premul = to_premul_f32(&raw);
+    let mut out = vec![0u8; (target * target * 4) as usize];
+    for y in 0..target as i32 {
+        let sy0 = (y as f32 / target as f32) * rh as f32;
+        let sy1 = ((y + 1) as f32 / target as f32) * rh as f32;
+        for x in 0..target as i32 {
+            let sx0 = (x as f32 / target as f32) * rw as f32;
+            let sx1 = ((x + 1) as f32 / target as f32) * rw as f32;
+            let [b, g, r, a] = sample_area_premul(&premul, rw as i32, rh as i32, 0, 0, rw as i32 - 1, rh as i32 - 1, sx0, sy0, sx1, sy1);
+            let oi = ((y as u32 * target + x as u32) * 4) as usize;
+            let ai = (a * 255.0).round().clamp(0.0, 255.0) as u8;
+            out[oi] = (b * 255.0).round().clamp(0.0, ai as f32) as u8;
+            out[oi + 1] = (g * 255.0).round().clamp(0.0, ai as f32) as u8;
+            out[oi + 2] = (r * 255.0).round().clamp(0.0, ai as f32) as u8;
+            out[oi + 3] = ai;
+        }
+    }
+    Some(IconPixels { w: target, h: target, px: Arc::new(out) })
 }
 
 /// 截取屏幕矩形为预乘 BGRA 像素（用于托盘图标镜像）。
@@ -554,11 +632,136 @@ pub fn key_out_icon_background(mut px: Vec<u8>, w: i32, h: i32) -> Option<IconPi
     Some(IconPixels { w: w as u32, h: h as u32, px: Arc::new(px) })
 }
 
-/// 图标内容边界归一化（复用 WinLaunchpad 算法）：裁剪透明留白、尖角矩形圆角化、
-/// 纯暗色透明图标自动衬浅色卡片、双线性缩放并预乘。
+/// 检测 32bpp BGRA 像素缓冲是否为未预乘（straight alpha）。
+/// 若存在任意半透明像素的 RGB 明显大于 Alpha，则必为 straight alpha。
+fn detect_straight_alpha(px: &[u8]) -> bool {
+    let mut has_semi = false;
+    for p in px.chunks_exact(4) {
+        let a = p[3];
+        if a > 0 && a < 252 {
+            has_semi = true;
+            if p[0] > a.saturating_add(2) || p[1] > a.saturating_add(2) || p[2] > a.saturating_add(2) {
+                return true;
+            }
+        }
+    }
+    // 纯二值透明图标（全 0 或全 255）视为 straight（等价且保证透明像素 RGB 归零）
+    !has_semi
+}
+
+/// 将 32bpp BGRA（自动识别 straight 或已预乘）转为统一浮点预乘 BGRA `[b, g, r, a]`（0..1）。
+fn to_premul_f32(px: &[u8]) -> Vec<[f32; 4]> {
+    let straight = detect_straight_alpha(px);
+    let mut out = Vec::with_capacity(px.len() / 4);
+    for p in px.chunks_exact(4) {
+        let a = p[3] as f32 / 255.0;
+        if a <= 0.0 {
+            out.push([0.0, 0.0, 0.0, 0.0]);
+        } else if straight {
+            out.push([
+                (p[0] as f32 / 255.0) * a,
+                (p[1] as f32 / 255.0) * a,
+                (p[2] as f32 / 255.0) * a,
+                a,
+            ]);
+        } else {
+            out.push([
+                (p[0] as f32 / 255.0).min(a),
+                (p[1] as f32 / 255.0).min(a),
+                (p[2] as f32 / 255.0).min(a),
+                a,
+            ]);
+        }
+    }
+    out
+}
+
+/// 在预乘浮点图像上执行精确区域重采样（缩小用精确像素足迹盒滤，放大用预乘双线性插值），杜绝锯齿与黑边。
+#[allow(clippy::too_many_arguments)]
+fn sample_area_premul(
+    premul: &[[f32; 4]],
+    iw: i32,
+    _ih: i32,
+    min_x: i32,
+    min_y: i32,
+    max_x: i32,
+    max_y: i32,
+    sx0: f32,
+    sy0: f32,
+    sx1: f32,
+    sy1: f32,
+) -> [f32; 4] {
+    let span_x = (sx1 - sx0).max(1e-4);
+    let span_y = (sy1 - sy0).max(1e-4);
+    // 放大或近似 1:1：使用预乘双线性插值保证平滑
+    if span_x <= 1.05 && span_y <= 1.05 {
+        let cx = (sx0 + sx1) * 0.5 - 0.5;
+        let cy = (sy0 + sy1) * 0.5 - 0.5;
+        let x0 = (cx.floor() as i32).clamp(min_x, max_x);
+        let x1 = (x0 + 1).min(max_x);
+        let y0 = (cy.floor() as i32).clamp(min_y, max_y);
+        let y1 = (y0 + 1).min(max_y);
+        let tx = (cx - x0 as f32).clamp(0.0, 1.0);
+        let ty = (cy - y0 as f32).clamp(0.0, 1.0);
+        let p00 = premul[(y0 * iw + x0) as usize];
+        let p10 = premul[(y0 * iw + x1) as usize];
+        let p01 = premul[(y1 * iw + x0) as usize];
+        let p11 = premul[(y1 * iw + x1) as usize];
+        let w00 = (1.0 - tx) * (1.0 - ty);
+        let w10 = tx * (1.0 - ty);
+        let w01 = (1.0 - tx) * ty;
+        let w11 = tx * ty;
+        return [
+            p00[0] * w00 + p10[0] * w10 + p01[0] * w01 + p11[0] * w11,
+            p00[1] * w00 + p10[1] * w10 + p01[1] * w01 + p11[1] * w11,
+            p00[2] * w00 + p10[2] * w10 + p01[2] * w01 + p11[2] * w11,
+            p00[3] * w00 + p10[3] * w10 + p01[3] * w01 + p11[3] * w11,
+        ];
+    }
+
+    // 缩小：按目标像素在源图像上的精确覆盖面积加权积分（避免 2x2 双线性跳点混叠）
+    let ix0 = (sx0.floor() as i32).clamp(min_x, max_x);
+    let ix1 = ((sx1 - 1e-4).floor() as i32).clamp(min_x, max_x);
+    let iy0 = (sy0.floor() as i32).clamp(min_y, max_y);
+    let iy1 = ((sy1 - 1e-4).floor() as i32).clamp(min_y, max_y);
+    let mut sb = 0.0f32;
+    let mut sg = 0.0f32;
+    let mut sr = 0.0f32;
+    let mut sa = 0.0f32;
+    let mut wsum = 0.0f32;
+    for iy in iy0..=iy1 {
+        let wy = ((iy as f32 + 1.0).min(sy1) - (iy as f32).max(sy0)).max(0.0);
+        if wy <= 0.0 {
+            continue;
+        }
+        let row = (iy * iw) as usize;
+        for ix in ix0..=ix1 {
+            let wx = ((ix as f32 + 1.0).min(sx1) - (ix as f32).max(sx0)).max(0.0);
+            let w = wx * wy;
+            if w <= 0.0 {
+                continue;
+            }
+            let p = premul[row + ix as usize];
+            sb += p[0] * w;
+            sg += p[1] * w;
+            sr += p[2] * w;
+            sa += p[3] * w;
+            wsum += w;
+        }
+    }
+    if wsum <= 1e-6 {
+        return [0.0; 4];
+    }
+    let inv = 1.0 / wsum;
+    [sb * inv, sg * inv, sr * inv, sa * inv]
+}
+
+/// 图标内容边界归一化：裁剪透明留白、尖角矩形圆角化、
+/// 纯暗色透明图标自动衬 macOS 浅色圆角卡片、全预乘精确区域重采样（绝不双重预乘）。
 pub fn normalize_and_premultiply(px: Vec<u8>, w: u32, h: u32, target: u32) -> (Vec<u8>, u32, u32) {
     let iw = w as i32;
     let ih = h as i32;
+    let premul = to_premul_f32(&px);
     let at = |x: i32, y: i32| -> [u8; 4] {
         let i = ((y * iw + x) * 4) as usize;
         [px[i], px[i + 1], px[i + 2], px[i + 3]]
@@ -635,44 +838,49 @@ pub fn normalize_and_premultiply(px: Vec<u8>, w: u32, h: u32, target: u32) -> (V
     let ch = ch_i as f32;
     let edge_opaque = at(min_x + cw_i / 2, min_y + 2)[3] > 200 && at(min_x + 2, min_y + ch_i / 2)[3] > 200;
 
+    // 基于还原后的真实非预乘色彩按 Alpha 权重统计亮度与饱和度，精准识别 ChatGPT / Seer 等暗色透明图标
     let mut trans_px = 0usize;
-    let mut vis_px = 0usize;
-    let mut bright_or_color_px = 0usize;
+    let mut vis_weight = 0.0f32;
+    let mut bright_or_color_weight = 0.0f32;
     let mut luma_sum = 0.0f32;
     for y in min_y..=max_y {
         for x in min_x..=max_x {
-            let p = at(x, y);
-            if p[3] <= 18 {
+            let p = premul[(y * iw + x) as usize];
+            let a = p[3];
+            if a <= 0.08 {
                 trans_px += 1;
-            } else if p[3] >= 60 {
-                vis_px += 1;
-                let (b, g, r) = (p[0] as f32, p[1] as f32, p[2] as f32);
-                let luma = (0.114 * b + 0.587 * g + 0.299 * r) / 255.0;
-                let sat = (b.max(g).max(r) - b.min(g).min(r)) / 255.0;
-                if luma > 0.40 || sat > 0.25 {
-                    bright_or_color_px += 1;
+            } else if a >= 0.16 {
+                let b = (p[0] / a).clamp(0.0, 1.0);
+                let g = (p[1] / a).clamp(0.0, 1.0);
+                let r = (p[2] / a).clamp(0.0, 1.0);
+                let luma = 0.114 * b + 0.587 * g + 0.299 * r;
+                let sat = b.max(g).max(r) - b.min(g).min(r);
+                vis_weight += a;
+                luma_sum += luma * a;
+                if luma > 0.42 || sat > 0.26 {
+                    bright_or_color_weight += a;
                 }
-                luma_sum += luma;
             }
         }
     }
     let total_box = (cw_i * ch_i).max(1) as f32;
     let trans_ratio = trans_px as f32 / total_box;
-    let avg_luma = if vis_px > 0 { luma_sum / vis_px as f32 } else { 1.0 };
-    let bright_ratio = bright_or_color_px as f32 / vis_px.max(1) as f32;
-    let needs_light_card = !is_sharp_rect && trans_ratio > 0.28 && avg_luma < 0.28 && bright_ratio < 0.14;
+    let avg_luma = if vis_weight > 0.0 { luma_sum / vis_weight } else { 1.0 };
+    let bright_ratio = if vis_weight > 0.0 { bright_or_color_weight / vis_weight } else { 1.0 };
+    let needs_light_card = !is_sharp_rect && trans_ratio > 0.16 && avg_luma < 0.38 && bright_ratio < 0.22;
 
     let mut out = vec![0u8; (target * target * 4) as usize];
     if needs_light_card {
-        let card_sz = (target as f32 * 0.85).round().max(16.0);
+        let card_sz = (target as f32 * 0.86).round().max(16.0);
         let card_x0 = (target as f32 - card_sz) * 0.5;
         let card_y0 = (target as f32 - card_sz) * 0.5;
         let card_rcx = card_x0 + card_sz * 0.5;
         let card_rcy = card_y0 + card_sz * 0.5;
-        let card_rad = (card_sz * 0.12).max(3.0);
+        // 采用与 macOS 原生图标一致的 22% 柔和圆角卡片
+        let card_rad = (card_sz * 0.22).max(4.0);
         let card_hw = card_sz * 0.5 - card_rad;
         let card_hh = card_sz * 0.5 - card_rad;
-        let inner_fit = card_sz * 0.62;
+        let inner_fit = card_sz * 0.66;
         let iscale = (inner_fit / cw).min(inner_fit / ch);
         let dw = (cw * iscale).round().max(1.0);
         let dh = (ch * iscale).round().max(1.0);
@@ -681,9 +889,11 @@ pub fn normalize_and_premultiply(px: Vec<u8>, w: u32, h: u32, target: u32) -> (V
         for y in 0..target as i32 {
             let fy = y as f32 + 0.5;
             let grad_t = ((fy - card_y0) / card_sz).clamp(0.0, 1.0);
-            let base_r = 250.0 - 20.0 * grad_t;
-            let base_g = 250.0 - 15.0 * grad_t;
-            let base_b = 253.0 - 10.0 * grad_t;
+            let base_r = (252.0 - 17.0 * grad_t) / 255.0;
+            let base_g = (253.0 - 15.0 * grad_t) / 255.0;
+            let base_b = (255.0 - 11.0 * grad_t) / 255.0;
+            let sy0 = min_y as f32 + ((y as f32 - dy0) / dh) * ch;
+            let sy1 = min_y as f32 + ((y as f32 + 1.0 - dy0) / dh) * ch;
             for x in 0..target as i32 {
                 let fx = x as f32 + 0.5;
                 let qx = (fx - card_rcx).abs() - card_hw;
@@ -694,46 +904,31 @@ pub fn normalize_and_premultiply(px: Vec<u8>, w: u32, h: u32, target: u32) -> (V
                     continue;
                 }
                 let rim = if sd > -1.3 && sd < 0.2 { 1.0 - ((sd + 0.55).abs() / 0.85).clamp(0.0, 1.0) } else { 0.0 };
-                let mut r = base_r + (255.0 - base_r) * rim * 0.45;
-                let mut g = base_g + (255.0 - base_g) * rim * 0.45;
-                let mut b = base_b + (255.0 - base_b) * rim * 0.45;
-                if fx >= dx0 - 0.5 && fx <= dx0 + dw + 0.5 && fy >= dy0 - 0.5 && fy <= dy0 + dh + 0.5 {
-                    let sy = min_y as f32 + ((fy - dy0) / dh) * ch - 0.5;
-                    let sx = min_x as f32 + ((fx - dx0) / dw) * cw - 0.5;
-                    let y0 = (sy.floor() as i32).clamp(min_y, max_y);
-                    let y1 = (y0 + 1).min(max_y);
-                    let ty = (sy - y0 as f32).clamp(0.0, 1.0);
-                    let x0 = (sx.floor() as i32).clamp(min_x, max_x);
-                    let x1 = (x0 + 1).min(max_x);
-                    let tx = (sx - x0 as f32).clamp(0.0, 1.0);
-                    let p00 = at(x0, y0);
-                    let p10 = at(x1, y0);
-                    let p01 = at(x0, y1);
-                    let p11 = at(x1, y1);
-                    let w00 = (1.0 - tx) * (1.0 - ty);
-                    let w10 = tx * (1.0 - ty);
-                    let w01 = (1.0 - tx) * ty;
-                    let w11 = tx * ty;
-                    let fg_b = p00[0] as f32 * w00 + p10[0] as f32 * w10 + p01[0] as f32 * w01 + p11[0] as f32 * w11;
-                    let fg_g = p00[1] as f32 * w00 + p10[1] as f32 * w10 + p01[1] as f32 * w01 + p11[1] as f32 * w11;
-                    let fg_r = p00[2] as f32 * w00 + p10[2] as f32 * w10 + p01[2] as f32 * w01 + p11[2] as f32 * w11;
-                    let fg_a = ((p00[3] as f32 * w00 + p10[3] as f32 * w10 + p01[3] as f32 * w01 + p11[3] as f32 * w11) / 255.0).clamp(0.0, 1.0);
-                    r = fg_r * fg_a + r * (1.0 - fg_a);
-                    g = fg_g * fg_a + g * (1.0 - fg_a);
-                    b = fg_b * fg_a + b * (1.0 - fg_a);
+                let mut r = base_r + (1.0 - base_r) * rim * 0.55;
+                let mut g = base_g + (1.0 - base_g) * rim * 0.55;
+                let mut b = base_b + (1.0 - base_b) * rim * 0.55;
+                if fx >= dx0 && fx <= dx0 + dw && fy >= dy0 && fy <= dy0 + dh {
+                    let sx0 = min_x as f32 + ((x as f32 - dx0) / dw) * cw;
+                    let sx1 = min_x as f32 + ((x as f32 + 1.0 - dx0) / dw) * cw;
+                    let fg = sample_area_premul(&premul, iw, ih, min_x, min_y, max_x, max_y, sx0, sy0, sx1, sy1);
+                    let inv_a = 1.0 - fg[3].clamp(0.0, 1.0);
+                    // 标准预乘 Porter-Duff OVER：前景已预乘，直接叠加在卡片底色上
+                    b = fg[0] + b * inv_a;
+                    g = fg[1] + g * inv_a;
+                    r = fg[2] + r * inv_a;
                 }
-                let ai = ((card_cov * 255.0).round() as u32).min(255);
                 let oi = ((y as u32 * target + x as u32) * 4) as usize;
-                out[oi] = ((b.round() as u32 * ai + 127) / 255).min(255) as u8;
-                out[oi + 1] = ((g.round() as u32 * ai + 127) / 255).min(255) as u8;
-                out[oi + 2] = ((r.round() as u32 * ai + 127) / 255).min(255) as u8;
-                out[oi + 3] = ai as u8;
+                let ai = (card_cov * 255.0).round().clamp(0.0, 255.0) as u8;
+                out[oi] = (b * card_cov * 255.0).round().clamp(0.0, ai as f32) as u8;
+                out[oi + 1] = (g * card_cov * 255.0).round().clamp(0.0, ai as f32) as u8;
+                out[oi + 2] = (r * card_cov * 255.0).round().clamp(0.0, ai as f32) as u8;
+                out[oi + 3] = ai;
             }
         }
         return (out, target, target);
     }
 
-    let fill_ratio = if is_sharp_rect || edge_opaque { 0.85 } else { 0.90 };
+    let fill_ratio = if is_sharp_rect || edge_opaque { 0.86 } else { 0.90 };
     let fit = target as f32 * fill_ratio;
     let scale = (fit / cw).min(fit / ch);
     let dw = (cw * scale).round().max(1.0);
@@ -752,43 +947,37 @@ pub fn normalize_and_premultiply(px: Vec<u8>, w: u32, h: u32, target: u32) -> (V
         if fy_out < dy0 - 0.5 || fy_out > dy0 + dh + 0.5 {
             continue;
         }
-        let sy = min_y as f32 + ((fy_out - dy0) / dh) * ch - 0.5;
-        let y0 = (sy.floor() as i32).clamp(min_y, max_y);
-        let y1 = (y0 + 1).min(max_y);
-        let ty = (sy - y0 as f32).clamp(0.0, 1.0);
+        let sy0 = min_y as f32 + ((y as f32 - dy0) / dh) * ch;
+        let sy1 = min_y as f32 + ((y as f32 + 1.0 - dy0) / dh) * ch;
         for x in 0..target as i32 {
             let fx_out = x as f32 + 0.5;
             if fx_out < dx0 - 0.5 || fx_out > dx0 + dw + 0.5 {
                 continue;
             }
-            let sx = min_x as f32 + ((fx_out - dx0) / dw) * cw - 0.5;
-            let x0 = (sx.floor() as i32).clamp(min_x, max_x);
-            let x1 = (x0 + 1).min(max_x);
-            let tx = (sx - x0 as f32).clamp(0.0, 1.0);
-            let p00 = at(x0, y0);
-            let p10 = at(x1, y0);
-            let p01 = at(x0, y1);
-            let p11 = at(x1, y1);
-            let w00 = (1.0 - tx) * (1.0 - ty);
-            let w10 = tx * (1.0 - ty);
-            let w01 = (1.0 - tx) * ty;
-            let w11 = tx * ty;
-            let b = p00[0] as f32 * w00 + p10[0] as f32 * w10 + p01[0] as f32 * w01 + p11[0] as f32 * w11;
-            let g = p00[1] as f32 * w00 + p10[1] as f32 * w10 + p01[1] as f32 * w01 + p11[1] as f32 * w11;
-            let r = p00[2] as f32 * w00 + p10[2] as f32 * w10 + p01[2] as f32 * w01 + p11[2] as f32 * w11;
-            let mut a = p00[3] as f32 * w00 + p10[3] as f32 * w10 + p01[3] as f32 * w01 + p11[3] as f32 * w11;
+            let sx0 = min_x as f32 + ((x as f32 - dx0) / dw) * cw;
+            let sx1 = min_x as f32 + ((x as f32 + 1.0 - dx0) / dw) * cw;
+            let [mut b, mut g, mut r, mut a] = sample_area_premul(&premul, iw, ih, min_x, min_y, max_x, max_y, sx0, sy0, sx1, sy1);
+            // 若采样框越出目标图像边缘，平滑裁切边缘覆盖率
+            let clip_x = ((x as f32 + 1.0).min(dx0 + dw) - (x as f32).max(dx0)).clamp(0.0, 1.0);
+            let clip_y = ((y as f32 + 1.0).min(dy0 + dh) - (y as f32).max(dy0)).clamp(0.0, 1.0);
+            let mut cov = clip_x * clip_y;
             if is_sharp_rect {
                 let qx = (fx_out - rcx).abs() - half_w;
                 let qy = (fy_out - rcy).abs() - half_h;
                 let sd = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - rad;
-                a *= (0.5 - sd).clamp(0.0, 1.0);
+                cov *= (0.5 - sd).clamp(0.0, 1.0);
             }
-            let ai = (a.round() as u32).min(255);
+            b *= cov;
+            g *= cov;
+            r *= cov;
+            a *= cov;
+            let ai = (a * 255.0).round().clamp(0.0, 255.0) as u8;
             let oi = ((y as u32 * target + x as u32) * 4) as usize;
-            out[oi] = ((b.round() as u32 * ai + 127) / 255).min(255) as u8;
-            out[oi + 1] = ((g.round() as u32 * ai + 127) / 255).min(255) as u8;
-            out[oi + 2] = ((r.round() as u32 * ai + 127) / 255).min(255) as u8;
-            out[oi + 3] = ai as u8;
+            // b/g/r 已处于预乘空间，直接写出不再二次乘以 alpha
+            out[oi] = (b * 255.0).round().clamp(0.0, ai as f32) as u8;
+            out[oi + 1] = (g * 255.0).round().clamp(0.0, ai as f32) as u8;
+            out[oi + 2] = (r * 255.0).round().clamp(0.0, ai as f32) as u8;
+            out[oi + 3] = ai;
         }
     }
     (out, target, target)
@@ -941,5 +1130,32 @@ mod tests {
         for p in out.chunks_exact(4) {
             assert!(p[2] <= p[3]);
         }
+    }
+
+    #[test]
+    fn dark_monochrome_transparent_icon_gets_light_card_backdrop() {
+        // 模拟 ChatGPT / Seer 类纯黑线稿透明图标（中心画黑色环形，其余全透明）
+        let sz = 64u32;
+        let mut px = vec![0u8; (sz * sz * 4) as usize];
+        for y in 0..sz {
+            for x in 0..sz {
+                let dx = x as f32 - 31.5;
+                let dy = y as f32 - 31.5;
+                let dist = (dx * dx + dy * dy).sqrt();
+                if (12.0..=20.0).contains(&dist) {
+                    let i = ((y * sz + x) * 4) as usize;
+                    px[i] = 20;
+                    px[i + 1] = 20;
+                    px[i + 2] = 20;
+                    px[i + 3] = 255;
+                }
+            }
+        }
+        let (out, w, h) = normalize_and_premultiply(px, sz, sz, 64);
+        assert_eq!((w, h), (64, 64));
+        // 卡片中心透明镂空处应已被衬上柔和浅乳白底色，在深色 Dock 上清晰可见
+        let center = ((32 * 64 + 32) * 4) as usize;
+        assert!(out[center + 3] > 240);
+        assert!(out[center + 2] > 220 && out[center + 1] > 220 && out[center] > 220);
     }
 }
