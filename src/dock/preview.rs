@@ -205,7 +205,7 @@ impl WindowPreview {
         self.cards.clear();
         self.entry_idx = Some(entry_idx);
         self.exe_key = exe_key.to_string();
-        self.dark = appearance.is_dark();
+        self.dark = appearance.desktop_is_dark();
         self.accent = accent_from_config(appearance);
         self.hover_card = None;
         self.hover_close = None;

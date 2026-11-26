@@ -260,7 +260,7 @@ impl Appearance {
         self
     }
 
-    /// 当前是否使用深色文字/图标主题（深色模式 → 浅色文字）。
+    /// 当前是否使用深色界面主题（设置窗口/状态浮层/菜单）。
     pub fn is_dark(&self) -> bool {
         match self.theme.as_str() {
             "light" => false,
@@ -269,22 +269,40 @@ impl Appearance {
         }
     }
 
-    /// Dock 胶囊底色（深色模式：深灰半透明；浅色：亮白半透明）。
-    pub fn dock_tint(&self) -> (f32, f32, f32, f32) {
-        let a = self.opacity;
-        if self.is_dark() {
-            (0.09, 0.10, 0.12, a)
-        } else {
-            (0.97, 0.97, 0.98, a)
+    /// 桌面常驻元素（顶部栏桌面态与 Dock 胶囊）是否使用深色基调：
+    /// 跟随系统模式下自动感应当前壁纸明暗，深色壁纸不再亮出刺眼纯白栏。
+    pub fn desktop_is_dark(&self) -> bool {
+        match self.theme.as_str() {
+            "light" => false,
+            "dark" => true,
+            _ => crate::topbar::color_sync::desktop_wallpaper_palette(false).is_dark(),
         }
     }
 
-    /// 顶部栏在桌面/非最大化态下的统一纯净底色（完全不透明，避免透出壁纸造成左右色差）。
-    pub fn topbar_base_rgb(&self) -> crate::topbar::color_sync::Rgb {
-        if self.is_dark() {
-            crate::topbar::color_sync::Rgb::new(0x1E, 0x1F, 0x24)
+    /// Dock 胶囊底色（深色基调：曜石深灰；浅色基调：柔和磨砂银灰）。
+    pub fn dock_tint(&self) -> (f32, f32, f32, f32) {
+        let a = self.opacity;
+        if self.desktop_is_dark() {
+            (0.09, 0.10, 0.12, a)
         } else {
-            crate::topbar::color_sync::Rgb::new(0xF3, 0xF4, 0xF7)
+            (0.86, 0.88, 0.91, a)
+        }
+    }
+
+    /// 顶部栏在桌面/非最大化态下的统一纯净底色（100% 均匀无左右色差，跟随系统时柔和贴合壁纸明暗不刺眼）。
+    pub fn topbar_base_rgb(&self) -> crate::topbar::color_sync::Rgb {
+        match self.theme.as_str() {
+            "dark" => {
+                let pal = crate::topbar::color_sync::desktop_wallpaper_palette(false);
+                if pal.is_dark() {
+                    pal.topbar_rgb
+                } else {
+                    crate::topbar::color_sync::Rgb::new(0x1B, 0x1D, 0x23)
+                }
+            }
+            // 显式浅色模式也采用克制的柔和银灰，避免纯白强光刺眼
+            "light" => crate::topbar::color_sync::Rgb::new(0xE0, 0xE3, 0xEA),
+            _ => crate::topbar::color_sync::desktop_wallpaper_palette(false).topbar_rgb,
         }
     }
 }

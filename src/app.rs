@@ -739,7 +739,7 @@ impl App {
         if self.config.topbar.enabled {
             let mons = self.topbar_monitors();
             let label = self.active_app_label();
-            let pure_dark_text = !self.config.appearance.is_dark();
+            let pure_dark_text = self.config.appearance.topbar_base_rgb().use_dark_text();
             for m in mons {
                 if let Ok(mut bar) = TopBar::new(app_ptr(), m, &self.config.topbar, &self.config.appearance) {
                     bar.pinned = self.config.topbar.pinned_tray_keys.clone();
@@ -864,7 +864,8 @@ impl App {
         let label = self.active_app_label();
         let fullscreen = self.snap.fullscreen;
         let cfg = &self.config.topbar;
-        let pure_dark_text = !self.config.appearance.is_dark();
+        let base_rgb = self.config.appearance.topbar_base_rgb();
+        let pure_dark_text = base_rgb.use_dark_text();
         for bar in &mut self.topbars {
             bar.active_app = label.clone();
             bar.status.ime = if cfg.has_status("ime") {
@@ -883,7 +884,6 @@ impl App {
         self.sync_edge_timer();
         // 最大化窗口自动取色融合
         let cfg = &self.config.topbar;
-        let base_rgb = self.config.appearance.topbar_base_rgb();
         let fg = self.snap.foreground;
         let hmon = self.snap.maximized_monitor;
         let want_fused = cfg.adaptive_maximized_color

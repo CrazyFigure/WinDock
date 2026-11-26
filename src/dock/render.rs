@@ -135,7 +135,8 @@ pub fn render(dock: &mut Dock, ctx: &mut RenderCtx) {
         return;
     }
     let Some(dc) = dock.target.mem_dc else { return };
-    let dark = ctx.appearance.is_dark();
+    // 桌面 Dock 随壁纸/主题自动切换明暗，深色壁纸下自动呈现沉稳暗色胶囊
+    let dark = ctx.appearance.desktop_is_dark();
     let fade = dock.show_t;
     if fade <= 0.001 {
         unsafe {
@@ -173,25 +174,25 @@ pub fn render(dock: &mut Dock, ctx: &mut RenderCtx) {
         };
         sf.fill_rrect(&sh, rad + ex as f32 * 0.4, (0.0, 0.0, 0.0, sa_base * alpha));
     }
-    // 纯净 macOS 托盘不透明度
+    // 纯净 macOS 托盘不透明度（深色沉稳曜石灰，浅色柔和磨砂银灰，避免刺眼惨白）
     let op = ctx.appearance.opacity.clamp(0.35, 0.95) * alpha;
     let (top_tint, bot_tint) = if dark {
         // 深色 macOS Dock：纯净曜石深灰，不浑浊不发泥
-        ((0.18, 0.19, 0.22, (op * 0.96).min(0.92)), (0.12, 0.13, 0.16, (op * 1.04).min(0.94)))
+        ((0.14, 0.15, 0.18, (op * 0.94).min(0.88)), (0.09, 0.10, 0.13, (op * 1.00).min(0.92)))
     } else {
-        // 浅色 macOS Dock：经典纯净浅乳白托盘，通透明亮
-        ((0.98, 0.985, 0.995, (op * 1.02).min(0.92)), (0.92, 0.935, 0.96, (op * 0.94).min(0.88)))
+        // 浅色 macOS Dock：克制柔和的浅银灰半透明托盘，清透不刺眼
+        ((0.89, 0.905, 0.93, (op * 0.92).min(0.84)), (0.82, 0.84, 0.88, (op * 0.88).min(0.80)))
     };
     sf.fill_rrect_vgrad(&cap_f, rad, top_tint, bot_tint);
-    // 外极细柔和界线 + 内 1px 亮白高光边（复刻 macOS Dock 立体托盘边缘）
-    sf.stroke_rrect(&cap_f, rad, 1.0, (0.0, 0.0, 0.0, (if dark { 0.42 } else { 0.12 }) * alpha));
+    // 外极细柔和界线 + 内 1px 细腻高光边（复刻 macOS Dock 立体托盘边缘）
+    sf.stroke_rrect(&cap_f, rad, 1.0, (0.0, 0.0, 0.0, (if dark { 0.42 } else { 0.14 }) * alpha));
     let inner = RECT {
         left: cap_f.left + 1,
         top: cap_f.top + 1,
         right: cap_f.right - 1,
         bottom: cap_f.bottom - 1,
     };
-    sf.stroke_rrect(&inner, (rad - 1.0).max(2.0), 1.0, (1.0, 1.0, 1.0, (if dark { 0.20 } else { 0.78 }) * alpha));
+    sf.stroke_rrect(&inner, (rad - 1.0).max(2.0), 1.0, (1.0, 1.0, 1.0, (if dark { 0.16 } else { 0.46 }) * alpha));
 
     // 分隔线（纤细居中，cap_f 已包含 slide 偏移）
     for sx in &dock.layout.separators {

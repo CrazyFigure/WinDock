@@ -146,6 +146,7 @@ impl TopBar {
                 Some(app_ptr as *const _),
             )
             .map_err(crate::win32::error_string)?;
+            let base_rgb = appearance.topbar_base_rgb();
             let mut bar = TopBar {
                 hwnd,
                 dpi: monitor.dpi,
@@ -163,12 +164,12 @@ impl TopBar {
                 drag: None,
                 popover: None,
                 mode: ColorMode::Glass,
-                fused_from: appearance.topbar_base_rgb(),
-                fused_to: appearance.topbar_base_rgb(),
+                fused_from: base_rgb,
+                fused_to: base_rgb,
                 fused_t: 1.0,
                 fused_target: None,
-                cur_fused: appearance.topbar_base_rgb(),
-                dark_text: !appearance.is_dark(),
+                cur_fused: base_rgb,
+                dark_text: base_rgb.use_dark_text(),
                 active_app: "桌面".into(),
                 status: StatusSnapshot::default(),
                 tray_items: Vec::new(),
@@ -188,7 +189,7 @@ impl TopBar {
     fn setup_dwm(&mut self, appearance: &Appearance) {
         use windows::Win32::Graphics::Dwm::*;
         unsafe {
-            let dark: u32 = if appearance.is_dark() { 1 } else { 0 };
+            let dark: u32 = if appearance.desktop_is_dark() { 1 } else { 0 };
             let _ = DwmSetWindowAttribute(self.hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const u32 as *const _, 4);
             let bt = DWMSBT_NONE.0;
             let _ = DwmSetWindowAttribute(self.hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &bt as *const i32 as *const _, 4);
@@ -579,8 +580,11 @@ unsafe extern "system" fn topbar_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             return LRESULT(0);
         }
         WM_SETTINGCHANGE => {
-            // 仅响应系统主题变化，严格忽略 SPI_SETWORKAREA(0x002F) 避免 AppBar 自我触发无限重建闪烁
-            if is_theme_setting_change(lparam.0) {
+            // 仅响应系统主题或壁纸变更，严格忽略 SPI_SETWORKAREA(0x002F) 避免 AppBar 自我触发无限重建闪烁
+            if is_wallpaper_setting_change(wparam.0, lparam.0) {
+                crate::topbar::color_sync::invalidate_wallpaper_cache();
+                crate::app::with_app(hwnd, |app| app.on_theme_changed());
+            } else if is_theme_setting_change(lparam.0) {
                 crate::app::with_app(hwnd, |app| app.on_theme_changed());
             }
             return LRESULT(0);
@@ -597,6 +601,18 @@ pub fn is_theme_setting_change(lparam: isize) -> bool {
     }
     let s = unsafe { windows::core::PCWSTR(lparam as *const u16).to_string().unwrap_or_default() };
     s.eq_ignore_ascii_case("ImmersiveColorSet") || s.eq_ignore_ascii_case("WindowsThemeElement")
+}
+
+/// 判断 WM_SETTINGCHANGE 是否为桌面壁纸切换事件。
+pub fn is_wallpaper_setting_change(wparam: usize, lparam: isize) -> bool {
+    if wparam as u32 == SPI_SETDESKWALLPAPER.0 {
+        return true;
+    }
+    if lparam == 0 {
+        return false;
+    }
+    let s = unsafe { windows::core::PCWSTR(lparam as *const u16).to_string().unwrap_or_default() };
+    s.eq_ignore_ascii_case("Wallpaper") || s.eq_ignore_ascii_case("Control Panel\\Desktop")
 }
 
 #[allow(dead_code)]
