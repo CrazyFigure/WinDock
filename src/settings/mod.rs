@@ -49,9 +49,20 @@ use pages::Row;
 pub const CLASS_SETTINGS: &str = "WinDockFinderSettings";
 const TIMER_TIP: usize = 301;
 const LIST_ROW_DP: f32 = 36.0;
-const DOCK_VISIBLE: usize = 4;
+// Dock 固定项列表默认展示 6 行
+const DOCK_VISIBLE: usize = 6;
 const TRAY_VISIBLE: usize = 4;
 const EXCLUDE_VISIBLE: usize = 3;
+
+/// 返回列表类行控件的可见行数，供高度计算与滚轮边界统一复用。
+fn list_visible(row: &Row) -> usize {
+    match row {
+        Row::DockList => DOCK_VISIBLE,
+        Row::TrayList => TRAY_VISIBLE,
+        Row::Exclude => EXCLUDE_VISIBLE,
+        _ => 0,
+    }
+}
 
 // ---------- 页面 ----------
 
@@ -604,8 +615,10 @@ impl Dlg {
         match row {
             Row::Section(_) => self.px(30.0),
             Row::Info(text) => self.px(22.0) + measure_wrapped_text_height(dc, text, self.font_sub, (width - self.px(32.0)).max(1)),
-            Row::DockList | Row::TrayList => self.px(44.0 + 10.0) + self.px(LIST_ROW_DP) * DOCK_VISIBLE as i32,
-            Row::Exclude => self.px(44.0 + 10.0) + self.px(LIST_ROW_DP) * EXCLUDE_VISIBLE as i32,
+            // 按各自可见行数计算列表容器高度，避免托盘列表受 Dock 行数调整影响
+            Row::DockList | Row::TrayList | Row::Exclude => {
+                self.px(44.0 + 10.0) + self.px(LIST_ROW_DP) * list_visible(row) as i32
+            }
             _ => self.px(44.0),
         }
     }
@@ -1271,6 +1284,8 @@ impl Dlg {
                     items::remove_pinned(&mut di, &id);
                     self.dock_sel = self.dock_sel.saturating_sub(1);
                     app.set_dock_items(di);
+                    // 移除后收紧滚动偏移，避免列表底部出现空白占位
+                    self.dock_scroll = self.dock_scroll.min(app.dock_items.items.len().saturating_sub(DOCK_VISIBLE));
                 }
             }
             Hit::DockAdd => {
@@ -1290,6 +1305,7 @@ impl Dlg {
             Hit::DockReset => {
                 app.set_dock_items(items::seed_items());
                 self.dock_sel = 0;
+                self.dock_scroll = 0;
             }
             Hit::DockRow(i) => {
                 self.dock_sel = i.min(app.dock_items.items.len().saturating_sub(1));
@@ -1367,6 +1383,12 @@ impl Dlg {
             }
         }
         self.dock_sel = j;
+        // 移动选中项超出可视区时同步调整滚动偏移，保持当前项可见
+        if j < self.dock_scroll {
+            self.dock_scroll = j;
+        } else if j >= self.dock_scroll + DOCK_VISIBLE {
+            self.dock_scroll = j + 1 - DOCK_VISIBLE;
+        }
         app.set_dock_items(di);
     }
 
@@ -2296,10 +2318,8 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                                 Row::Exclude => (app.config.topbar.adaptive_color_exclude.len(), &mut dlg.exclude_scroll),
                                 _ => (0, &mut dlg.dock_scroll),
                             };
-                            let visible = match &dlg.rows[ri] {
-                                Row::Exclude => EXCLUDE_VISIBLE,
-                                _ => DOCK_VISIBLE,
-                            };
+                            // 按具体列表类型读取可见行数，避免托盘列表滚轮上限错用 Dock 可见行数
+                            let visible = list_visible(&dlg.rows[ri]);
                             let max = n.saturating_sub(visible) as i32;
                             *cur = (*cur as i32 + step).clamp(0, max) as usize;
                             let _ = InvalidateRect(hwnd, None, false);
@@ -2489,5 +2509,21 @@ mod tests {
         }
         assert!(pages::rows(Page::General).iter().any(|r| matches!(r, Row::Hotkey(Field::HotkeyRestore))));
         assert_eq!(pages::rows(Page::About), vec![Row::About]);
+    }
+
+    #[test]
+    fn dock_list_displays_six_rows_without_affecting_other_lists() {
+        assert_eq!(DOCK_VISIBLE, 6);
+        assert_eq!(list_visible(&Row::DockList), 6);
+        assert_eq!(list_visible(&Row::TrayList), TRAY_VISIBLE);
+        assert_eq!(list_visible(&Row::Exclude), EXCLUDE_VISIBLE);
+
+        let cfg = Config::default();
+        let dlg = Dlg::new(std::ptr::null_mut(), 1.0, &cfg);
+        assert_eq!(dlg.row_height(HDC::default(), &Row::DockList, 600), 54 + 36 * 6);
+        assert_eq!(dlg.row_height(HDC::default(), &Row::TrayList, 600), 54 + 36 * 4);
+        let list = rc(0, 0, 500, 300);
+        assert_eq!(dlg.list_rows(list, 10, 0, DOCK_VISIBLE).len(), 6);
+        assert_eq!(dlg.list_rows(list, 4, 0, DOCK_VISIBLE).len(), 4);
     }
 }
