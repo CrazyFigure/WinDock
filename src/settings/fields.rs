@@ -42,6 +42,7 @@ pub enum Field {
     StBattery,
     FullscreenYield,
     Theme,
+    DockMaterial,
     Opacity,
     DockRadius,
     IconRoundness,
@@ -57,6 +58,7 @@ const DISPLAY_DOCK: Options = &[("primary", "仅主屏"), ("cursor", "跟随鼠�
 const DISPLAY_BAR: Options = &[("primary", "仅主屏"), ("all", "所有屏")];
 const HIDE_MODE: Options = &[("smart_maximized", "智能避让"), ("always", "始终显示"), ("auto", "自动隐藏")];
 const THEME: Options = &[("system", "跟随系统"), ("light", "浅色"), ("dark", "深色")];
+const DOCK_MATERIAL: Options = &[("liquid_glass", "液态玻璃"), ("classic", "经典磨砂")];
 const ROUNDNESS: Options = &[("macos", "圆角"), ("none", "原始")];
 const ACCENT: Options = &[
     ("system", "系统"),
@@ -169,6 +171,7 @@ impl Field {
             Field::StBattery => "电量",
             Field::FullscreenYield => "全屏时自动让位",
             Field::Theme => "主题模式",
+            Field::DockMaterial => "Dock 材质",
             Field::Opacity => "背景不透明度",
             Field::DockRadius => "Dock 圆角",
             Field::IconRoundness => "图标圆角裁切",
@@ -193,6 +196,7 @@ impl Field {
             Field::ColorSpeed => "进入 / 退出最大化时颜色过渡的时长。",
             Field::FullscreenYield => "全屏游戏或视频时隐藏顶部栏与 Dock。",
             Field::ShowWindowPreview => "悬停在运行中的应用图标上时，显示其打开窗口的实时缩略图。",
+            Field::DockMaterial => "液态玻璃：通透光学折射与菲涅尔亮边；经典磨砂：纯净柔和半透明托盘。",
             Field::Opacity => "调节顶部栏壁纸融合通透度与 Dock 托盘不透明度。",
             Field::AccentColor => "自定义控件与高亮强调色，选择首项自动跟随 Windows 主题色。",
             Field::ReduceMotion => "关闭波浪弹簧与显隐滑动动画。",
@@ -340,6 +344,7 @@ impl Field {
             Field::TopbarDisplayMode => (c.topbar.display_mode.clone(), DISPLAY_BAR),
             Field::ClockFormat => (c.topbar.clock_format.clone(), CLOCK),
             Field::Theme => (c.appearance.theme.clone(), THEME),
+            Field::DockMaterial => (c.appearance.dock_material.clone(), DOCK_MATERIAL),
             Field::IconRoundness => (c.appearance.icon_roundness.clone(), ROUNDNESS),
             Field::AccentColor => (c.appearance.accent_color.clone(), ACCENT),
             _ => return None,
@@ -356,6 +361,7 @@ impl Field {
             Field::TopbarDisplayMode => { pick(DISPLAY_BAR).map(|v| c.topbar.display_mode = v); }
             Field::ClockFormat => { pick(CLOCK).map(|v| c.topbar.clock_format = v); }
             Field::Theme => { pick(THEME).map(|v| c.appearance.theme = v); }
+            Field::DockMaterial => { pick(DOCK_MATERIAL).map(|v| c.appearance.dock_material = v); }
             Field::IconRoundness => { pick(ROUNDNESS).map(|v| c.appearance.icon_roundness = v); }
             Field::AccentColor => { pick(ACCENT).map(|v| c.appearance.accent_color = v); }
             Field::TriggerEdge => if let Some(v) = pick_f(TRIGGER_EDGE_OPTS) { c.dock.trigger_edge_px = v.round() as i32; },
@@ -426,5 +432,12 @@ mod tests {
         Field::Opacity.set_choice(&mut cfg, 0);
         assert!((cfg.appearance.opacity - 0.55).abs() < 0.01);
         assert_eq!(Field::Opacity.get_choice(&cfg).map(|(i, _)| i), Some(0));
+
+        assert_eq!(Field::DockMaterial.get_choice(&cfg).map(|(i, _)| i), Some(0));
+        Field::DockMaterial.set_choice(&mut cfg, 1);
+        assert_eq!(cfg.appearance.dock_material, "classic");
+        assert_eq!(Field::DockMaterial.get_choice(&cfg).map(|(i, _)| i), Some(1));
+        Field::DockMaterial.set_from(&mut cfg, &Config::default());
+        assert_eq!(cfg.appearance.dock_material, "liquid_glass");
     }
 }

@@ -162,44 +162,64 @@ pub fn render(dock: &mut Dock, ctx: &mut RenderCtx) {
     // macOS 原生质感圆角托盘：纯净浅乳白/深炭灰柔和半透明层 + 细腻玻璃内光边 + 轻柔双层环境底阴影
     let rad = dock.corner_radius();
     let s_dpi = dock.dpi_scale();
-    // 底部柔和环境阴影（克制不发黑）
-    for (expand_dp, dy_dp, sa_base) in [(4.0f32, 4.5f32, 0.08f32), (1.5f32, 2.0f32, 0.12f32)] {
-        let ex = (expand_dp * s_dpi).round() as i32;
-        let dy = (dy_dp * s_dpi).round() as i32;
-        let sh = RECT {
-            left: cap_f.left - ex,
-            top: cap_f.top + dy,
-            right: cap_f.right + ex,
-            bottom: cap_f.bottom + dy + ex / 2,
-        };
-        sf.fill_rrect(&sh, rad + ex as f32 * 0.4, (0.0, 0.0, 0.0, sa_base * alpha));
-    }
-    // 纯净 macOS 托盘不透明度与背景协调色（轻透不发泥）
-    let op = ctx.appearance.opacity.clamp(0.35, 0.95) * alpha;
-    let (top_a, bot_a) = if dark {
-        ((op * 0.94).min(0.88), (op * 1.00).min(0.92))
+    let is_liquid_glass = ctx.appearance.dock_material == "liquid_glass";
+    // 液态玻璃模式由 SourceConstantAlpha 统一淡入淡出；经典模式沿用像素 alpha 混合
+    let fg_alpha = if is_liquid_glass { 1.0 } else { alpha };
+
+    if is_liquid_glass {
+        let top_col = (top_rgb.r as f32 / 255.0, top_rgb.g as f32 / 255.0, top_rgb.b as f32 / 255.0, 1.0);
+        let bot_col = (bot_rgb.r as f32 / 255.0, bot_rgb.g as f32 / 255.0, bot_rgb.b as f32 / 255.0, 1.0);
+        sf.fill_liquid_glass_capsule(
+            &cap_f,
+            rad,
+            s_dpi,
+            dark,
+            ctx.appearance.opacity,
+            (dock.win_rect.left, dock.win_rect.top),
+            dock.glass_strip.as_ref(),
+            top_col,
+            bot_col,
+        );
     } else {
-        ((op * 0.92).min(0.84), (op * 0.88).min(0.80))
-    };
-    let top_tint = (top_rgb.r as f32 / 255.0, top_rgb.g as f32 / 255.0, top_rgb.b as f32 / 255.0, top_a);
-    let bot_tint = (bot_rgb.r as f32 / 255.0, bot_rgb.g as f32 / 255.0, bot_rgb.b as f32 / 255.0, bot_a);
-    sf.fill_rrect_vgrad(&cap_f, rad, top_tint, bot_tint);
-    // 外极细柔和界线 + 内 1px 细腻高光边（复刻 macOS Dock 立体托盘边缘）
-    sf.stroke_rrect(&cap_f, rad, 1.0, (0.0, 0.0, 0.0, (if dark { 0.42 } else { 0.14 }) * alpha));
-    let inner = RECT {
-        left: cap_f.left + 1,
-        top: cap_f.top + 1,
-        right: cap_f.right - 1,
-        bottom: cap_f.bottom - 1,
-    };
-    sf.stroke_rrect(&inner, (rad - 1.0).max(2.0), 1.0, (1.0, 1.0, 1.0, (if dark { 0.16 } else { 0.46 }) * alpha));
+        // 底部柔和环境阴影（克制不发黑）
+        for (expand_dp, dy_dp, sa_base) in [(4.0f32, 4.5f32, 0.08f32), (1.5f32, 2.0f32, 0.12f32)] {
+            let ex = (expand_dp * s_dpi).round() as i32;
+            let dy = (dy_dp * s_dpi).round() as i32;
+            let sh = RECT {
+                left: cap_f.left - ex,
+                top: cap_f.top + dy,
+                right: cap_f.right + ex,
+                bottom: cap_f.bottom + dy + ex / 2,
+            };
+            sf.fill_rrect(&sh, rad + ex as f32 * 0.4, (0.0, 0.0, 0.0, sa_base * alpha));
+        }
+        // 纯净 macOS 托盘不透明度与背景协调色（轻透不发泥）
+        let op = ctx.appearance.opacity.clamp(0.35, 0.95) * alpha;
+        let (top_a, bot_a) = if dark {
+            ((op * 0.94).min(0.88), (op * 1.00).min(0.92))
+        } else {
+            ((op * 0.92).min(0.84), (op * 0.88).min(0.80))
+        };
+        let top_tint = (top_rgb.r as f32 / 255.0, top_rgb.g as f32 / 255.0, top_rgb.b as f32 / 255.0, top_a);
+        let bot_tint = (bot_rgb.r as f32 / 255.0, bot_rgb.g as f32 / 255.0, bot_rgb.b as f32 / 255.0, bot_a);
+        sf.fill_rrect_vgrad(&cap_f, rad, top_tint, bot_tint);
+        // 外极细柔和界线 + 内 1px 细腻高光边（复刻 macOS Dock 立体托盘边缘）
+        sf.stroke_rrect(&cap_f, rad, 1.0, (0.0, 0.0, 0.0, (if dark { 0.42 } else { 0.14 }) * alpha));
+        let inner = RECT {
+            left: cap_f.left + 1,
+            top: cap_f.top + 1,
+            right: cap_f.right - 1,
+            bottom: cap_f.bottom - 1,
+        };
+        sf.stroke_rrect(&inner, (rad - 1.0).max(2.0), 1.0, (1.0, 1.0, 1.0, (if dark { 0.16 } else { 0.46 }) * alpha));
+    }
 
     // 分隔线（纤细居中，cap_f 已包含 slide 偏移）
     for sx in &dock.layout.separators {
         let x = cap.left as f32 + sx + 0.5;
         let y0 = cap_f.top as f32 + dock.capsule_h() * 0.20;
         let y1 = cap_f.bottom as f32 - dock.capsule_h() * 0.20;
-        let sep_col = if dark { (1.0, 1.0, 1.0, 0.22 * alpha) } else { (0.0, 0.0, 0.0, 0.18 * alpha) };
+        let sep_col = if dark { (1.0, 1.0, 1.0, 0.24 * fg_alpha) } else { (0.0, 0.0, 0.0, 0.20 * fg_alpha) };
         sf.thick_line(x, y0, x, y1, (1.0 * s_dpi).max(1.0), sep_col);
     }
 
@@ -239,7 +259,7 @@ pub fn render(dock: &mut Dock, ctx: &mut RenderCtx) {
         // 精致 macOS 运行指示点（浅色底深灰点，深色底纯白点）
         if ctx.cfg.show_running_dot && dock.entry_is_running(i) {
             let dy = cap_f.bottom as f32 - (4.5 * s_dpi);
-            let dot_col = if dark { (1.0, 1.0, 1.0, 0.92 * alpha) } else { (0.16, 0.16, 0.18, 0.85 * alpha) };
+            let dot_col = if dark { (1.0, 1.0, 1.0, 0.94 * fg_alpha) } else { (0.14, 0.14, 0.16, 0.88 * fg_alpha) };
             sf.fill_circle(cx, dy, (2.1 * s_dpi).max(1.8), dot_col);
         }
         // 拖拽悬停在回收站上的柔和红环反馈
@@ -251,7 +271,7 @@ pub fn render(dock: &mut Dock, ctx: &mut RenderCtx) {
                     right: (cx + slot.size * 0.56) as i32,
                     bottom: (cy + slot.size * 0.56) as i32,
                 };
-                sf.stroke_rrect(&hl, slot.size * 0.28, 2.0, (1.0, 0.27, 0.23, 0.92 * alpha));
+                sf.stroke_rrect(&hl, slot.size * 0.28, 2.0, (1.0, 0.27, 0.23, 0.92 * fg_alpha));
             }
         }
     }
@@ -297,12 +317,25 @@ pub fn render(dock: &mut Dock, ctx: &mut RenderCtx) {
                 right: box_r.right,
                 bottom: box_r.bottom + 4,
             };
-            let bg = if dark { rgb(0x23252A, 0.92 * alpha) } else { rgb(0xF6F7FA, 0.94 * alpha) };
-            let fg = if dark { rgb(0xF5F5F7, 0.98 * alpha) } else { rgb(0x1D1D1F, 0.96 * alpha) };
-            let bd = if dark { (1.0, 1.0, 1.0, 0.16 * alpha) } else { (0.0, 0.0, 0.0, 0.12 * alpha) };
-            sf.fill_rrect(&shadow, tip_rad, (0.0, 0.0, 0.0, 0.22 * alpha));
+            let bg = if dark {
+                rgb(0x23252A, (if is_liquid_glass { 0.84 } else { 0.92 }) * fg_alpha)
+            } else {
+                rgb(0xF6F7FA, (if is_liquid_glass { 0.88 } else { 0.94 }) * fg_alpha)
+            };
+            let fg = if dark { rgb(0xF5F5F7, 0.98 * fg_alpha) } else { rgb(0x1D1D1F, 0.96 * fg_alpha) };
+            let bd = if dark { (1.0, 1.0, 1.0, (if is_liquid_glass { 0.28 } else { 0.16 }) * fg_alpha) } else { (0.0, 0.0, 0.0, 0.12 * fg_alpha) };
+            sf.fill_rrect(&shadow, tip_rad, (0.0, 0.0, 0.0, 0.22 * fg_alpha));
             sf.fill_rrect(&box_r, tip_rad, bg);
             sf.stroke_rrect(&box_r, tip_rad, 1.0, bd);
+            if is_liquid_glass && !dark {
+                let inner_tip = RECT {
+                    left: box_r.left + 1,
+                    top: box_r.top + 1,
+                    right: box_r.right - 1,
+                    bottom: box_r.bottom - 1,
+                };
+                sf.stroke_rrect(&inner_tip, (tip_rad - 1.0).max(2.0), 1.0, (1.0, 1.0, 1.0, 0.55 * fg_alpha));
+            }
             // 底部居中指向小三角
             let ax = cx.clamp(box_r.left as f32 + tip_rad, box_r.right as f32 - tip_rad);
             let ay = box_r.bottom as f32 - 1.0;

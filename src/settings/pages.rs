@@ -97,6 +97,7 @@ pub fn rows(page: Page) -> Vec<Row> {
             Row::Choice(Field::Theme),
             Row::Choice(Field::Opacity),
             Row::Section("Dock 胶囊"),
+            Row::Choice(Field::DockMaterial),
             Row::Choice(Field::DockRadius),
             Row::Section("强调色与动效"),
             Row::Choice(Field::AccentColor),

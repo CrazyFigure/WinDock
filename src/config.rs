@@ -219,6 +219,8 @@ impl TopbarCfg {
 pub struct Appearance {
     /// system | light | dark
     pub theme: String,
+    /// liquid_glass | classic
+    pub dock_material: String,
     pub opacity: f32,
     pub dock_corner_radius_dp: i32,
     /// macos | none
@@ -232,6 +234,8 @@ impl Default for Appearance {
     fn default() -> Self {
         Self {
             theme: "system".into(),
+            // 默认启用光学液态玻璃材质，保留清晰折射与通透高光边
+            dock_material: "liquid_glass".into(),
             opacity: 0.78,
             dock_corner_radius_dp: 15,
             icon_roundness: "macos".into(),
@@ -245,6 +249,9 @@ impl Appearance {
     pub fn normalized(mut self) -> Self {
         if !matches!(self.theme.as_str(), "system" | "light" | "dark") {
             self.theme = "system".into();
+        }
+        if !matches!(self.dock_material.as_str(), "liquid_glass" | "classic") {
+            self.dock_material = "liquid_glass".into();
         }
         if !self.opacity.is_finite() {
             self.opacity = 0.78;
@@ -586,7 +593,21 @@ mod tests {
         assert!(c.dock.show_window_preview);
         assert!(c.topbar.has_status("brightness"));
         assert!(!c.general.startup_initialized);
+        assert_eq!(c.appearance.dock_material, "liquid_glass");
         assert_eq!(c.schema_version, SCHEMA_VERSION);
+
+        let invalid_mat = serde_json::from_str::<Config>(
+            r#"{"appearance":{"dock_material":"unknown"}}"#,
+        )
+        .unwrap()
+        .normalized();
+        assert_eq!(invalid_mat.appearance.dock_material, "liquid_glass");
+        let classic = serde_json::from_str::<Config>(
+            r#"{"appearance":{"dock_material":"classic"}}"#,
+        )
+        .unwrap()
+        .normalized();
+        assert_eq!(classic.appearance.dock_material, "classic");
     }
 
     #[test]

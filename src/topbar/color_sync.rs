@@ -413,44 +413,370 @@ fn collect_strip_pixels(roots: &[HWND], rect: RECT, max_cols: i32, max_rows: i32
     }
 }
 
-/// 采集 Dock 背后应用窗口的实时主色（无背后外部应用窗口时返回 None，以便降级系统主题）。
-///
-/// - Dock 隐藏期间直接采样正后方胶囊区域（零误差）；
-/// - Dock 可见期间优先采样窗口左右紧邻侧翼及紧上方窄条带，彻底避免自采样黑化正反馈环路。
-pub fn sample_dock_backdrop(cap_screen: RECT, dock_win_rect: RECT, mon_rect: RECT, dock_visible: bool) -> Option<Rgb> {
-    let roots = crate::monitor::dock_backdrop_windows(cap_screen);
-    if roots.is_empty() {
+/// Dock 液态玻璃背景条带（低分辨率双层预烘焙：柔焦主体层 + 边缘折射微锐层，严格控制常驻内存）。
+#[derive(Clone, Debug)]
+pub struct DockGlassStrip {
+    pub screen_rect: RECT,
+    pub w: i32,
+    pub h: i32,
+    /// 主模糊层（0xFFRRGGBB），供玻璃主体透射
+    pub blur_bgra: Vec<u32>,
+    /// 轻模糊微锐层（0xFFRRGGBB），供玻璃曲率边缘产生折射弯曲与色散
+    pub refract_bgra: Vec<u32>,
+}
+
+impl DockGlassStrip {
+    /// 目标网格尺寸（2× 降采样并封顶，单条带约 50~150 KB）。
+    pub fn target_grid_size(rect: RECT) -> (usize, usize) {
+        let rw = (rect.right - rect.left).max(16);
+        let rh = (rect.bottom - rect.top).max(8);
+        let w = (rw / 2).clamp(96, 480) as usize;
+        let h = (rh / 2).clamp(24, 64) as usize;
+        (w, h)
+    }
+}
+
+/// 抓取指定屏幕区域到临时 Vec<u32>（仅在有外部窗口遮挡时按需调用，用完即释放）。
+fn capture_screen_bgra(rect: RECT) -> Option<(i32, i32, Vec<u32>)> {
+    let w = (rect.right - rect.left).clamp(0, 4096);
+    let h = (rect.bottom - rect.top).clamp(0, 512);
+    if w < 4 || h < 2 {
         return None;
     }
-    let mut pixels = Vec::with_capacity(256);
-    if !dock_visible {
-        collect_strip_pixels(&roots, cap_screen, 28, 5, &mut pixels);
-    } else {
-        let left_flank = RECT {
-            left: (dock_win_rect.left - 96).max(mon_rect.left),
-            top: cap_screen.top,
-            right: (dock_win_rect.left - 4).max(mon_rect.left),
-            bottom: cap_screen.bottom,
+    unsafe {
+        let (hdc, bmp, old, ptr) = dib_section(w, h)?;
+        let screen = GetDC(None);
+        if screen.is_invalid() {
+            let _ = SelectObject(hdc, old);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(hdc);
+            return None;
+        }
+        let ok = BitBlt(hdc, 0, 0, w, h, screen, rect.left, rect.top, SRCCOPY).is_ok();
+        ReleaseDC(None, screen);
+        let _ = GdiFlush();
+        let out = if ok {
+            let slice = std::slice::from_raw_parts(ptr as *const u32, (w * h) as usize);
+            Some((w, h, slice.to_vec()))
+        } else {
+            None
         };
-        let right_flank = RECT {
-            left: (dock_win_rect.right + 4).min(mon_rect.right),
-            top: cap_screen.top,
-            right: (dock_win_rect.right + 96).min(mon_rect.right),
-            bottom: cap_screen.bottom,
-        };
-        collect_strip_pixels(&roots, left_flank, 14, 4, &mut pixels);
-        collect_strip_pixels(&roots, right_flank, 14, 4, &mut pixels);
-        if pixels.len() < 12 {
-            let above_strip = RECT {
-                left: cap_screen.left.max(mon_rect.left),
-                top: (dock_win_rect.top - 14).max(mon_rect.top),
-                right: cap_screen.right.min(mon_rect.right),
-                bottom: (dock_win_rect.top - 2).max(mon_rect.top),
-            };
-            collect_strip_pixels(&roots, above_strip, 24, 3, &mut pixels);
+        let _ = SelectObject(hdc, old);
+        let _ = DeleteObject(HGDIOBJ(bmp.0));
+        let _ = DeleteDC(hdc);
+        out
+    }
+}
+
+/// 将线性 RGB 缓冲打包为带微饱和度增强的 `DockGlassStrip`（避免模糊后灰暗失真）。
+fn build_dock_glass_from_linear(
+    screen_rect: RECT,
+    gw: usize,
+    gh: usize,
+    raw_lin: Vec<[f32; 3]>,
+) -> DockGlassStrip {
+    let total = gw * gh;
+    let mut refract_lin = raw_lin.clone();
+    let mut blur_lin = raw_lin;
+    // 边缘折射层仅做轻微柔化，保留桌面/窗口光影轮廓以便边缘曲率弯折
+    separable_box_blur_3x(&mut refract_lin, gw, gh, 2, 1);
+    // 主体模糊层采用中大半径三遍盒式模糊，呈现顺滑通透的液态玻璃质感
+    separable_box_blur_3x(&mut blur_lin, gw, gh, 8, 4);
+
+    let mut refract_bgra = Vec::with_capacity(total);
+    let mut blur_bgra = Vec::with_capacity(total);
+
+    let encode_vivid = |lin: [f32; 3]| -> u32 {
+        let srgb = [
+            linear_to_srgb(lin[0]),
+            linear_to_srgb(lin[1]),
+            linear_to_srgb(lin[2]),
+        ];
+        // 轻量色彩保鲜，避免模糊后色彩发泥
+        let vib = boost_vibrancy_srgb(srgb, 1.18);
+        let rgb = Rgb::new(
+            (vib[0] * 255.0).round().clamp(0.0, 255.0) as u8,
+            (vib[1] * 255.0).round().clamp(0.0, 255.0) as u8,
+            (vib[2] * 255.0).round().clamp(0.0, 255.0) as u8,
+        );
+        pack_opaque_rgb(rgb)
+    };
+
+    for i in 0..total {
+        refract_bgra.push(encode_vivid(refract_lin[i]));
+        blur_bgra.push(encode_vivid(blur_lin[i]));
+    }
+
+    DockGlassStrip {
+        screen_rect,
+        w: gw as i32,
+        h: gh as i32,
+        blur_bgra,
+        refract_bgra,
+    }
+}
+
+/// 将 32bpp 抓屏缓冲降采样为线性 RGB 网格，并用最近/边界夹紧映射填满 `(gw, gh)`。
+fn downsample_bgra_to_linear(src: &[u32], sw: i32, sh: i32, gw: usize, gh: usize) -> Vec<[f32; 3]> {
+    let mut out = vec![[0.0f32; 3]; gw * gh];
+    let swu = sw.max(1) as usize;
+    let shu = sh.max(1) as usize;
+    for y in 0..gh {
+        let sy0 = (y * shu) / gh;
+        let sy1 = (((y + 1) * shu) / gh).max(sy0 + 1).min(shu);
+        for x in 0..gw {
+            let sx0 = (x * swu) / gw;
+            let sx1 = (((x + 1) * swu) / gw).max(sx0 + 1).min(swu);
+            let mut acc = [0.0f32; 3];
+            let mut cnt = 0.0f32;
+            for sy in sy0..sy1 {
+                let row = sy * swu;
+                for sx in sx0..sx1 {
+                    let p = src[row + sx];
+                    acc[0] += srgb_to_linear(((p >> 16) & 0xFF) as f32 / 255.0);
+                    acc[1] += srgb_to_linear(((p >> 8) & 0xFF) as f32 / 255.0);
+                    acc[2] += srgb_to_linear((p & 0xFF) as f32 / 255.0);
+                    cnt += 1.0;
+                }
+            }
+            let inv = 1.0 / cnt.max(1.0);
+            out[y * gw + x] = [acc[0] * inv, acc[1] * inv, acc[2] * inv];
         }
     }
-    dominant_bgra_color(&pixels, 12).or_else(|| dwm_window_color_hint(roots[0]))
+    out
+}
+
+/// 在 Dock 可见且背后存在应用窗口时，通过无自遮挡外围环带（上方窄条 + 左右侧翼）重构连续线性背景网格。
+fn reconstruct_window_backdrop_linear(
+    roots: &[HWND],
+    zone_rect: RECT,
+    cap_screen: RECT,
+    dock_win_rect: RECT,
+    mon_rect: RECT,
+    gw: usize,
+    gh: usize,
+    above_y_hint: Option<i32>,
+    fallback_lin: &[[f32; 3]],
+) -> Vec<[f32; 3]> {
+    let mut grid = fallback_lin.to_vec();
+    let zw = (zone_rect.right - zone_rect.left).max(1);
+    let zh = (zone_rect.bottom - zone_rect.top).max(1);
+
+    // 1. 优先采紧贴胶囊或窗口顶部的未遮挡上方条带，还原列向分布（如侧栏/内容区明暗分割）
+    let above_bottom = above_y_hint
+        .unwrap_or(dock_win_rect.top - 2)
+        .min(dock_win_rect.top - 2)
+        .max(mon_rect.top + 4);
+    let above_rect = RECT {
+        left: zone_rect.left.max(mon_rect.left),
+        top: (above_bottom - 14).max(mon_rect.top),
+        right: zone_rect.right.min(mon_rect.right),
+        bottom: above_bottom,
+    };
+    let mut col_hit = vec![false; gw];
+    let mut col_lin = vec![[0.0f32; 3]; gw];
+    if let Some((aw, ah, a_buf)) = capture_screen_bgra(above_rect) {
+        let mut any_col = false;
+        for gx in 0..gw {
+            let sx = zone_rect.left + ((gx as f32 + 0.5) / gw as f32 * zw as f32) as i32;
+            let ax = (sx - above_rect.left).clamp(0, aw - 1);
+            let mut acc = [0.0f32; 3];
+            let mut cnt = 0.0f32;
+            for ay in (0..ah).step_by(2) {
+                if unsafe { point_belongs_to_any(roots, above_rect.left + ax, above_rect.top + ay) } {
+                    let p = a_buf[(ay * aw + ax) as usize];
+                    acc[0] += srgb_to_linear(((p >> 16) & 0xFF) as f32 / 255.0);
+                    acc[1] += srgb_to_linear(((p >> 8) & 0xFF) as f32 / 255.0);
+                    acc[2] += srgb_to_linear((p & 0xFF) as f32 / 255.0);
+                    cnt += 1.0;
+                }
+            }
+            if cnt > 0.0 {
+                let inv = 1.0 / cnt;
+                col_hit[gx] = true;
+                col_lin[gx] = [acc[0] * inv, acc[1] * inv, acc[2] * inv];
+                any_col = true;
+            }
+        }
+        // 将相邻命中列平滑填充进少量缺口，保持左右色带自然衔接
+        if any_col {
+            for gx in 0..gw {
+                if col_hit[gx] {
+                    for gy in 0..gh {
+                        grid[gy * gw + gx] = col_lin[gx];
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. 采左右侧翼在胶囊对应高度处的行向颜色，向内渐变融合
+    let flank_rects = [
+        (
+            true,
+            RECT {
+                left: (dock_win_rect.left - 72).max(mon_rect.left),
+                top: zone_rect.top.max(mon_rect.top),
+                right: (dock_win_rect.left - 4).max(mon_rect.left),
+                bottom: zone_rect.bottom.min(mon_rect.bottom),
+            },
+        ),
+        (
+            false,
+            RECT {
+                left: (dock_win_rect.right + 4).min(mon_rect.right),
+                top: zone_rect.top.max(mon_rect.top),
+                right: (dock_win_rect.right + 72).min(mon_rect.right),
+                bottom: zone_rect.bottom.min(mon_rect.bottom),
+            },
+        ),
+    ];
+    for (is_left, frect) in flank_rects {
+        let Some((fw, fh, f_buf)) = capture_screen_bgra(frect) else { continue };
+        for gy in 0..gh {
+            let sy = zone_rect.top + ((gy as f32 + 0.5) / gh as f32 * zh as f32) as i32;
+            let fy = (sy - frect.top).clamp(0, fh - 1);
+            let mut acc = [0.0f32; 3];
+            let mut cnt = 0.0f32;
+            let step = (fw / 8).max(1);
+            let mut fx = 0;
+            while fx < fw {
+                if unsafe { point_belongs_to_any(roots, frect.left + fx, frect.top + fy) } {
+                    let p = f_buf[(fy * fw + fx) as usize];
+                    acc[0] += srgb_to_linear(((p >> 16) & 0xFF) as f32 / 255.0);
+                    acc[1] += srgb_to_linear(((p >> 8) & 0xFF) as f32 / 255.0);
+                    acc[2] += srgb_to_linear((p & 0xFF) as f32 / 255.0);
+                    cnt += 1.0;
+                }
+                fx += step;
+            }
+            if cnt > 0.0 {
+                let edge_c = [acc[0] / cnt, acc[1] / cnt, acc[2] / cnt];
+                let reach = (gw / 4).max(8);
+                for dx in 0..reach {
+                    let gx = if is_left { dx } else { gw - 1 - dx };
+                    let t = (1.0 - dx as f32 / reach as f32) * (if col_hit[gx] { 0.45 } else { 0.92 });
+                    let dst = &mut grid[gy * gw + gx];
+                    dst[0] = dst[0] * (1.0 - t) + edge_c[0] * t;
+                    dst[1] = dst[1] * (1.0 - t) + edge_c[1] * t;
+                    dst[2] = dst[2] * (1.0 - t) + edge_c[2] * t;
+                }
+            }
+        }
+    }
+    let _ = cap_screen;
+    grid
+}
+
+/// 单次统一采集 Dock 背后主色与（可选）液态玻璃双层预烘焙条带。
+///
+/// - 纯桌面态零抓屏开销：直接复用缓存的显示器底部壁纸几何映射；
+/// - 隐藏态弹出首帧：单次小区域 `BitBlt` 同时提取主色与精确玻璃背景（零自遮挡）；
+/// - 可见态被应用窗遮挡：仅采样外围侧翼与上方窄条，彻底杜绝自采样循环。
+pub fn sample_dock_backdrop_bundle(
+    zone_rect: RECT,
+    cap_screen: RECT,
+    dock_win_rect: RECT,
+    mon_rect: RECT,
+    dock_visible: bool,
+    need_glass: bool,
+    above_y_hint: Option<i32>,
+) -> (Option<Rgb>, Option<DockGlassStrip>) {
+    let clamped_zone = RECT {
+        left: zone_rect.left.max(mon_rect.left),
+        top: zone_rect.top.max(mon_rect.top),
+        right: zone_rect.right.min(mon_rect.right),
+        bottom: zone_rect.bottom.min(mon_rect.bottom),
+    };
+    let roots = crate::monitor::dock_backdrop_windows(cap_screen);
+    if roots.is_empty() {
+        let glass = if need_glass {
+            Some(dock_wallpaper_glass_strip(mon_rect, clamped_zone))
+        } else {
+            None
+        };
+        return (None, glass);
+    }
+
+    let mut pixels = Vec::with_capacity(256);
+    if !dock_visible {
+        // Dock 尚未显示：单次局部抓屏同时提取背后窗口主色与完整玻璃条带
+        if let Some((zw, zh, z_buf)) = capture_screen_bgra(clamped_zone) {
+            let max_cols = 28i32;
+            let max_rows = 5i32;
+            let cw = (cap_screen.right - cap_screen.left).max(1);
+            let ch = (cap_screen.bottom - cap_screen.top).max(1);
+            let step_x = (cw / max_cols).max(1);
+            let step_y = (ch / max_rows).max(1);
+            let mut sy = cap_screen.top + step_y / 2;
+            while sy < cap_screen.bottom {
+                let mut sx = cap_screen.left + step_x / 2;
+                while sx < cap_screen.right {
+                    if unsafe { point_belongs_to_any(&roots, sx, sy) } {
+                        let lx = (sx - clamped_zone.left).clamp(0, zw - 1);
+                        let ly = (sy - clamped_zone.top).clamp(0, zh - 1);
+                        pixels.push(z_buf[(ly * zw + lx) as usize]);
+                    }
+                    sx += step_x;
+                }
+                sy += step_y;
+            }
+            let dom = dominant_bgra_color(&pixels, 12).or_else(|| dwm_window_color_hint(roots[0]));
+            let glass = if need_glass {
+                let (gw, gh) = DockGlassStrip::target_grid_size(clamped_zone);
+                let lin = downsample_bgra_to_linear(&z_buf, zw, zh, gw, gh);
+                Some(build_dock_glass_from_linear(clamped_zone, gw, gh, lin))
+            } else {
+                None
+            };
+            return (dom, glass);
+        }
+    }
+
+    // Dock 已显示：采样左右侧翼 + 上方窄条（零自遮挡）
+    let left_flank = RECT {
+        left: (dock_win_rect.left - 96).max(mon_rect.left),
+        top: cap_screen.top,
+        right: (dock_win_rect.left - 4).max(mon_rect.left),
+        bottom: cap_screen.bottom,
+    };
+    let right_flank = RECT {
+        left: (dock_win_rect.right + 4).min(mon_rect.right),
+        top: cap_screen.top,
+        right: (dock_win_rect.right + 96).min(mon_rect.right),
+        bottom: cap_screen.bottom,
+    };
+    collect_strip_pixels(&roots, left_flank, 14, 4, &mut pixels);
+    collect_strip_pixels(&roots, right_flank, 14, 4, &mut pixels);
+    if pixels.len() < 12 {
+        let above_strip = RECT {
+            left: cap_screen.left.max(mon_rect.left),
+            top: (dock_win_rect.top - 14).max(mon_rect.top),
+            right: cap_screen.right.min(mon_rect.right),
+            bottom: (dock_win_rect.top - 2).max(mon_rect.top),
+        };
+        collect_strip_pixels(&roots, above_strip, 24, 3, &mut pixels);
+    }
+    let dom = dominant_bgra_color(&pixels, 12).or_else(|| dwm_window_color_hint(roots[0]));
+    let glass = if need_glass {
+        let (gw, gh) = DockGlassStrip::target_grid_size(clamped_zone);
+        let fallback_lin = dock_wallpaper_zone_linear(mon_rect, clamped_zone, gw, gh);
+        let lin = reconstruct_window_backdrop_linear(
+            &roots,
+            clamped_zone,
+            cap_screen,
+            dock_win_rect,
+            mon_rect,
+            gw,
+            gh,
+            above_y_hint,
+            &fallback_lin,
+        );
+        Some(build_dock_glass_from_linear(clamped_zone, gw, gh, lin))
+    } else {
+        None
+    };
+    (dom, glass)
 }
 
 /// 根据背后色彩或回退策略生成和谐的 Dock 胶囊明暗极性与上下渐变 RGB（含防抖滞回区间）。
@@ -912,8 +1238,25 @@ struct CachedWallpaper {
     palette: DesktopPalette,
 }
 
+#[derive(Clone, Debug)]
+struct CachedDockBand {
+    mon_rect: (i32, i32, i32, i32),
+    virt_rect: (i32, i32, i32, i32),
+    path: String,
+    mtime: Option<SystemTime>,
+    file_len: u64,
+    pos: WallpaperPosition,
+    bg_rgb: Rgb,
+    band_top_rel: f32,
+    band_h: f32,
+    w: usize,
+    h: usize,
+    raw_lin: Vec<[f32; 3]>,
+}
+
 static WALLPAPER_CACHE: OnceLock<Mutex<Option<CachedWallpaper>>> = OnceLock::new();
 static STRIP_CACHE: OnceLock<Mutex<Vec<CachedLinearStrip>>> = OnceLock::new();
+static DOCK_BAND_CACHE: OnceLock<Mutex<Vec<CachedDockBand>>> = OnceLock::new();
 static LAST_WALLPAPER_SIG: OnceLock<Mutex<u64>> = OnceLock::new();
 
 /// 清空桌面壁纸采样与顶栏条带缓存（系统广播壁纸变更时调用）。
@@ -922,6 +1265,9 @@ pub fn invalidate_wallpaper_cache() {
         *lock.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
     if let Some(lock) = STRIP_CACHE.get() {
+        lock.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+    if let Some(lock) = DOCK_BAND_CACHE.get() {
         lock.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
@@ -1141,6 +1487,61 @@ fn decode_scaled_wallpaper(path: &str, max_dim: u32) -> Option<(u32, u32, u32, u
     }
 }
 
+/// 在已解码的 BGRA 壁纸上按归一化 UV 做线性空间双线性采样。
+fn sample_decoded_wallpaper_lin(img: &(u32, u32, u32, u32, Vec<u8>), u: f32, v: f32) -> [f32; 3] {
+    let (sw, sh, _, _, ref px) = *img;
+    let fx = (u * (sw - 1) as f32).clamp(0.0, (sw - 1) as f32);
+    let fy = (v * (sh - 1) as f32).clamp(0.0, (sh - 1) as f32);
+    let x0 = fx.floor() as usize;
+    let y0 = fy.floor() as usize;
+    let x1 = (x0 + 1).min(sw as usize - 1);
+    let y1 = (y0 + 1).min(sh as usize - 1);
+    let tx = fx - x0 as f32;
+    let ty = fy - y0 as f32;
+    let get = |x: usize, y: usize| -> [f32; 3] {
+        let off = (y * sw as usize + x) * 4;
+        rgb_to_linear([
+            px[off + 2] as f32 / 255.0,
+            px[off + 1] as f32 / 255.0,
+            px[off] as f32 / 255.0,
+        ])
+    };
+    let p00 = get(x0, y0);
+    let p10 = get(x1, y0);
+    let p01 = get(x0, y1);
+    let p11 = get(x1, y1);
+    let w00 = (1.0 - tx) * (1.0 - ty);
+    let w10 = tx * (1.0 - ty);
+    let w01 = (1.0 - tx) * ty;
+    let w11 = tx * ty;
+    [
+        p00[0] * w00 + p10[0] * w10 + p01[0] * w01 + p11[0] * w11,
+        p00[1] * w00 + p10[1] * w10 + p01[1] * w01 + p11[1] * w11,
+        p00[2] * w00 + p10[2] * w10 + p01[2] * w01 + p11[2] * w11,
+    ]
+}
+
+/// 构造显示器底部的壁纸铺设布局参数。
+fn make_wallpaper_layout(
+    mon_rect: RECT,
+    virt_rect: RECT,
+    orig_w: u32,
+    orig_h: u32,
+    pos: WallpaperPosition,
+) -> WallpaperLayout {
+    WallpaperLayout {
+        mon_w: (mon_rect.right - mon_rect.left).max(1) as f32,
+        mon_h: (mon_rect.bottom - mon_rect.top).max(1) as f32,
+        virt_ox: (mon_rect.left - virt_rect.left) as f32,
+        virt_oy: (mon_rect.top - virt_rect.top) as f32,
+        virt_w: (virt_rect.right - virt_rect.left).max(1) as f32,
+        virt_h: (virt_rect.bottom - virt_rect.top).max(1) as f32,
+        orig_w: orig_w as f32,
+        orig_h: orig_h as f32,
+        pos,
+    }
+}
+
 /// 从已解码壁纸中按屏幕几何映射截取顶部条带，并在线性 RGB 空间执行宽半径高斯模糊。
 fn build_blurred_strip(
     img: Option<(u32, u32, u32, u32, Vec<u8>)>,
@@ -1157,7 +1558,7 @@ fn build_blurred_strip(
     let bg_srgb = [bg_rgb.r as f32 / 255.0, bg_rgb.g as f32 / 255.0, bg_rgb.b as f32 / 255.0];
     let bg_lin = rgb_to_linear(bg_srgb);
 
-    let Some((sw, sh, orig_w, orig_h, px)) = img else {
+    let Some(img) = img else {
         let luma = linear_luminance(bg_lin);
         return CachedLinearStrip {
             key,
@@ -1171,50 +1572,8 @@ fn build_blurred_strip(
 
     let mon_w = (mon_rect.right - mon_rect.left).max(1) as f32;
     let mon_h = (mon_rect.bottom - mon_rect.top).max(1) as f32;
-    let layout = WallpaperLayout {
-        mon_w,
-        mon_h,
-        virt_ox: (mon_rect.left - virt_rect.left) as f32,
-        virt_oy: (mon_rect.top - virt_rect.top) as f32,
-        virt_w: (virt_rect.right - virt_rect.left).max(1) as f32,
-        virt_h: (virt_rect.bottom - virt_rect.top).max(1) as f32,
-        orig_w: orig_w as f32,
-        orig_h: orig_h as f32,
-        pos,
-    };
+    let layout = make_wallpaper_layout(mon_rect, virt_rect, img.2, img.3, pos);
     let bar_hf = bar_h.max(12) as f32;
-
-    let sample_bilinear_lin = |u: f32, v: f32| -> [f32; 3] {
-        let fx = (u * (sw - 1) as f32).clamp(0.0, (sw - 1) as f32);
-        let fy = (v * (sh - 1) as f32).clamp(0.0, (sh - 1) as f32);
-        let x0 = fx.floor() as usize;
-        let y0 = fy.floor() as usize;
-        let x1 = (x0 + 1).min(sw as usize - 1);
-        let y1 = (y0 + 1).min(sh as usize - 1);
-        let tx = fx - x0 as f32;
-        let ty = fy - y0 as f32;
-        let get = |x: usize, y: usize| -> [f32; 3] {
-            let off = (y * sw as usize + x) * 4;
-            rgb_to_linear([
-                px[off + 2] as f32 / 255.0,
-                px[off + 1] as f32 / 255.0,
-                px[off] as f32 / 255.0,
-            ])
-        };
-        let p00 = get(x0, y0);
-        let p10 = get(x1, y0);
-        let p01 = get(x0, y1);
-        let p11 = get(x1, y1);
-        let w00 = (1.0 - tx) * (1.0 - ty);
-        let w10 = tx * (1.0 - ty);
-        let w01 = (1.0 - tx) * ty;
-        let w11 = tx * ty;
-        [
-            p00[0] * w00 + p10[0] * w10 + p01[0] * w01 + p11[0] * w11,
-            p00[1] * w00 + p10[1] * w10 + p01[1] * w01 + p11[1] * w11,
-            p00[2] * w00 + p10[2] * w10 + p01[2] * w01 + p11[2] * w11,
-        ]
-    };
 
     // 多采样 y = 0..1.5*bar_h，让底部边界在垂直模糊时自然衔接到下方壁纸
     let mut lin_grid = vec![[0.0f32; 3]; STRIP_W * BLUR_H];
@@ -1223,7 +1582,7 @@ fn build_blurred_strip(
         for col in 0..STRIP_W {
             let sx_rel = (col as f32 + 0.5) / STRIP_W as f32 * mon_w;
             let c = match map_monitor_strip_uv(sx_rel, sy_rel, &layout) {
-                Some((u, v)) => sample_bilinear_lin(u, v),
+                Some((u, v)) => sample_decoded_wallpaper_lin(&img, u, v),
                 None => bg_lin,
             };
             lin_grid[row * STRIP_W + col] = c;
@@ -1355,6 +1714,131 @@ pub fn desktop_topbar_backdrop(
         strip_h: cached.strip_h,
         strip_bgra,
     }
+}
+
+/// 获取或构建显示器底部的缓存壁纸线性色带（280×44，约 147KB，Dock 扩缩或偏移变更零图像解码开销）。
+fn cached_dock_wallpaper_band(mon_rect: RECT) -> CachedDockBand {
+    const BAND_W: usize = 280;
+    const BAND_H: usize = 44;
+    let virt_rect = virtual_desktop_rect(mon_rect);
+    let (path, pos, bg_rgb) = query_monitor_wallpaper(mon_rect);
+    let (mtime, file_len) = file_meta(&path);
+    let mon_key = (mon_rect.left, mon_rect.top, mon_rect.right, mon_rect.bottom);
+    let virt_key = (virt_rect.left, virt_rect.top, virt_rect.right, virt_rect.bottom);
+
+    let cache = DOCK_BAND_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = guard.iter().find(|c| {
+            c.mon_rect == mon_key
+                && c.virt_rect == virt_key
+                && c.path == path
+                && c.mtime == mtime
+                && c.file_len == file_len
+                && c.pos == pos
+                && c.bg_rgb == bg_rgb
+        }) {
+            return hit.clone();
+        }
+    }
+
+    let mon_w = (mon_rect.right - mon_rect.left).max(1) as f32;
+    let mon_h = (mon_rect.bottom - mon_rect.top).max(1) as f32;
+    let band_h = (mon_h * 0.24).clamp(140.0, 280.0).min(mon_h);
+    let band_top_rel = (mon_h - band_h).max(0.0);
+    let bg_lin = rgb_to_linear([
+        bg_rgb.r as f32 / 255.0,
+        bg_rgb.g as f32 / 255.0,
+        bg_rgb.b as f32 / 255.0,
+    ]);
+    let img = decode_scaled_wallpaper(&path, 384);
+    let mut raw_lin = vec![bg_lin; BAND_W * BAND_H];
+    if let Some(ref decoded) = img {
+        let layout = make_wallpaper_layout(mon_rect, virt_rect, decoded.2, decoded.3, pos);
+        for row in 0..BAND_H {
+            let sy_rel = (band_top_rel + (row as f32 + 0.5) / BAND_H as f32 * band_h).min(mon_h - 0.5);
+            for col in 0..BAND_W {
+                let sx_rel = (col as f32 + 0.5) / BAND_W as f32 * mon_w;
+                if let Some((u, v)) = map_monitor_strip_uv(sx_rel, sy_rel, &layout) {
+                    raw_lin[row * BAND_W + col] = sample_decoded_wallpaper_lin(decoded, u, v);
+                }
+            }
+        }
+    }
+
+    let built = CachedDockBand {
+        mon_rect: mon_key,
+        virt_rect: virt_key,
+        path,
+        mtime,
+        file_len,
+        pos,
+        bg_rgb,
+        band_top_rel,
+        band_h,
+        w: BAND_W,
+        h: BAND_H,
+        raw_lin,
+    };
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    guard.retain(|c| c.mon_rect != mon_key);
+    if guard.len() >= 4 {
+        guard.remove(0);
+    }
+    guard.push(built.clone());
+    built
+}
+
+/// 从缓存的显示器底部壁纸条带裁剪出指定屏幕矩形对应的线性 RGB 网格。
+fn dock_wallpaper_zone_linear(mon_rect: RECT, zone_rect: RECT, gw: usize, gh: usize) -> Vec<[f32; 3]> {
+    let band = cached_dock_wallpaper_band(mon_rect);
+    let mon_w = (mon_rect.right - mon_rect.left).max(1) as f32;
+    let zw = (zone_rect.right - zone_rect.left).max(1) as f32;
+    let zh = (zone_rect.bottom - zone_rect.top).max(1) as f32;
+    let mut out = Vec::with_capacity(gw * gh);
+    for gy in 0..gh {
+        let sy_rel = (zone_rect.top - mon_rect.top) as f32 + (gy as f32 + 0.5) / gh as f32 * zh;
+        let v = ((sy_rel - band.band_top_rel) / band.band_h.max(1.0)).clamp(0.0, 1.0);
+        let fy = v * (band.h - 1) as f32;
+        let y0 = fy.floor() as usize;
+        let y1 = (y0 + 1).min(band.h - 1);
+        let ty = fy - y0 as f32;
+        for gx in 0..gw {
+            let sx_rel = (zone_rect.left - mon_rect.left) as f32 + (gx as f32 + 0.5) / gw as f32 * zw;
+            let u = (sx_rel / mon_w).clamp(0.0, 1.0);
+            let fx = u * (band.w - 1) as f32;
+            let x0 = fx.floor() as usize;
+            let x1 = (x0 + 1).min(band.w - 1);
+            let tx = fx - x0 as f32;
+            let p00 = band.raw_lin[y0 * band.w + x0];
+            let p10 = band.raw_lin[y0 * band.w + x1];
+            let p01 = band.raw_lin[y1 * band.w + x0];
+            let p11 = band.raw_lin[y1 * band.w + x1];
+            let w00 = (1.0 - tx) * (1.0 - ty);
+            let w10 = tx * (1.0 - ty);
+            let w01 = (1.0 - tx) * ty;
+            let w11 = tx * ty;
+            out.push([
+                p00[0] * w00 + p10[0] * w10 + p01[0] * w01 + p11[0] * w11,
+                p00[1] * w00 + p10[1] * w10 + p01[1] * w01 + p11[1] * w11,
+                p00[2] * w00 + p10[2] * w10 + p01[2] * w01 + p11[2] * w11,
+            ]);
+        }
+    }
+    out
+}
+
+/// 为指定显示器 Dock 区域生成壁纸态液态玻璃条带（无抓屏、热路径零 I/O）。
+pub fn dock_wallpaper_glass_strip(mon_rect: RECT, zone_rect: RECT) -> DockGlassStrip {
+    let clamped = RECT {
+        left: zone_rect.left.max(mon_rect.left),
+        top: zone_rect.top.max(mon_rect.top),
+        right: zone_rect.right.min(mon_rect.right),
+        bottom: zone_rect.bottom.min(mon_rect.bottom),
+    };
+    let (gw, gh) = DockGlassStrip::target_grid_size(clamped);
+    let lin = dock_wallpaper_zone_linear(mon_rect, clamped, gw, gh);
+    build_dock_glass_from_linear(clamped, gw, gh, lin)
 }
 
 /// 通过 WIC 将壁纸缩放到 32×18 采样顶部均色与整图平均亮度。
@@ -1611,5 +2095,46 @@ mod tests {
         let mixed_rgb = dominant_bgra_color(&mixed, 12).unwrap();
         assert!(mixed_rgb.r >= 210 && mixed_rgb.luminance() > 0.6);
         assert_eq!(dominant_bgra_color(&bgra_white[..5], 12), None);
+    }
+
+    #[test]
+    fn dock_glass_strip_respects_memory_budget_and_preserves_spatial_gradient() {
+        // 1. 降采样网格严格封顶（<= 480×64），确保单屏液态玻璃条带内存低于 ~240KB
+        let (gw, gh) = DockGlassStrip::target_grid_size(RECT {
+            left: 0,
+            top: 900,
+            right: 2560,
+            bottom: 1080,
+        });
+        assert!(gw <= 480 && gh <= 64);
+        assert_eq!(DockGlassStrip::target_grid_size(RECT { left: 0, top: 0, right: 800, bottom: 80 }), (400, 40));
+
+        // 2. 降采样与双层预烘焙应保留左紫右青空间过渡且无零透明度空洞
+        let sw = 200i32;
+        let sh = 40i32;
+        let mut src = Vec::with_capacity((sw * sh) as usize);
+        for _y in 0..sh {
+            for x in 0..sw {
+                src.push(if x < sw / 2 { 0xFF90_30E0 } else { 0xFF10_B0D0 });
+            }
+        }
+        let lin = downsample_bgra_to_linear(&src, sw, sh, 100, 20);
+        let strip = build_dock_glass_from_linear(RECT { left: 0, top: 0, right: 200, bottom: 40 }, 100, 20, lin);
+        assert_eq!(strip.blur_bgra.len(), 2000);
+        assert_eq!(strip.refract_bgra.len(), 2000);
+        let left_px = strip.blur_bgra[10 * 100 + 8];
+        let right_px = strip.blur_bgra[10 * 100 + 92];
+        assert!(((left_px >> 16) & 0xFF) > ((right_px >> 16) & 0xFF));
+        assert!(((right_px >> 8) & 0xFF) > ((left_px >> 8) & 0xFF));
+        assert!(strip.blur_bgra.iter().all(|&p| (p >> 24) == 0xFF));
+
+        // 3. 实机壁纸液态玻璃条带生成在合理耗时内完成且尺寸非空
+        let live = dock_wallpaper_glass_strip(
+            RECT { left: 0, top: 0, right: 1920, bottom: 1080 },
+            RECT { left: 460, top: 990, right: 1460, bottom: 1076 },
+        );
+        assert_eq!(live.w, 480);
+        assert_eq!(live.h, 43);
+        assert_eq!(live.blur_bgra.len(), (live.w * live.h) as usize);
     }
 }

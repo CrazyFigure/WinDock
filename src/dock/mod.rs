@@ -22,7 +22,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::config::{Appearance, DockCfg};
 use crate::dock::items::{EntryList, FuncKind};
 use crate::dock::layout::DockLayout;
-use crate::topbar::color_sync::{harmonize_dock_backdrop, Rgb};
+use crate::topbar::color_sync::{harmonize_dock_backdrop, DockGlassStrip, Rgb};
 use crate::ui::{make_font, DibTarget};
 use crate::win32::{dp, MonitorInfo};
 
@@ -73,6 +73,9 @@ pub struct Dock {
     // Dock 自适应背后颜色状态（优先跟随背后窗色，其次 Windows 系统主题，最后降级壁纸）
     pub backdrop_rgb: Option<Rgb>,
     pub backdrop_dirty: bool,
+    // 液态玻璃低分辨率背景条带缓存（classic 模式下为 None，零常驻内存）
+    pub glass_strip: Option<DockGlassStrip>,
+    pub glass_dirty: bool,
     pub color_dark: bool,
     color_from_top: Rgb,
     color_to_top: Rgb,
@@ -199,6 +202,8 @@ impl Dock {
                 drop_cookie: None,
                 backdrop_rgb: None,
                 backdrop_dirty: true,
+                glass_strip: None,
+                glass_dirty: appearance.dock_material == "liquid_glass",
                 color_dark: init_dark,
                 color_from_top: init_top,
                 color_to_top: init_top,
@@ -226,7 +231,48 @@ impl Dock {
     pub fn apply_appearance(&mut self, appearance: &Appearance) {
         self.apply_backdrop_color(self.backdrop_rgb, appearance, true);
         self.backdrop_dirty = true;
+        if appearance.dock_material == "liquid_glass" {
+            self.glass_dirty = true;
+        } else {
+            // 切回经典磨砂后立即释放液态玻璃缓存，零多余常驻内存
+            self.glass_strip = None;
+            self.glass_dirty = false;
+        }
         self.dirty = true;
+    }
+
+    /// 刷新液态玻璃背景条带缓存（由后台/隐藏首帧采样回调写入）。
+    pub fn apply_glass_strip(&mut self, strip: Option<DockGlassStrip>, appearance: &Appearance) {
+        if appearance.dock_material != "liquid_glass" {
+            self.glass_strip = None;
+            self.glass_dirty = false;
+            return;
+        }
+        if let Some(s) = strip {
+            self.glass_strip = Some(s);
+            self.glass_dirty = false;
+            self.dirty = true;
+        }
+    }
+
+    /// 返回液态玻璃所需的屏幕取样区域（涵盖窗口最大波浪宽度与胶囊高度及折射边距）。
+    pub fn glass_zone_rect(&self) -> RECT {
+        let cap = self.capsule_screen_rect();
+        RECT {
+            left: self.win_rect.left.max(self.monitor.rect.left),
+            top: (cap.top - 12).max(self.monitor.rect.top),
+            right: self.win_rect.right.min(self.monitor.rect.right),
+            bottom: (self.win_rect.bottom + 8).min(self.monitor.rect.bottom),
+        }
+    }
+
+    /// 返回当前未受 Tooltip 与放大图标遮挡的上方采样下边界提示。
+    pub fn glass_above_y_hint(&self) -> Option<i32> {
+        if !self.tooltip_visible && self.hover.is_none() {
+            Some(self.capsule_screen_rect().top - 2)
+        } else {
+            None
+        }
     }
 
     /// 根据背后采样色与外观回退链刷新 Dock 胶囊目标配色，并控制是否瞬切或平滑插值过渡。
@@ -398,6 +444,7 @@ impl Dock {
         let mut left = mon.rect.left + (mon.width() - w) / 2;
         left = left.clamp(mon.rect.left, (mon.rect.right - w).max(mon.rect.left));
         let top = mon.rect.bottom - self.bottom_offset_px - h;
+        let prev_rect = self.win_rect;
         self.win_size = (w.max(1), h.max(1));
         self.win_rect = RECT {
             left,
@@ -427,7 +474,12 @@ impl Dock {
             );
         }
         self.dirty = true;
-        self.backdrop_dirty = true;
+        if self.win_rect != prev_rect {
+            self.backdrop_dirty = true;
+            if appearance.dock_material == "liquid_glass" {
+                self.glass_dirty = true;
+            }
+        }
         if !self.target.ensure_at_least(w, h) {
             crate::log::log("Dock DIB 分配失败");
         }
@@ -478,6 +530,7 @@ impl Dock {
             self.dirty = true;
             if v {
                 self.backdrop_dirty = true;
+                self.glass_dirty = true;
             } else {
                 self.hover = None;
                 self.tooltip_visible = false;
@@ -536,6 +589,7 @@ impl Dock {
                 self.window_visible = false;
             }
             self.backdrop_dirty = true;
+            self.glass_dirty = true;
             if self.color_t < 1.0 {
                 self.color_t = 1.0;
                 self.cur_top = self.color_to_top;

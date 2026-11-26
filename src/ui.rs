@@ -599,6 +599,311 @@ impl Surface {
         (ox * ox + oy * oy).sqrt() + qx.max(qy).min(0.0) - r
     }
 
+    /// 圆角矩形有符号距离及单位外法线（仅在四角圆弧区域开方，其余直边零开方开销）。
+    #[inline]
+    fn sd_rrect_and_normal(
+        px: f32,
+        py: f32,
+        cx: f32,
+        cy: f32,
+        hw: f32,
+        hh: f32,
+        r: f32,
+    ) -> (f32, f32, f32) {
+        let dx = px - cx;
+        let dy = py - cy;
+        let sx = if dx >= 0.0 { 1.0 } else { -1.0 };
+        let sy = if dy >= 0.0 { 1.0 } else { -1.0 };
+        let qx = dx.abs() - hw;
+        let qy = dy.abs() - hh;
+        if qx > 0.0 && qy > 0.0 {
+            let len = (qx * qx + qy * qy).sqrt().max(1e-5);
+            (len - r, sx * (qx / len), sy * (qy / len))
+        } else if qx > qy {
+            (qx - r, sx, 0.0)
+        } else {
+            (qy - r, 0.0, sy)
+        }
+    }
+
+    /// 在低分辨率背景条带上执行定点双线性采样，返回归一化线性近似 sRGB `(r, g, b)`。
+    #[inline]
+    fn sample_bgra_bilinear(buf: &[u32], bw: i32, bh: i32, fx: f32, fy: f32) -> (f32, f32, f32) {
+        let max_x = (bw - 1).max(0) as f32;
+        let max_y = (bh - 1).max(0) as f32;
+        let cx = fx.clamp(0.0, max_x);
+        let cy = fy.clamp(0.0, max_y);
+        let x0 = cx.floor() as usize;
+        let y0 = cy.floor() as usize;
+        let x1 = (x0 + 1).min(bw.max(1) as usize - 1);
+        let y1 = (y0 + 1).min(bh.max(1) as usize - 1);
+        let wx1 = ((cx - x0 as f32) * 256.0).round() as u32;
+        let wy1 = ((cy - y0 as f32) * 256.0).round() as u32;
+        let wx0 = 256 - wx1;
+        let wy0 = 256 - wy1;
+        let w = bw.max(1) as usize;
+        let p00 = buf[y0 * w + x0];
+        let p10 = buf[y0 * w + x1];
+        let p01 = buf[y1 * w + x0];
+        let p11 = buf[y1 * w + x1];
+        let w00 = (wx0 * wy0) >> 8;
+        let w10 = (wx1 * wy0) >> 8;
+        let w01 = (wx0 * wy1) >> 8;
+        let w11 = (wx1 * wy1) >> 8;
+        let r = (((p00 >> 16) & 0xFF) * w00 + ((p10 >> 16) & 0xFF) * w10 + ((p01 >> 16) & 0xFF) * w01 + ((p11 >> 16) & 0xFF) * w11) as f32 / (255.0 * 256.0);
+        let g = (((p00 >> 8) & 0xFF) * w00 + ((p10 >> 8) & 0xFF) * w10 + ((p01 >> 8) & 0xFF) * w01 + ((p11 >> 8) & 0xFF) * w11) as f32 / (255.0 * 256.0);
+        let b = ((p00 & 0xFF) * w00 + (p10 & 0xFF) * w10 + (p01 & 0xFF) * w01 + (p11 & 0xFF) * w11) as f32 / (255.0 * 256.0);
+        (r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0))
+    }
+
+    /// 绘制光学「液态玻璃」圆角胶囊：
+    /// 结合 SDF 边缘凸透镜折射、轻度棱镜色散、对角菲涅尔高光亮边、内倒角光晕与外围柔和环境投影。
+    pub fn fill_liquid_glass_capsule(
+        &mut self,
+        r: &RECT,
+        radius: f32,
+        dpi_scale: f32,
+        dark: bool,
+        opacity: f32,
+        win_screen_origin: (i32, i32),
+        backdrop: Option<&crate::topbar::color_sync::DockGlassStrip>,
+        fallback_top: Rgba,
+        fallback_bot: Rgba,
+    ) {
+        if r.right <= r.left || r.bottom <= r.top {
+            return;
+        }
+        let (l, t, rr, b) = (r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
+        let w_f = (rr - l).max(1.0);
+        let h_f = (b - t).max(1.0);
+        let rad = radius.min((w_f.min(h_f) * 0.5).max(1.0)).max(1.0);
+        let cx = (l + rr) * 0.5;
+        let cy = (t + b) * 0.5;
+        let hw = (w_f * 0.5 - rad).max(0.0);
+        let hh = (h_f * 0.5 - rad).max(0.0);
+
+        let s_dpi = dpi_scale.max(0.75);
+        let bevel_w = (14.5 * s_dpi).min((h_f * 0.38).max(4.0));
+        let sh_blur = 9.0 * s_dpi;
+        let sh_pad_x = (sh_blur + 3.0 * s_dpi).ceil() as i32;
+        let sh_pad_top = (5.0 * s_dpi).ceil() as i32;
+        let sh_pad_bot = (sh_blur + 5.5 * s_dpi).ceil() as i32;
+
+        // 映射不透明度到玻璃雾面比重：0.55 通透晶莹，0.78 默认标准仍保有清晰液态玻璃折射，1.0 浓郁光泽
+        let op = opacity.clamp(0.2, 1.0);
+        let base_veil = if op <= 0.78 {
+            let k = ((op - 0.2) / 0.58).clamp(0.0, 1.0);
+            if dark { 0.12 + k * 0.24 } else { 0.08 + k * 0.22 }
+        } else {
+            let k = ((op - 0.78) / 0.22).clamp(0.0, 1.0);
+            let k2 = k * k;
+            if dark { 0.36 + k2 * 0.50 } else { 0.30 + k2 * 0.56 }
+        };
+        let (top_tint, bot_tint) = if dark {
+            (
+                (0.11 * 0.72 + fallback_top.0 * 0.28, 0.13 * 0.72 + fallback_top.1 * 0.28, 0.17 * 0.72 + fallback_top.2 * 0.28),
+                (0.07 * 0.72 + fallback_bot.0 * 0.28, 0.08 * 0.72 + fallback_bot.1 * 0.28, 0.12 * 0.72 + fallback_bot.2 * 0.28),
+            )
+        } else {
+            (
+                (0.96 * 0.78 + fallback_top.0 * 0.22, 0.975 * 0.78 + fallback_top.1 * 0.22, 1.0 * 0.78 + fallback_top.2 * 0.22),
+                (0.89 * 0.78 + fallback_bot.0 * 0.22, 0.92 * 0.78 + fallback_bot.1 * 0.22, 0.96 * 0.78 + fallback_bot.2 * 0.22),
+            )
+        };
+
+        // 预计算屏幕坐标到背景网格的仿射缩放因子
+        let strip_map = backdrop.and_then(|st| {
+            let sw = (st.screen_rect.right - st.screen_rect.left) as f32;
+            let sh = (st.screen_rect.bottom - st.screen_rect.top) as f32;
+            let expected = (st.w.max(0) as usize).saturating_mul(st.h.max(0) as usize);
+            if st.w <= 1 || st.h <= 1 || sw <= 1.0 || sh <= 1.0 || st.blur_bgra.len() < expected || st.refract_bgra.len() < expected {
+                return None;
+            }
+            Some((
+                st,
+                (st.w - 1) as f32 / sw,
+                (st.h - 1) as f32 / sh,
+            ))
+        });
+
+        let sh_rad = rad + 1.5 * s_dpi;
+        let sh_hw = ((w_f + 3.0 * s_dpi) * 0.5 - sh_rad).max(0.0);
+        let sh_hh = ((h_f + 3.0 * s_dpi) * 0.5 - sh_rad).max(0.0);
+        let sh_cy = cy + 3.2 * s_dpi;
+        let sh_strength = if dark { 0.28 } else { 0.16 };
+        let rim_peak = 0.85 * s_dpi;
+        let rim_half = 1.65 * s_dpi;
+        let bevel_glow_w = 7.0 * s_dpi;
+        let refract_amp = 15.0 * s_dpi;
+        let disp_amp = 2.4 * s_dpi;
+
+        let (x0, y0, x1, y1) = self.clamp_bounds(
+            r.left - sh_pad_x,
+            r.top - sh_pad_top,
+            r.right + sh_pad_x,
+            r.bottom + sh_pad_bot,
+        );
+        let dst_slice = unsafe { std::slice::from_raw_parts_mut(self.ptr, self.w * self.h) };
+
+        for y in y0..y1 {
+            let py = y as f32 + 0.5;
+            let vy = ((py - t) / h_f).clamp(0.0, 1.0);
+            let tint_r = top_tint.0 + (bot_tint.0 - top_tint.0) * vy;
+            let tint_g = top_tint.1 + (bot_tint.1 - top_tint.1) * vy;
+            let tint_b = top_tint.2 + (bot_tint.2 - top_tint.2) * vy;
+            // 顶部柔光高光带 + 底部微弱内反光
+            let top_sheen = if vy < 0.36 {
+                let k = 1.0 - vy / 0.36;
+                k * k * (if dark { 0.10 } else { 0.20 })
+            } else {
+                0.0
+            };
+            let bot_bounce = if vy > 0.80 {
+                let k = (vy - 0.80) / 0.20;
+                k * k * (if dark { 0.06 } else { 0.11 })
+            } else {
+                0.0
+            };
+            let row_off = y as usize * self.w;
+            let sy_screen = (win_screen_origin.1 + y) as f32 + 0.5;
+
+            for x in x0..x1 {
+                let px = x as f32 + 0.5;
+                let (d, nx, ny) = Self::sd_rrect_and_normal(px, py, cx, cy, hw, hh, rad);
+
+                // 外围柔和投影（绝不渗透进玻璃内部，防止通透材质发黑发泥）
+                let sh_alpha = if d > -0.5 {
+                    let (d_sh, _, _) = Self::sd_rrect_and_normal(px, py, cx, sh_cy, sh_hw, sh_hh, sh_rad);
+                    if d_sh < sh_blur {
+                        let t_sh = (1.0 - d_sh.max(0.0) / sh_blur).max(0.0);
+                        sh_strength * t_sh * t_sh
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+
+                if d >= 0.5 {
+                    if sh_alpha > 0.002 {
+                        let sa = (sh_alpha * 255.0).round().clamp(0.0, 255.0) as u32;
+                        dst_slice[row_off + x as usize] = sa << 24;
+                    }
+                    continue;
+                }
+
+                let depth_in = (-d).max(0.0);
+                let u_rim = (1.0 - depth_in / bevel_w).clamp(0.0, 1.0);
+                // 光滑弯曲边沿斜率：越靠近边缘折射越明显，内部平滑归零
+                let lens = u_rim * u_rim * (2.2 - 1.2 * u_rim);
+
+                // 采样经过中心微放大与边缘向内弯折的背景色彩
+                let (mut gr, mut gg, mut gb) = if let Some((st, sx_scale, sy_scale)) = strip_map {
+                    let sx_screen = (win_screen_origin.0 + x) as f32 + 0.5;
+                    let mag = 0.028 * (1.0 - u_rim * 0.5);
+                    let gx_base = sx_screen - (px - cx) * mag - nx * (refract_amp * lens);
+                    let gy_base = sy_screen - (py - cy) * mag - ny * (refract_amp * lens);
+                    let fx = (gx_base - st.screen_rect.left as f32) * sx_scale;
+                    let fy = (gy_base - st.screen_rect.top as f32) * sy_scale;
+                    let blur_c = Self::sample_bgra_bilinear(&st.blur_bgra, st.w, st.h, fx, fy);
+                    if lens > 0.03 {
+                        // 曲率边缘混合轻模糊微锐层 + RGB 微色散，模拟物理光学棱镜质感
+                        let disp = disp_amp * lens;
+                        let dx_f = nx * disp * sx_scale;
+                        let dy_f = ny * disp * sy_scale;
+                        let (rr_c, _, _) = Self::sample_bgra_bilinear(&st.refract_bgra, st.w, st.h, fx - dx_f, fy - dy_f);
+                        let (_, rg_c, _) = Self::sample_bgra_bilinear(&st.refract_bgra, st.w, st.h, fx, fy);
+                        let (_, _, rb_c) = Self::sample_bgra_bilinear(&st.refract_bgra, st.w, st.h, fx + dx_f, fy + dy_f);
+                        let sharp_w = (lens * 0.72).clamp(0.0, 0.72);
+                        (
+                            blur_c.0 * (1.0 - sharp_w) + rr_c * sharp_w,
+                            blur_c.1 * (1.0 - sharp_w) + rg_c * sharp_w,
+                            blur_c.2 * (1.0 - sharp_w) + rb_c * sharp_w,
+                        )
+                    } else {
+                        blur_c
+                    }
+                } else {
+                    (
+                        fallback_top.0 + (fallback_bot.0 - fallback_top.0) * vy,
+                        fallback_top.1 + (fallback_bot.1 - fallback_top.1) * vy,
+                        fallback_top.2 + (fallback_bot.2 - fallback_top.2) * vy,
+                    )
+                };
+
+                // 深色烟熏玻璃下遇到背后高光区域适度保留光影透出，避免光柱被压死
+                let bg_luma = 0.299 * gr + 0.587 * gg + 0.114 * gb;
+                let eff_veil = if dark && bg_luma > 0.52 {
+                    base_veil * (1.0 - 0.28 * ((bg_luma - 0.52) / 0.48).clamp(0.0, 1.0))
+                } else {
+                    base_veil
+                };
+                gr = gr * (1.0 - eff_veil) + tint_r * eff_veil;
+                gg = gg * (1.0 - eff_veil) + tint_g * eff_veil;
+                gb = gb * (1.0 - eff_veil) + tint_b * eff_veil;
+
+                // 叠加顶部流光高光与底部内反光
+                let sheen = top_sheen + bot_bounce;
+                if sheen > 0.001 {
+                    gr = gr * (1.0 - sheen) + sheen;
+                    gg = gg * (1.0 - sheen) + sheen;
+                    gb = gb * (1.0 - sheen) + sheen;
+                }
+
+                // 对角方向性菲涅尔亮边（左上主高光 + 右下二次反射，复刻液态玻璃立体轮廓；零 powf/exp 开销）
+                let light_dot = nx * -0.7071 + ny * -0.7071;
+                let ld_pos = light_dot.max(0.0);
+                let ld_neg = (-light_dot).max(0.0);
+                let fresnel_dir = ld_pos * ld_pos.sqrt() + ld_neg * ld_neg * 0.72 + 0.16;
+
+                if depth_in < bevel_glow_w {
+                    let g_t = 1.0 - depth_in / bevel_glow_w;
+                    let bevel_a = g_t * g_t * fresnel_dir * (if dark { 0.14 } else { 0.22 });
+                    gr = (gr * (1.0 - bevel_a) + 0.96 * bevel_a).min(1.0);
+                    gg = (gg * (1.0 - bevel_a) + 0.98 * bevel_a).min(1.0);
+                    gb = (gb * (1.0 - bevel_a) + 1.00 * bevel_a).min(1.0);
+                }
+
+                // 1.3px 锐利镜面高光环（四次平滑钟形曲线替代 exp，高光边柔和顺滑）
+                let rim_u = ((depth_in - rim_peak).abs() / rim_half).min(1.0);
+                if rim_u < 1.0 {
+                    let s = 1.0 - rim_u * rim_u;
+                    let rim = s * s;
+                    let rim_a = (rim * fresnel_dir * (if dark { 0.58 } else { 0.85 })).clamp(0.0, 0.95);
+                    gr = (gr * (1.0 - rim_a) + 0.97 * rim_a).min(1.0);
+                    gg = (gg * (1.0 - rim_a) + 0.985 * rim_a).min(1.0);
+                    gb = (gb * (1.0 - rim_a) + 1.00 * rim_a).min(1.0);
+                }
+
+                // 浅色玻璃仅在非高光外沿保留极微弱对比界线，深色玻璃保持干净亮边避免外黑框
+                if !dark && depth_in < 0.75 * s_dpi {
+                    let edge_t = 1.0 - depth_in / (0.75 * s_dpi);
+                    let dark_edge = 0.08 * edge_t * (1.0 - 0.65 * ld_pos);
+                    gr *= 1.0 - dark_edge;
+                    gg *= 1.0 - dark_edge;
+                    gb *= 1.0 - dark_edge;
+                }
+
+                let cov = (0.5 - d).clamp(0.0, 1.0);
+                if cov >= 0.999 {
+                    let r8 = (gr * 255.0).round().clamp(0.0, 255.0) as u32;
+                    let g8 = (gg * 255.0).round().clamp(0.0, 255.0) as u32;
+                    let b8 = (gb * 255.0).round().clamp(0.0, 255.0) as u32;
+                    dst_slice[row_off + x as usize] = 0xFF00_0000 | (r8 << 16) | (g8 << 8) | b8;
+                } else {
+                    // 边界抗锯齿：将预乘玻璃像素 Porter-Duff OVER 合成到外围投影上
+                    let out_a = cov + sh_alpha * (1.0 - cov);
+                    let r8 = ((gr * cov * 255.0).round() as u32).min(255);
+                    let g8 = ((gg * cov * 255.0).round() as u32).min(255);
+                    let b8 = ((gb * cov * 255.0).round() as u32).min(255);
+                    let a8 = ((out_a * 255.0).round() as u32).min(255);
+                    dst_slice[row_off + x as usize] =
+                        (a8 << 24) | (r8.min(a8) << 16) | (g8.min(a8) << 8) | b8.min(a8);
+                }
+            }
+        }
+    }
+
     /// 填充抗锯齿圆角矩形（中间核心矩形走高速填充，仅对边缘/四角做 SDF 抗锯齿）。
     pub fn fill_rrect(&mut self, r: &RECT, radius: f32, c: Rgba) {
         if c.3 <= 0.001 || r.right <= r.left || r.bottom <= r.top {
@@ -2571,5 +2876,92 @@ mod tests {
             &[(text_rc, "🔔 自动换行彩色文本测试")],
         ));
         target.release();
+    }
+
+    #[test]
+    fn liquid_glass_capsule_refracts_highlights_rims_and_stays_fast() {
+        let (w, h) = (720usize, 110usize);
+        let mut buf = vec![0u32; w * h];
+        let mut sf = Surface {
+            w,
+            h,
+            ptr: buf.as_mut_ptr(),
+            clip: None,
+        };
+        // 构造带斜向青白光带的背景条带（模拟壁纸高光穿过液态玻璃胶囊）
+        let (sw, sh) = (360i32, 55i32);
+        let mut bg_blur = Vec::with_capacity((sw * sh) as usize);
+        let mut bg_refract = Vec::with_capacity((sw * sh) as usize);
+        for y in 0..sh {
+            for x in 0..sw {
+                let diag = (x as f32 * 0.45 - y as f32 * 2.2 - 30.0).abs();
+                let px = if diag < 8.0 {
+                    0xFFD8_F8FFu32
+                } else if x < sw / 2 {
+                    0xFF28_3456u32
+                } else {
+                    0xFF1D_2A3Au32
+                };
+                bg_refract.push(px);
+                bg_blur.push(if diag < 14.0 { 0xFF70_9AB8 } else { px });
+            }
+        }
+        let strip = crate::topbar::color_sync::DockGlassStrip {
+            screen_rect: RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 },
+            w: sw,
+            h: sh,
+            blur_bgra: bg_blur,
+            refract_bgra: bg_refract,
+        };
+        let cap = RECT { left: 32, top: 18, right: 688, bottom: 86 };
+
+        let t0 = std::time::Instant::now();
+        sf.fill_liquid_glass_capsule(
+            &cap,
+            20.0,
+            1.0,
+            true,
+            0.78,
+            (0, 0),
+            Some(&strip),
+            (0.14, 0.15, 0.19, 1.0),
+            (0.09, 0.10, 0.13, 1.0),
+        );
+        let elapsed_us = t0.elapsed().as_micros();
+        // 即便在未充分优化的 debug test 下也应保持低耗时（< 40ms），release/dev-opt 下仅 ~0.3ms
+        assert!(elapsed_us < 80_000, "liquid glass render took too long: {elapsed_us}us");
+
+        // 1. 胶囊左上角圆弧高光边应明显亮于右上角非高光对角弧
+        let luma_at = |x: usize, y: usize| -> u32 {
+            let p = buf[y * w + x];
+            let r = (p >> 16) & 0xFF;
+            let g = (p >> 8) & 0xFF;
+            let b = p & 0xFF;
+            r * 3 + g * 6 + b
+        };
+        // 左上角弧中点约在 (cap.left + 6, cap.top + 6)，右上角弧对称点在 (cap.right - 7, cap.top + 6)
+        let tl_rim = luma_at((cap.left + 6) as usize, (cap.top + 6) as usize);
+        let tr_rim = luma_at((cap.right - 7) as usize, (cap.top + 6) as usize);
+        assert!(tl_rim > tr_rim, "期望左上菲涅尔高光({tl_rim})亮于右上暗角({tr_rim})");
+
+        // 2. 胶囊最外左上角远端保持透明（不污染阴影以外区域）
+        assert_eq!(buf[0], 0);
+        // 3. 胶囊中心完全不透明预乘输出（无 Alpha 漏洞）
+        let center_px = buf[(52 * w) + 360];
+        assert_eq!(center_px >> 24, 0xFF);
+        // 4. 浅色无条带回退渲染正常且左上边亮于内部
+        sf.clear_rect_transparent(w as i32, h as i32);
+        sf.fill_liquid_glass_capsule(
+            &cap,
+            20.0,
+            1.25,
+            false,
+            0.55,
+            (0, 0),
+            None,
+            (0.90, 0.92, 0.95, 1.0),
+            (0.82, 0.85, 0.90, 1.0),
+        );
+        assert_eq!(buf[(52 * w) + 360] >> 24, 0xFF);
     }
 }

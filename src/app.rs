@@ -1034,14 +1034,18 @@ impl App {
         }
     }
 
-    /// 协调 Dock 背后配色采样：优先跟随背后窗口色，其次 Windows 系统主题，最后降级壁纸。
+    /// 协调 Dock 背后配色与液态玻璃条带采样：优先跟随背后窗口色，其次 Windows 系统主题，最后降级壁纸。
     fn sync_dock_backdrops(&mut self) {
         let appearance = self.config.appearance.clone();
-        if appearance.theme != "system" || self.snap.fullscreen {
+        let is_liquid = appearance.dock_material == "liquid_glass";
+        if (appearance.theme != "system" && !is_liquid) || self.snap.fullscreen {
             self.dock_color_token += 1;
             let mut dirty = false;
             for d in &mut self.docks {
                 d.apply_backdrop_color(None, &appearance, true);
+                if !is_liquid {
+                    d.apply_glass_strip(None, &appearance);
+                }
                 dirty |= d.dirty;
             }
             if dirty {
@@ -1051,21 +1055,37 @@ impl App {
         }
         for d in &mut self.docks {
             d.backdrop_dirty = true;
+            if is_liquid {
+                d.glass_dirty = true;
+            }
         }
         self.spawn_dock_backdrop_sample();
     }
 
-    /// 为下一个已显示且待更新背后配色的 Dock 异步拉起采样线程（隐藏中将直接在显出首帧零遮挡采样）。
+    /// 为下一个已显示且待更新背后配色/液态玻璃背景的 Dock 异步拉起采样线程（隐藏中将直接在显出首帧零遮挡采样）。
     fn spawn_dock_backdrop_sample(&mut self) {
-        if self.config.appearance.theme != "system" || self.snap.fullscreen || self.dock_color_busy {
+        let is_liquid = self.config.appearance.dock_material == "liquid_glass";
+        if (self.config.appearance.theme != "system" && !is_liquid)
+            || self.snap.fullscreen
+            || self.dock_color_busy
+        {
             return;
         }
         let target = self
             .docks
             .iter()
-            .find(|d| d.backdrop_dirty && d.window_visible && d.want_visible)
-            .map(|d| (d.monitor.hmonitor.0 as isize, d.capsule_screen_rect(), d.win_rect, d.monitor.rect));
-        let Some((hmon, cap_screen, win_rect, mon_rect)) = target else {
+            .find(|d| (d.backdrop_dirty || (is_liquid && d.glass_dirty)) && d.window_visible && d.want_visible)
+            .map(|d| {
+                (
+                    d.monitor.hmonitor.0 as isize,
+                    d.glass_zone_rect(),
+                    d.capsule_screen_rect(),
+                    d.win_rect,
+                    d.monitor.rect,
+                    d.glass_above_y_hint(),
+                )
+            });
+        let Some((hmon, zone_rect, cap_screen, win_rect, mon_rect, above_y_hint)) = target else {
             return;
         };
         self.dock_color_busy = true;
@@ -1075,8 +1095,16 @@ impl App {
         let spawned = std::thread::Builder::new()
             .name("dock-color".into())
             .spawn(move || {
-                let rgb = color_sync::sample_dock_backdrop(cap_screen, win_rect, mon_rect, true);
-                let payload = Box::new((token, hmon, rgb));
+                let (rgb, glass) = color_sync::sample_dock_backdrop_bundle(
+                    zone_rect,
+                    cap_screen,
+                    win_rect,
+                    mon_rect,
+                    true,
+                    is_liquid,
+                    above_y_hint,
+                );
+                let payload = Box::new((token, hmon, rgb, glass));
                 unsafe {
                     let _ = PostMessageW(
                         HWND(main as *mut _),
@@ -1093,8 +1121,10 @@ impl App {
 
     fn on_dock_color(&mut self, lparam: isize) {
         self.dock_color_busy = false;
-        let (token, hmon, rgb) = *unsafe { Box::from_raw(lparam as *mut (u64, isize, Option<Rgb>)) };
-        if token != self.dock_color_token || self.config.appearance.theme != "system" {
+        let (token, hmon, rgb, glass) =
+            *unsafe { Box::from_raw(lparam as *mut (u64, isize, Option<Rgb>, Option<color_sync::DockGlassStrip>)) };
+        let is_liquid = self.config.appearance.dock_material == "liquid_glass";
+        if token != self.dock_color_token || (self.config.appearance.theme != "system" && !is_liquid) {
             return;
         }
         let appearance = self.config.appearance.clone();
@@ -1103,6 +1133,7 @@ impl App {
         for d in &mut self.docks {
             if d.monitor.hmonitor.0 as isize == hmon {
                 d.apply_backdrop_color(rgb, &appearance, instant);
+                d.apply_glass_strip(glass.clone(), &appearance);
                 need_frame |= d.dirty;
             }
         }
@@ -1668,20 +1699,37 @@ impl App {
     }
 
     fn render_dock(&mut self, i: usize) {
+        let appearance_snapshot = self.config.appearance.clone();
+        let is_liquid = appearance_snapshot.dock_material == "liquid_glass";
         // 首次从隐藏浮出前同步采样正后方画面（此时 Dock 尚未显示，完全无自遮挡且首帧零闪烁）
-        if !self.docks[i].window_visible && self.docks[i].want_visible && self.docks[i].backdrop_dirty {
-            let appearance = &self.config.appearance;
-            let bg = if appearance.theme == "system" && !self.snap.fullscreen {
-                color_sync::sample_dock_backdrop(
+        if !self.docks[i].window_visible
+            && self.docks[i].want_visible
+            && (self.docks[i].backdrop_dirty || (is_liquid && self.docks[i].glass_dirty))
+        {
+            let (bg, glass) = if (appearance_snapshot.theme == "system" || is_liquid) && !self.snap.fullscreen {
+                color_sync::sample_dock_backdrop_bundle(
+                    self.docks[i].glass_zone_rect(),
                     self.docks[i].capsule_screen_rect(),
                     self.docks[i].win_rect,
                     self.docks[i].monitor.rect,
                     false,
+                    is_liquid,
+                    None,
                 )
             } else {
-                None
+                (None, None)
             };
-            self.docks[i].apply_backdrop_color(bg, appearance, true);
+            self.docks[i].apply_backdrop_color(bg, &appearance_snapshot, true);
+            self.docks[i].apply_glass_strip(glass, &appearance_snapshot);
+        } else if is_liquid && self.docks[i].want_visible && self.docks[i].glass_strip.is_none() {
+            // 设置页实时切换至液态玻璃或壁纸刚刷新时，先以缓存壁纸条带瞬时填充首帧再异步补采背后窗口
+            let strip = color_sync::dock_wallpaper_glass_strip(
+                self.docks[i].monitor.rect,
+                self.docks[i].glass_zone_rect(),
+            );
+            self.docks[i].apply_glass_strip(Some(strip), &appearance_snapshot);
+            self.docks[i].glass_dirty = true;
+            self.spawn_dock_backdrop_sample();
         }
         let cfg = &self.config.dock;
         let appearance = &self.config.appearance;
@@ -1778,15 +1826,21 @@ impl App {
             self.schedule_fused_color_recheck();
         }
         // 可见 Dock 每 2 秒低频复查背后内容（覆盖应用内滚屏/标签页切换或壁纸切换等无窗口焦点变化场景）
+        let need_dock_sample = self.config.appearance.theme == "system"
+            || self.config.appearance.dock_material == "liquid_glass";
         if self.slow_ticks % 2 == 0
-            && self.config.appearance.theme == "system"
+            && need_dock_sample
             && !self.snap.fullscreen
             && !self.dock_color_busy
         {
+            let is_liquid = self.config.appearance.dock_material == "liquid_glass";
             let mut marked = false;
             for d in &mut self.docks {
                 if d.window_visible && d.want_visible {
                     d.backdrop_dirty = true;
+                    if is_liquid {
+                        d.glass_dirty = true;
+                    }
                     marked = true;
                 }
             }
@@ -3197,8 +3251,12 @@ impl App {
         }
     }
 
-    /// 系统浅/深主题变化时仅更新外观与重绘，不销毁重建 AppBar，彻底杜绝闪烁与画面抖动。
+    /// 系统浅/深主题或壁纸变化时仅更新外观与重绘，不销毁重建 AppBar，彻底杜绝闪烁与画面抖动。
     pub fn on_theme_changed(&mut self) {
+        for d in &mut self.docks {
+            d.glass_strip = None;
+            d.glass_dirty = self.config.appearance.dock_material == "liquid_glass";
+        }
         self.apply_config(false);
     }
 
