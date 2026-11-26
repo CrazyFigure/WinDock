@@ -9,10 +9,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
-use windows::Win32::Foundation::WAIT_OBJECT_0;
-use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
 use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST};
 
 use crate::config::Store;
@@ -59,16 +56,6 @@ fn notify(text: &str, error: bool) {
     }
 }
 
-/// 等待进程退出。
-fn wait_process(pid: u32, timeout: Duration) -> bool {
-    unsafe {
-        let Ok(h) = OpenProcess(PROCESS_SYNCHRONIZE, windows::Win32::Foundation::BOOL::from(false), pid) else { return true };
-        let ok = WaitForSingleObject(h, timeout.as_millis().min(u32::MAX as u128) as u32) == WAIT_OBJECT_0;
-        let _ = CloseHandle(h);
-        ok
-    }
-}
-
 /// 等待指定路径的 EXE 不再被占用（可重命名）。
 fn wait_unlocked(path: &Path, timeout: Duration) -> bool {
     let start = Instant::now();
@@ -110,7 +97,7 @@ pub fn run(parent_pid: u32, setup: &Path, target: &Path) -> i32 {
     crate::update::cleanup_stale_workdirs();
 
     // 1. 等待旧主进程退出（其退出前已撤销 AppBar、恢复任务栏并清除恢复记录）
-    if !wait_process(parent_pid, Duration::from_secs(30)) {
+    if !crate::win32::wait_process(parent_pid, Duration::from_secs(30)) {
         notify("WinDockFinder 旧版本未能退出，更新已取消。", true);
         launch(target, &["--settings"]);
         return 1;

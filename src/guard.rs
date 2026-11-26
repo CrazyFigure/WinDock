@@ -96,8 +96,8 @@ pub fn run(parent_pid: u32, hotkey: Option<HotkeySpec>) -> i32 {
     let store = Store::open();
     unsafe {
         let Ok(proc) = OpenProcess(PROCESS_SYNCHRONIZE, false, parent_pid) else {
-            // 主进程已不存在：若有残留记录则修复后退出。
-            if let Some(rec) = RecoveryRecord::load(&store) {
+            // 主进程已不存在：仅在恢复记录确属该父进程时修复后退出，避免误清重启后的新实例记录。
+            if let Some(rec) = RecoveryRecord::load(&store).filter(|rec| rec.main_pid == parent_pid) {
                 rec.restore();
                 RecoveryRecord::clear(&store);
             }
@@ -168,8 +168,8 @@ pub fn run(parent_pid: u32, hotkey: Option<HotkeySpec>) -> i32 {
                 break Reason::Hotkey;
             }
             if r == WAIT_OBJECT_0 {
-                // 主进程句柄 signaled：进程已退出
-                break if RecoveryRecord::load(&store).is_some() {
+                // 主进程句柄 signaled：进程已退出，仅当恢复记录仍属于本父进程时视为异常崩溃
+                break if RecoveryRecord::load(&store).is_some_and(|rec| rec.main_pid == parent_pid) {
                     Reason::Crash
                 } else {
                     Reason::CleanExit
@@ -188,7 +188,7 @@ pub fn run(parent_pid: u32, hotkey: Option<HotkeySpec>) -> i32 {
         match reason {
             Reason::CleanExit => 0,
             Reason::Crash | Reason::Hang | Reason::Hotkey => {
-                let rec = RecoveryRecord::load(&store);
+                let rec = RecoveryRecord::load(&store).filter(|rec| rec.main_pid == parent_pid);
                 match rec {
                     Some(mut rec) => {
                         rec.abnormal_pause = true;

@@ -415,6 +415,22 @@ pub fn system_uses_dark_theme() -> bool {
     system_theme_dark().unwrap_or(false)
 }
 
+/// 等待指定进程退出；若进程已退出或句柄不可打开则直接视为已退出。
+pub fn wait_process(pid: u32, timeout: std::time::Duration) -> bool {
+    use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    if pid == 0 {
+        return true;
+    }
+    unsafe {
+        let Ok(h) = OpenProcess(PROCESS_SYNCHRONIZE, BOOL::from(false), pid) else {
+            return true;
+        };
+        let ok = WaitForSingleObject(h, timeout.as_millis().min(u32::MAX as u128) as u32) == WAIT_OBJECT_0;
+        let _ = CloseHandle(h);
+        ok
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +441,10 @@ mod tests {
         let pseudo = HWND(0x1234isize as *mut _);
         restore_foreground_if_owned(pseudo, HWND::default());
         restore_foreground_if_owned(pseudo, pseudo);
+    }
+
+    #[test]
+    fn wait_process_zero_pid_returns_immediately() {
+        assert!(wait_process(0, std::time::Duration::from_millis(10)));
     }
 }

@@ -83,6 +83,7 @@ const M_RESTART: usize = 9;
 const M_SHUTDOWN: usize = 10;
 const M_TASKMGR: usize = 11;
 const M_STARTUP: usize = 13;
+const M_RESTART_APP: usize = 14;
 const M_APP_OPEN: usize = 100;
 const M_APP_NEW: usize = 101;
 const M_APP_ADMIN: usize = 102;
@@ -708,6 +709,49 @@ impl App {
         self.shutdown();
         unsafe {
             let _ = DestroyWindow(self.hwnd);
+        }
+    }
+
+    /// 构造重启协调子进程的命令行参数（等待当前主进程与守护进程退出后再拉起新实例）。
+    fn restart_wait_args(pid: u32, guard_pid: u32) -> Vec<String> {
+        let mut args = vec![
+            "--restart-wait".to_string(),
+            "--parent-pid".to_string(),
+            pid.to_string(),
+        ];
+        if guard_pid != 0 {
+            args.push("--guard-pid".to_string());
+            args.push(guard_pid.to_string());
+        }
+        args
+    }
+
+    /// 重启 WinDockFinder：先拉起等待子进程再正常退出清理，确保新实例接管前已释放单实例锁与恢复任务栏。
+    pub fn restart(&mut self) {
+        if self.exiting {
+            return;
+        }
+        let exe = crate::win32::exe_path();
+        let pid = std::process::id();
+        let guard_pid = self
+            .guard_handle
+            .map(|h| unsafe { windows::Win32::System::Threading::GetProcessId(h) })
+            .unwrap_or(0);
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(Self::restart_wait_args(pid, guard_pid));
+        if let Some(dir) = exe.parent() {
+            cmd.current_dir(dir);
+        }
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        match cmd.spawn() {
+            Ok(_) => {
+                crate::log::log("用户触发重启 WinDockFinder");
+                self.quit();
+            }
+            Err(e) => {
+                crate::log::log(&format!("重启 WinDockFinder 启动新实例失败: {e}"));
+                self.notify_tray("重启 WinDockFinder 失败，请手动重新打开。");
+            }
         }
     }
 
@@ -2096,25 +2140,28 @@ impl App {
         self.flush_pending_color_samples();
     }
 
-    fn product_menu(&mut self) {
-        let pt = cursor_pos();
-        self.product_menu_at(pt.x, pt.y);
-    }
-
-    fn product_menu_at(&mut self, x: i32, y: i32) {
-        let taskbar_label = if self.taskbar.active() && self.taskbar.temporary_show() {
+    fn taskbar_menu_label_for(active: bool, temporary_show: bool) -> &'static str {
+        if active && temporary_show {
             "重新隐藏 Windows 任务栏"
-        } else if self.taskbar.active() {
-            "暂时显示 Windows 任务栏"
+        } else if active {
+            "显示 Windows 任务栏"
         } else {
             "隐藏 Windows 任务栏"
-        };
-        let v = vec![
+        }
+    }
+
+    fn taskbar_menu_label(&self) -> &'static str {
+        Self::taskbar_menu_label_for(self.taskbar.active(), self.taskbar.temporary_show())
+    }
+
+    /// 构建产品菜单（顶部栏左上角图标 & Dock 空白区右键菜单）条目列表。
+    fn product_menu_items(dock_visible: bool, topbar_visible: bool, taskbar_label: &'static str) -> Vec<MenuItem> {
+        vec![
             MenuItem::normal(M_SETTINGS, "WinDockFinder设置"),
             MenuItem::normal(M_ABOUT, "关于 WinDockFinder"),
             MenuItem::sep(),
-            MenuItem::normal(M_TOGGLE_DOCK, if self.dock_visible { "隐藏 Dock" } else { "显示 Dock" }),
-            MenuItem::normal(M_TOGGLE_TOPBAR, if self.topbar_visible { "隐藏顶部栏" } else { "显示顶部栏" }),
+            MenuItem::normal(M_TOGGLE_DOCK, if dock_visible { "隐藏 Dock" } else { "显示 Dock" }),
+            MenuItem::normal(M_TOGGLE_TOPBAR, if topbar_visible { "隐藏顶部栏" } else { "显示顶部栏" }),
             MenuItem::normal(M_TOGGLE_TASKBAR, taskbar_label),
             MenuItem::sep(),
             MenuItem::normal(M_LOCK, "锁定屏幕"),
@@ -2123,8 +2170,39 @@ impl App {
             MenuItem::danger(M_SHUTDOWN, "关机"),
             MenuItem::sep(),
             MenuItem::normal(M_TASKMGR, "任务管理器"),
+            MenuItem::normal(M_RESTART_APP, "重启 WinDockFinder"),
             MenuItem::danger(M_EXIT, "退出 WinDockFinder"),
-        ];
+        ]
+    }
+
+    /// 构建系统托盘图标菜单条目列表。
+    fn tray_menu_items(
+        dock_visible: bool,
+        topbar_visible: bool,
+        taskbar_label: &'static str,
+        startup_item: MenuItem,
+    ) -> Vec<MenuItem> {
+        vec![
+            MenuItem::normal(M_SETTINGS, "WinDockFinder设置"),
+            MenuItem::sep(),
+            MenuItem::normal(M_TOGGLE_DOCK, if dock_visible { "隐藏 Dock" } else { "显示 Dock" }),
+            MenuItem::normal(M_TOGGLE_TOPBAR, if topbar_visible { "隐藏顶部栏" } else { "显示顶部栏" }),
+            MenuItem::normal(M_TOGGLE_TASKBAR, taskbar_label),
+            MenuItem::sep(),
+            startup_item,
+            MenuItem::sep(),
+            MenuItem::normal(M_RESTART_APP, "重启 WinDockFinder"),
+            MenuItem::danger(M_EXIT, "退出 WinDockFinder"),
+        ]
+    }
+
+    fn product_menu(&mut self) {
+        let pt = cursor_pos();
+        self.product_menu_at(pt.x, pt.y);
+    }
+
+    fn product_menu_at(&mut self, x: i32, y: i32) {
+        let v = Self::product_menu_items(self.dock_visible, self.topbar_visible, self.taskbar_menu_label());
         self.popup_at(v, MenuCtx::None, x, y);
     }
 
@@ -2198,24 +2276,12 @@ impl App {
             StartupState::DisabledBySystem => MenuItem::normal(M_STARTUP, "开机自启（已被任务管理器禁用）"),
             StartupState::Off => MenuItem::normal(M_STARTUP, "开机自启"),
         };
-        let taskbar_label = if self.taskbar.active() && self.taskbar.temporary_show() {
-            "重新隐藏 Windows 任务栏"
-        } else if self.taskbar.active() {
-            "暂时显示 Windows 任务栏"
-        } else {
-            "隐藏 Windows 任务栏"
-        };
-        let v = vec![
-            MenuItem::normal(M_SETTINGS, "WinDockFinder设置"),
-            MenuItem::sep(),
-            MenuItem::normal(M_TOGGLE_DOCK, if self.dock_visible { "隐藏 Dock" } else { "显示 Dock" }),
-            MenuItem::normal(M_TOGGLE_TOPBAR, if self.topbar_visible { "隐藏顶部栏" } else { "显示顶部栏" }),
-            MenuItem::normal(M_TOGGLE_TASKBAR, taskbar_label),
-            MenuItem::sep(),
+        let v = Self::tray_menu_items(
+            self.dock_visible,
+            self.topbar_visible,
+            self.taskbar_menu_label(),
             startup_item,
-            MenuItem::sep(),
-            MenuItem::danger(M_EXIT, "退出 WinDockFinder"),
-        ];
+        );
         self.popup(v, MenuCtx::None);
     }
 
@@ -2227,6 +2293,7 @@ impl App {
             M_TOGGLE_DOCK => self.toggle_dock(),
             M_TOGGLE_TOPBAR => self.toggle_topbar(),
             M_TOGGLE_TASKBAR => self.toggle_taskbar(),
+            M_RESTART_APP => self.restart(),
             M_EXIT => self.quit(),
             M_LOCK => {
                 let _ = crate::win32::open_shell_path("open", "rundll32.exe", Some("user32.dll,LockWorkStation"));
@@ -3745,5 +3812,39 @@ mod tests {
         assert!(is_desktop_class("TopLevelWindowForOverflowXamlIsland"));
         assert!(is_desktop_class("Xaml_WindowedPopupClass"));
         assert!(!is_desktop_class("Chrome_WidgetWin_1"));
+    }
+
+    #[test]
+    fn restart_item_is_placed_directly_above_exit_in_menus() {
+        assert_eq!(App::taskbar_menu_label_for(true, false), "显示 Windows 任务栏");
+        assert_eq!(App::taskbar_menu_label_for(true, true), "重新隐藏 Windows 任务栏");
+        assert_eq!(App::taskbar_menu_label_for(false, false), "隐藏 Windows 任务栏");
+
+        let product = App::product_menu_items(true, true, "显示 Windows 任务栏");
+        let exit_idx = product.iter().position(|it| !it.separator && it.id == M_EXIT).unwrap();
+        assert_eq!(exit_idx, product.len() - 1);
+        assert_eq!(product[exit_idx - 1].id, M_RESTART_APP);
+        assert_eq!(product[exit_idx - 1].label, "重启 WinDockFinder");
+        assert!(!product[exit_idx - 1].danger);
+        assert!(product[exit_idx].danger);
+
+        let tray = App::tray_menu_items(true, true, "显示 Windows 任务栏", MenuItem::normal(M_STARTUP, "开机自启"));
+        let tray_exit_idx = tray.iter().position(|it| !it.separator && it.id == M_EXIT).unwrap();
+        assert_eq!(tray_exit_idx, tray.len() - 1);
+        assert_eq!(tray[tray_exit_idx - 1].id, M_RESTART_APP);
+        assert_eq!(tray[tray_exit_idx - 1].label, "重启 WinDockFinder");
+        assert!(!tray[tray_exit_idx - 1].danger);
+    }
+
+    #[test]
+    fn restart_wait_args_include_guard_pid_only_when_nonzero() {
+        assert_eq!(
+            App::restart_wait_args(1234, 0),
+            vec!["--restart-wait", "--parent-pid", "1234"]
+        );
+        assert_eq!(
+            App::restart_wait_args(1234, 5678),
+            vec!["--restart-wait", "--parent-pid", "1234", "--guard-pid", "5678"]
+        );
     }
 }

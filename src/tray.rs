@@ -99,7 +99,7 @@ impl Tray {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, CMD_TOGGLE_DOCK, PCWSTR(t(if dock_visible { "隐藏 Dock".into() } else { "显示 Dock".into() }).as_ptr()));
             let _ = AppendMenuW(menu, MF_STRING, CMD_TOGGLE_TOPBAR, PCWSTR(t(if topbar_visible { "隐藏顶部栏".into() } else { "显示顶部栏".into() }).as_ptr()));
-            let _ = AppendMenuW(menu, MF_STRING, CMD_TOGGLE_TASKBAR, PCWSTR(t(if taskbar_hidden { "暂时显示 Windows 任务栏".into() } else { "隐藏 Windows 任务栏".into() }).as_ptr()));
+            let _ = AppendMenuW(menu, MF_STRING, CMD_TOGGLE_TASKBAR, PCWSTR(t(if taskbar_hidden { "显示 Windows 任务栏".into() } else { "隐藏 Windows 任务栏".into() }).as_ptr()));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let startup_label = match (startup_on, startup_disabled) {
                 (true, true) => "开机自启（已被任务管理器禁用）".to_string(),

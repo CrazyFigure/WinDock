@@ -53,6 +53,22 @@ fn dispatch(args: &[String]) -> i32 {
         return guard::run(pid, hotkey);
     }
 
+    // 应用重启协调：等待旧主进程与旧守护进程完全退出后再启动新实例，避免单实例锁与恢复记录竞态
+    if has(args, "--restart-wait") {
+        let Some(parent) = arg_value(args, "--parent-pid").and_then(|v| v.parse::<u32>().ok()) else {
+            return 2;
+        };
+        if !win32::wait_process(parent, std::time::Duration::from_secs(15)) {
+            log::init(&win32::data_dir(), "restart");
+            log::log(&format!("--restart-wait 等待旧主进程({parent})退出超时"));
+            return 1;
+        }
+        if let Some(guard_pid) = arg_value(args, "--guard-pid").and_then(|v| v.parse::<u32>().ok()).filter(|&p| p != 0) {
+            let _ = win32::wait_process(guard_pid, std::time::Duration::from_secs(5));
+        }
+        return app::run(false);
+    }
+
     // 短时图标提取工作进程
     if let Some(req) = arg_value(args, "--worker-icons") {
         dock::icons::worker_extract_from_file(Path::new(&req));
