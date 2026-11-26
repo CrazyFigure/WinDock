@@ -112,8 +112,10 @@ static LAST_POST: Mutex<Option<Instant>> = Mutex::new(None);
 /// 应用名称内存缓存（key: 小写路径，严格限制上限 256 条防止常驻膨胀）。
 static NAME_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
+/// 判断是否为顶部栏、Dock、自绘菜单或浮窗等内部壳层窗口（设置窗口按普通应用窗口参与前景与列表跟踪）。
 fn is_our_window(class: &str) -> bool {
-    class.starts_with("WinDockFinder") || class == "SysShadow"
+    (class.starts_with("WinDockFinder") && class != crate::settings::CLASS_SETTINGS)
+        || class == "SysShadow"
 }
 
 /// 真正代表桌面壁纸/桌面图标层的窗口类名。
@@ -162,6 +164,8 @@ fn known_system_name(file_lower: &str) -> Option<&'static str> {
         "code.exe" => "Visual Studio Code",
         "wechat.exe" | "weixin.exe" => "微信",
         "qq.exe" => "QQ",
+        // 设置窗口作为普通应用展示统一短名称，避免回退为带副标题的 PE 文件描述
+        "windockfinder.exe" => "WinDockFinder 设置",
         _ => return None,
     })
 }
@@ -1010,5 +1014,24 @@ mod tests {
         let disjoint = RECT { left: 600, top: 200, right: 800, bottom: 260 };
         assert_eq!(rect_overlap_size(a, b), (200, 40));
         assert_eq!(rect_overlap_size(a, disjoint), (0, 0));
+    }
+
+    #[test]
+    fn settings_window_is_treated_as_regular_app_window() {
+        assert!(!is_our_window(crate::settings::CLASS_SETTINGS));
+        assert!(!is_desktop_class(crate::settings::CLASS_SETTINGS));
+        assert!(is_our_window("WinDockFinderTopBar"));
+        assert!(is_our_window("WinDockFinderDockOverlay"));
+        assert!(is_our_window("WinDockFinderDockTrigger"));
+        assert!(is_our_window("WinDockFinderDockPreview"));
+        assert!(is_our_window("WinDockFinderContextMenu"));
+        assert!(is_our_window("WinDockFinderStatusPanel"));
+        assert!(is_our_window("WinDockFinderPopover"));
+        assert!(is_our_window("WinDockFinderMain"));
+        assert!(is_our_window("SysShadow"));
+        assert_eq!(
+            app_display_name(r"C:\Program Files\WinDockFinder\WinDockFinder.exe", Some("WinDockFinder 设置")),
+            "WinDockFinder 设置"
+        );
     }
 }

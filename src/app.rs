@@ -135,12 +135,21 @@ pub fn with_app(hwnd: HWND, f: impl FnOnce(&mut App)) {
     hold_app(|| f(unsafe { &mut *ptr }));
 }
 
-/// 在已持有 `&mut App` 的自定义窗口过程中执行回调，期间忽略经 with_app 派发的嵌套消息。
+/// 在已持有 `&mut App` 的自定义窗口过程中执行回调，按嵌套深度保存并恢复标志，防止重入修改 `App`。
 pub fn hold_app<R>(f: impl FnOnce() -> R) -> R {
-    HANDLER_DEPTH.with(|d| d.set(1));
-    let r = f();
-    HANDLER_DEPTH.with(|d| d.set(0));
-    r
+    struct DepthGuard(u32);
+    impl Drop for DepthGuard {
+        fn drop(&mut self) {
+            HANDLER_DEPTH.with(|d| d.set(self.0));
+        }
+    }
+    let prev = HANDLER_DEPTH.with(|d| {
+        let p = d.get();
+        d.set(p + 1);
+        p
+    });
+    let _guard = DepthGuard(prev);
+    f()
 }
 
 pub fn tray_icon_cache() -> Arc<TrayIconCache> {
@@ -241,7 +250,8 @@ fn is_desktop_class(class: &str) -> bool {
         || class.starts_with("TopLevelWindowForOverflowXamlIsland")
         || class.starts_with("Xaml_WindowedPopupClass")
         || class.contains("QWindowPopup")
-        || class.starts_with("WinDockFinder")
+        // 仅过滤内部壳层与浮窗；设置窗口作为独立应用窗口允许前台菜单与窗口管理操作
+        || (class.starts_with("WinDockFinder") && class != crate::settings::CLASS_SETTINGS)
 }
 
 #[derive(Clone, Default)]
@@ -1971,6 +1981,22 @@ impl App {
             invalidate(bar.hwnd);
         }
         self.on_state_changed();
+        if let Some(settings_hwnd) = self.settings.as_ref().filter(|s| s.is_open()).map(|s| s.hwnd()) {
+            let settings_id = settings_hwnd.0 as isize;
+            let mut fused_to_settings = false;
+            for bar in &mut self.topbars {
+                if bar.fused_hwnd == settings_id {
+                    bar.color_dirty = true;
+                    fused_to_settings = true;
+                }
+            }
+            if fused_to_settings {
+                unsafe {
+                    // 设置页切换主题后等待本帧重绘完成再采样顶部栏融合色，避免采到旧色调
+                    let _ = SetTimer(self.hwnd, TIMER_COLOR_RECHECK, 80, None);
+                }
+            }
+        }
         self.sync_edge_timer();
         self.ensure_frame();
     }
@@ -3887,11 +3913,26 @@ mod tests {
     #[test]
     fn desktop_and_tray_classes_are_filtered_from_foreground_actions() {
         assert!(is_desktop_class("WinDockFinderTopBar"));
+        assert!(is_desktop_class("WinDockFinderContextMenu"));
+        assert!(!is_desktop_class(crate::settings::CLASS_SETTINGS));
         assert!(is_desktop_class("#32768"));
         assert!(is_desktop_class("Windows.UI.Input.InputSite.WindowClass"));
         assert!(is_desktop_class("TopLevelWindowForOverflowXamlIsland"));
         assert!(is_desktop_class("Xaml_WindowedPopupClass"));
         assert!(!is_desktop_class("Chrome_WidgetWin_1"));
+    }
+
+    #[test]
+    fn hold_app_restores_nested_reentrancy_depth() {
+        assert!(!handler_busy());
+        hold_app(|| {
+            assert!(handler_busy());
+            hold_app(|| {
+                assert!(handler_busy());
+            });
+            assert!(handler_busy());
+        });
+        assert!(!handler_busy());
     }
 
     #[test]

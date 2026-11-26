@@ -48,6 +48,7 @@ use pages::Row;
 
 pub const CLASS_SETTINGS: &str = "WinDockFinderSettings";
 const TIMER_TIP: usize = 301;
+const WM_PRINTCLIENT: u32 = 0x0318;
 const LIST_ROW_DP: f32 = 36.0;
 // Dock 固定项列表默认展示 6 行
 const DOCK_VISIBLE: usize = 6;
@@ -333,17 +334,17 @@ impl Settings {
             let y = work.top + ((work.bottom - work.top) - ch).max(0) / 2;
             let dark = app.config.appearance.is_dark();
             let raw = Box::into_raw(dlg);
-            // 取消 WS_EX_TOPMOST 与 WS_EX_TOOLWINDOW：不死压其他应用上方，支持 Alt+Tab 正常切换
+            // 作为独立顶层应用窗口创建（无所有者、带系统菜单与最小化/最大化能力），确保正常参与前景/Alt+Tab/Dock 追踪
             let hwnd = match CreateWindowExW(
-                WINDOW_EX_STYLE(0),
+                WS_EX_APPWINDOW,
                 wide_static(CLASS_SETTINGS),
                 w!("WinDockFinder 设置"),
-                WS_POPUP,
+                WS_POPUP | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU,
                 x,
                 y,
                 cw,
                 ch,
-                app.hwnd,
+                None,
                 None,
                 crate::win32::hinstance(),
                 Some(raw as *const _),
@@ -356,7 +357,7 @@ impl Settings {
                     return Err(msg);
                 }
             };
-            enable_rounded(hwnd, dark);
+            enable_rounded(hwnd, dark, false);
             let _ = ShowWindow(hwnd, SW_SHOW);
             crate::win32::bring_to_front(hwnd);
             let s = Settings { dlg: raw, hwnd };
@@ -369,12 +370,21 @@ impl Settings {
         unsafe { !self.hwnd.0.is_null() && IsWindow(self.hwnd).as_bool() }
     }
 
+    pub fn hwnd(&self) -> HWND {
+        self.hwnd
+    }
+
     pub fn activate(&mut self) {
         if !self.is_open() {
             return;
         }
         unsafe {
-            let _ = ShowWindow(self.hwnd, SW_SHOW);
+            // 最小化后激活需先还原，再前置焦点
+            if IsIconic(self.hwnd).as_bool() {
+                let _ = ShowWindow(self.hwnd, SW_RESTORE);
+            } else {
+                let _ = ShowWindow(self.hwnd, SW_SHOW);
+            }
             crate::win32::bring_to_front(self.hwnd);
         }
     }
@@ -441,7 +451,7 @@ fn register_class() {
         let hinst = crate::win32::hinstance();
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: CS_HREDRAW | CS_VREDRAW,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(proc),
             hInstance: hinst,
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
@@ -453,14 +463,34 @@ fn register_class() {
     });
 }
 
-/// 无边框弹窗启用 Windows 11 原生圆角、阴影与深浅边框模式同步。
-fn enable_rounded(hwnd: HWND, dark: bool) {
+/// 约束无边框设置窗口的最大化范围到所在显示器工作区（保留顶部栏区域，不触发独占全屏判定）。
+fn clamp_minmax_info(mmi: &mut MINMAXINFO, mon_rect: RECT, mon_work: RECT) {
+    mmi.ptMaxPosition.x = mon_work.left - mon_rect.left;
+    mmi.ptMaxPosition.y = mon_work.top - mon_rect.top;
+    mmi.ptMaxSize.x = (mon_work.right - mon_work.left).max(1);
+    mmi.ptMaxSize.y = (mon_work.bottom - mon_work.top).max(1);
+    mmi.ptMaxTrackSize = mmi.ptMaxSize;
+}
+
+unsafe fn clamp_minmax_for_hwnd(hwnd: HWND, lparam: LPARAM) -> bool {
+    let Some(mmi) = (lparam.0 as *mut MINMAXINFO).as_mut() else {
+        return false;
+    };
+    let Some(mon) = crate::win32::monitor_of_window(hwnd).or_else(crate::win32::primary_monitor) else {
+        return false;
+    };
+    clamp_minmax_info(mmi, mon.rect, mon.work);
+    true
+}
+
+/// 无边框应用窗口启用 Windows 11 原生圆角（最大化时取消圆角）、阴影与深浅边框模式同步。
+fn enable_rounded(hwnd: HWND, dark: bool, zoomed: bool) {
     use windows::Win32::Graphics::Dwm::{
         DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE,
-        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND,
     };
     unsafe {
-        let pref = DWMWCP_ROUND.0 as u32;
+        let pref = if zoomed { DWMWCP_DONOTROUND.0 } else { DWMWCP_ROUND.0 } as u32;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &pref as *const u32 as *const _, 4);
         let dark_val = u32::from(dark);
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark_val as *const u32 as *const _, 4);
@@ -531,7 +561,8 @@ impl Dlg {
         self.dark = next_dark;
         self.pal = palette(self.dark, accent_from_config(&cfg.appearance));
         if dark_changed && !self.hwnd.0.is_null() {
-            enable_rounded(self.hwnd, self.dark);
+            let zoomed = unsafe { IsZoomed(self.hwnd).as_bool() };
+            enable_rounded(self.hwnd, self.dark, zoomed);
         }
     }
 
@@ -1605,7 +1636,8 @@ fn focus_ring(dlg: &Dlg, sf: &mut Surface, hit: Hit, r: RECT, s: f32) {
     }
 }
 
-fn paint(dlg: &mut Dlg, app: &App) {
+/// 将设置窗口当前内容绘制到离线缓存并复用（供 WM_PAINT 与 PrintWindow/WM_PRINTCLIENT 共享）。
+fn render_surface(dlg: &mut Dlg, app: &App) -> Option<(HDC, i32, i32)> {
     let mut cr = RECT::default();
     unsafe {
         let _ = GetClientRect(dlg.hwnd, &mut cr);
@@ -1613,9 +1645,9 @@ fn paint(dlg: &mut Dlg, app: &App) {
     let w = (cr.right - cr.left).max(1);
     let h = (cr.bottom - cr.top).max(1);
     if !dlg.target.ensure_at_least(w, h) {
-        return;
+        return None;
     }
-    let Some(dc) = dlg.target.mem_dc else { return };
+    let dc = dlg.target.mem_dc?;
     let mut l = dlg.layout(dc, app);
     if dlg.scroll > l.max_scroll {
         dlg.scroll = l.max_scroll;
@@ -1624,7 +1656,7 @@ fn paint(dlg: &mut Dlg, app: &App) {
     if dlg.page == Page::About && dlg.color_text.is_none() {
         dlg.color_text = ColorTextRenderer::new().ok();
     }
-    let Some(mut sf) = dlg.target.surface() else { return };
+    let mut sf = dlg.target.surface()?;
     let s = dlg.scale;
     paint_frame(dlg, &l, &mut sf, dc);
     if dlg.page == Page::About {
@@ -1632,15 +1664,33 @@ fn paint(dlg: &mut Dlg, app: &App) {
     } else {
         paint_rows(dlg, app, &l, &mut sf, dc);
     }
-    sf.stroke_rrect(&rc(0, 0, w - 1, h - 1), 10.0 * s, 1.0, (0.0, 0.0, 0.0, 0.10));
+    if !unsafe { IsZoomed(dlg.hwnd).as_bool() } {
+        sf.stroke_rrect(&rc(0, 0, w - 1, h - 1), 10.0 * s, 1.0, (0.0, 0.0, 0.0, 0.10));
+    }
     if let Some((anchor, text)) = &dlg.tip_visible {
         draw_tooltip(&mut sf, dc, dlg.font_tip, anchor, text, w, h, s);
     }
+    Some((dc, w, h))
+}
+
+fn paint(dlg: &mut Dlg, app: &App) {
+    let Some((dc, w, h)) = render_surface(dlg, app) else { return };
     unsafe {
         let mut ps = PAINTSTRUCT::default();
         let wdc = BeginPaint(dlg.hwnd, &mut ps);
         let _ = BitBlt(wdc, 0, 0, w, h, dc, 0, 0, SRCCOPY);
         let _ = EndPaint(dlg.hwnd, &ps);
+    }
+}
+
+fn paint_to_dc(dlg: &mut Dlg, app: &App, target_dc: HDC) {
+    if target_dc.is_invalid() {
+        return;
+    }
+    if let Some((dc, w, h)) = render_surface(dlg, app) {
+        unsafe {
+            let _ = BitBlt(target_dc, 0, 0, w, h, dc, 0, 0, SRCCOPY);
+        }
     }
 }
 
@@ -2189,6 +2239,12 @@ fn paint_about(dlg: &mut Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: HDC) 
 // ---------- 窗口过程 ----------
 
 unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == WM_GETMINMAXINFO && clamp_minmax_for_hwnd(hwnd, lparam) {
+        return LRESULT(0);
+    }
+    if msg == WM_ERASEBKGND {
+        return LRESULT(1);
+    }
     if msg == WM_NCCREATE {
         let cs = lparam.0 as *const CREATESTRUCTW;
         let param = (*cs).lpCreateParams;
@@ -2213,6 +2269,15 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
         drop(Box::from_raw(ptr));
         return LRESULT(0);
     }
+    // 外层正处于 App 处理器或模态对话框期间，避免同步重绘/定时器/打印消息重入造就可变引用别名
+    if crate::app::handler_busy() {
+        if msg == WM_PAINT {
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        if matches!(msg, WM_PRINTCLIENT | WM_TIMER) {
+            return LRESULT(0);
+        }
+    }
     let dlg = &mut *ptr;
     let app = &mut *dlg.app;
     crate::app::hold_app(|| {
@@ -2230,9 +2295,18 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
 fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
-            WM_ERASEBKGND => LRESULT(1),
             WM_PAINT => {
                 paint(dlg, app);
+                LRESULT(0)
+            }
+            WM_PRINTCLIENT => {
+                paint_to_dc(dlg, app, HDC(wparam.0 as *mut _));
+                LRESULT(0)
+            }
+            WM_SIZE => {
+                let zoomed = wparam.0 == SIZE_MAXIMIZED as usize || IsZoomed(hwnd).as_bool();
+                enable_rounded(hwnd, dlg.dark, zoomed);
+                let _ = InvalidateRect(hwnd, None, false);
                 LRESULT(0)
             }
             WM_ACTIVATE | WM_KILLFOCUS if dlg.capture.is_some() && (msg == WM_KILLFOCUS || loword(wparam.0) == 0) => {
@@ -2334,13 +2408,17 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 let _ = InvalidateRect(hwnd, None, false);
                 LRESULT(0)
             }
-            WM_LBUTTONDOWN => {
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
                 let dc = dlg.dc();
                 let (x, y) = (get_x_lparam(lparam.0), get_y_lparam(lparam.0));
                 let l = dlg.layout(dc, app);
                 let hit = dlg.hit_test(&l, dc, app, x, y);
                 dlg.tip_visible = None;
                 dlg.focus_from_keyboard = false;
+                if msg == WM_LBUTTONDBLCLK && hit == Hit::DragBar {
+                    let _ = ShowWindow(hwnd, if IsZoomed(hwnd).as_bool() { SW_RESTORE } else { SW_MAXIMIZE });
+                    return LRESULT(0);
+                }
                 if hit == Hit::DragBar {
                     let _ = ReleaseCapture();
                     let _ = SendMessageW(hwnd, WM_NCLBUTTONDOWN, WPARAM(HTCAPTION as usize), LPARAM(0));
@@ -2525,5 +2603,28 @@ mod tests {
         let list = rc(0, 0, 500, 300);
         assert_eq!(dlg.list_rows(list, 10, 0, DOCK_VISIBLE).len(), 6);
         assert_eq!(dlg.list_rows(list, 4, 0, DOCK_VISIBLE).len(), 4);
+    }
+
+    #[test]
+    fn maximize_bounds_clamp_to_monitor_work_area() {
+        let mut primary = MINMAXINFO::default();
+        let mon_p = rc(0, 0, 1920, 1080);
+        let work_p = rc(0, 28, 1920, 1080);
+        clamp_minmax_info(&mut primary, mon_p, work_p);
+        assert_eq!(primary.ptMaxPosition.x, 0);
+        assert_eq!(primary.ptMaxPosition.y, 28);
+        assert_eq!(primary.ptMaxSize.x, 1920);
+        assert_eq!(primary.ptMaxSize.y, 1052);
+        assert_eq!(primary.ptMaxTrackSize.x, 1920);
+        assert_eq!(primary.ptMaxTrackSize.y, 1052);
+
+        let mut secondary = MINMAXINFO::default();
+        let mon_s = rc(1920, 0, 3840, 1080);
+        let work_s = rc(1920, 32, 3840, 1040);
+        clamp_minmax_info(&mut secondary, mon_s, work_s);
+        assert_eq!(secondary.ptMaxPosition.x, 0);
+        assert_eq!(secondary.ptMaxPosition.y, 32);
+        assert_eq!(secondary.ptMaxSize.x, 1920);
+        assert_eq!(secondary.ptMaxSize.y, 1008);
     }
 }
