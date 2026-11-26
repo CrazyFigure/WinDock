@@ -140,7 +140,7 @@ impl CoverWindow {
                         | WS_EX_TRANSPARENT,
                     w!("Static"),
                     w!("WinDockFinder tray cover"),
-                    WS_POPUP,
+                    WS_POPUP | WS_DISABLED,
                     bounds.left,
                     bounds.top,
                     w,
@@ -299,9 +299,46 @@ fn menu_position(anchor: RECT, work: RECT, width: i32, height: i32, gap: i32) ->
     POINT { x: left, y: top }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PopupKind {
+    NativeMenu,
+    ToolkitMenu,
+    ToolWindow,
+}
+
+/// 直接识别标准菜单和 Qt 菜单；其他工具浮窗还需结合所属进程及生成位置确认。
+fn popup_kind(class: &str, style: WINDOW_STYLE, ex_style: WINDOW_EX_STYLE) -> Option<PopupKind> {
+    if class == "#32768" {
+        Some(PopupKind::NativeMenu)
+    } else if !style.contains(WS_CAPTION)
+        && ex_style.contains(WS_EX_TOOLWINDOW)
+        && !ex_style.contains(WS_EX_APPWINDOW)
+    {
+        if class.starts_with("Qt") && class.contains("QWindowPopup") {
+            Some(PopupKind::ToolkitMenu)
+        } else if style.contains(WS_POPUP) {
+            Some(PopupKind::ToolWindow)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+fn window_popup_kind(hwnd: HWND) -> Option<PopupKind> {
+    unsafe {
+        popup_kind(
+            &class_name(hwnd),
+            WINDOW_STYLE(GetWindowLongPtrW(hwnd, GWL_STYLE) as u32),
+            WINDOW_EX_STYLE(GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32),
+        )
+    }
+}
+
 fn popup_windows() -> Vec<HWND> {
     unsafe extern "system" fn collect(hwnd: HWND, data: LPARAM) -> BOOL {
-        if IsWindowVisible(hwnd).as_bool() && class_name(hwnd) == "#32768" {
+        if IsWindowVisible(hwnd).as_bool() && window_popup_kind(hwnd).is_some() {
             (*(data.0 as *mut Vec<HWND>)).push(hwnd);
         }
         true.into()
@@ -326,6 +363,7 @@ pub(super) struct MenuPlacement {
     anchor: RECT,
     source: POINT,
     placed: bool,
+    observed: bool,
 }
 
 thread_local! {
@@ -352,22 +390,28 @@ unsafe extern "system" fn on_popup(
 }
 
 impl MenuPlacement {
-    pub fn new(anchor: RECT, source: POINT, app_windows: &[isize]) -> Self {
+    pub fn new(anchor: RECT, source: POINT, app_windows: &[isize], tray_owners: &[u32]) -> Self {
         Self {
             old_windows: popup_windows(),
-            owner_pids: app_windows
+            owner_pids: tray_owners
                 .iter()
-                .map(|raw| window_pid(HWND(*raw as *mut _)))
+                .copied()
+                .chain(
+                    app_windows
+                        .iter()
+                        .map(|raw| window_pid(HWND(*raw as *mut _))),
+                )
                 .filter(|pid| *pid != 0)
                 .collect(),
             anchor,
             source,
             placed: false,
+            observed: false,
         }
     }
 
     /// 先监听应用菜单的出现事件再发送输入，尽早搬移窗口。旧版菜单缺少事件时短时补查。
-    pub fn open_at(self, open: impl FnOnce() -> bool) -> bool {
+    pub fn open_at(self, open: impl FnOnce() -> bool, fallback: impl FnOnce() -> bool) -> bool {
         let pid = if self.owner_pids.len() == 1 {
             *self.owner_pids.iter().next().unwrap_or(&0)
         } else {
@@ -387,36 +431,12 @@ impl MenuPlacement {
                 )
             })
         };
-        let opened = open();
-        if opened {
-            let deadline = Instant::now() + Duration::from_millis(450);
-            let mut msg = MSG::default();
-            loop {
-                // 消息检查也会分发排队的进程外 WinEvent。
-                unsafe {
-                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-                        DispatchMessageW(&msg);
-                    }
-                }
-                let placed = PENDING_MENU.with(|slot| {
-                    let mut slot = slot.borrow_mut();
-                    let Some(placement) = slot.as_mut() else {
-                        return false;
-                    };
-                    if !placement.placed {
-                        for hwnd in popup_windows() {
-                            if placement.try_move(hwnd) {
-                                break;
-                            }
-                        }
-                    }
-                    placement.placed
-                });
-                if placed || Instant::now() >= deadline {
-                    break;
-                }
-                unsafe { MsgWaitForMultipleObjectsEx(None, 8, QS_ALLINPUT, MWMO_INPUTAVAILABLE) };
-            }
+        let requested = open();
+        // 部分程序只消费右键鼠标通知。UIA 返回成功但没有应用菜单时再透传鼠标。
+        let observed = requested && Self::wait_for_menu(Duration::from_millis(270));
+        let sent_mouse = !observed && fallback();
+        if sent_mouse {
+            Self::wait_for_menu(Duration::from_millis(450));
         }
         for hook in hooks.into_iter().filter(|hook| !hook.is_invalid()) {
             unsafe {
@@ -424,17 +444,50 @@ impl MenuPlacement {
             }
         }
         PENDING_MENU.with(|slot| slot.replace(None));
-        opened
+        requested || sent_mouse
+    }
+
+    fn wait_for_menu(timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut msg = MSG::default();
+        loop {
+            // 消息检查也会分发排队的进程外 WinEvent。
+            unsafe {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    DispatchMessageW(&msg);
+                }
+            }
+            let (placed, observed) = PENDING_MENU.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                let Some(placement) = slot.as_mut() else {
+                    return (false, false);
+                };
+                if !placement.placed {
+                    for hwnd in popup_windows() {
+                        if placement.try_move(hwnd) {
+                            break;
+                        }
+                    }
+                }
+                (placement.placed, placement.observed)
+            });
+            if placed || Instant::now() >= deadline {
+                return observed;
+            }
+            unsafe { MsgWaitForMultipleObjectsEx(None, 8, QS_ALLINPUT, MWMO_INPUTAVAILABLE) };
+        }
     }
 
     fn try_move(&mut self, hwnd: HWND) -> bool {
         if self.placed
             || self.old_windows.contains(&hwnd)
             || !unsafe { IsWindowVisible(hwnd).as_bool() }
-            || class_name(hwnd) != "#32768"
         {
             return false;
         }
+        let Some(kind) = window_popup_kind(hwnd) else {
+            return false;
+        };
         let mut rect = RECT::default();
         if unsafe { GetWindowRect(hwnd, &mut rect).is_err() }
             || rect.right <= rect.left
@@ -448,14 +501,23 @@ impl MenuPlacement {
         };
         let gap = crate::win32::dp(4, monitor.dpi);
         let tolerance = crate::win32::dp(32, monitor.dpi);
-        let matches = if self.owner_pids.is_empty() {
-            touches_source(rect, self.source, tolerance)
-        } else {
-            self.owner_pids.contains(&window_pid(hwnd))
+        let anchor = POINT {
+            x: self.anchor.left,
+            y: self.anchor.bottom,
+        };
+        let nearby =
+            touches_source(rect, self.source, tolerance) || touches_source(rect, anchor, tolerance);
+        let owned = self.owner_pids.contains(&window_pid(hwnd));
+        // 通用工具窗同时需要进程归属和相关落点，避免误移动同进程的通知。
+        let matches = match kind {
+            PopupKind::NativeMenu => owned || (self.owner_pids.is_empty() && nearby),
+            PopupKind::ToolkitMenu => owned,
+            PopupKind::ToolWindow => owned && nearby,
         };
         if !matches || unsafe { IsHungAppWindow(hwnd).as_bool() } {
             return false;
         }
+        self.observed = true;
         let point = menu_position(
             self.anchor,
             monitor.work,
@@ -522,5 +584,29 @@ mod tests {
             bottom: 2014,
         };
         assert_eq!(revealed_bounds(tucked, screen).top, 1824);
+    }
+
+    #[test]
+    fn recognizes_toolkit_popup_without_accepting_normal_windows() {
+        assert_eq!(
+            popup_kind("#32768", WS_POPUP, WS_EX_TOOLWINDOW),
+            Some(PopupKind::NativeMenu)
+        );
+        assert_eq!(
+            popup_kind(
+                "Qt683QWindowPopupSaveBits",
+                WS_VISIBLE,
+                WS_EX_TOOLWINDOW | WS_EX_LAYERED
+            ),
+            Some(PopupKind::ToolkitMenu)
+        );
+        assert_eq!(
+            popup_kind("Application", WS_POPUP | WS_CAPTION, WS_EX_TOOLWINDOW),
+            None
+        );
+        assert_eq!(
+            popup_kind("Application", WS_POPUP, WS_EX_TOOLWINDOW | WS_EX_APPWINDOW),
+            None
+        );
     }
 }

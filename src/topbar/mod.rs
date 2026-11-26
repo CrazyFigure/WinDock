@@ -7,6 +7,7 @@ pub mod status;
 pub mod tray_mirror;
 pub mod tray_popover;
 mod tray_popup;
+mod tray_registry;
 
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};

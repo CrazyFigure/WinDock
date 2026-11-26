@@ -250,7 +250,12 @@ fn entries_equal(a: &crate::dock::items::EntryList, b: &crate::dock::items::Entr
 enum TrayWork {
     // 图标采样中的用户点击排在其后，避免两个后台线程同时操作同一个原生托盘。
     Refresh { queued_click: Option<(TrayItem, Option<RECT>)> },
-    Click { right: bool, screen: POINT },
+    Click { right: bool, screen: POINT, queued_click: Option<(TrayItem, Option<RECT>)> },
+}
+
+enum TraySeed {
+    Loading(Option<HWND>),
+    Ready,
 }
 
 /// 顶部栏与收纳浮层都是无边框窗口，使用实际图标矩形确定屏幕锚点。
@@ -314,6 +319,7 @@ pub struct App {
     tray_snapshot_generation: u64,
     pub last_tray_refresh: Option<Instant>,
     tray_work: Option<TrayWork>,
+    tray_seed: TraySeed,
     pub temp_show_until: Option<Instant>,
     pub display_dirty_at: Option<Instant>,
     pub cursor_monitor: isize,
@@ -443,6 +449,7 @@ pub fn run(open_settings: bool) -> i32 {
         tray_snapshot_generation: 0,
         last_tray_refresh: None,
         tray_work: None,
+        tray_seed: TraySeed::Ready,
         temp_show_until: None,
         display_dirty_at: None,
         cursor_monitor: 0,
@@ -496,6 +503,10 @@ pub fn run(open_settings: bool) -> i32 {
 impl App {
     fn init(&mut self) {
         self.heartbeat = Heartbeat::create(std::process::id());
+        // 与窗口监控、顶部栏和守护进程初始化并行准备首屏图标。
+        if self.config.topbar.enabled && tray_mirror::spawn_seed(self.hwnd, self.tray_icons.clone()) {
+            self.tray_seed = TraySeed::Loading(None);
+        }
         monitor::install(self.hwnd);
         taskbar::install_hook(self.hwnd);
         self.snap = monitor::snapshot();
@@ -1017,7 +1028,9 @@ impl App {
     // ---------- 托盘镜像 ----------
 
     pub fn refresh_tray(&mut self) {
-        if self.topbars.is_empty() || self.tray_work.is_some() || self.snap.fullscreen {
+        if self.topbars.is_empty() || self.tray_work.is_some() || self.snap.fullscreen
+            || matches!(self.tray_seed, TraySeed::Loading(_))
+        {
             return;
         }
         let peek = self.taskbar.begin_tray_peek();
@@ -1046,6 +1059,17 @@ impl App {
         }
     }
 
+    /// 首次点开收纳时，等一次轻量注册快照，让首屏同时包含窗口和托盘条目。
+    fn on_tray_seed(&mut self, snapshot: TraySnapshot) {
+        self.apply_tray_snapshot(snapshot);
+        if let TraySeed::Loading(Some(hwnd)) = std::mem::replace(&mut self.tray_seed, TraySeed::Ready) {
+            if let Some(index) = self.topbar_index(hwnd) {
+                self.open_popover(index);
+            }
+        }
+        self.refresh_tray();
+    }
+
     /// 同步可见托盘的扫描结果，保留当前未展开区域的缓存。
     fn apply_tray_snapshot(&mut self, snapshot: TraySnapshot) {
         if snapshot.apply(&mut self.tray_raw_items, &mut self.tray_snapshot_generation) {
@@ -1070,18 +1094,34 @@ impl App {
     /// 同步顶部栏与收纳浮层中的应用/托盘图标列表。
     pub fn sync_shelf_items(&mut self) {
         let apps = monitor::running_apps();
-        for a in &apps {
-            if !a.exe.is_empty() {
-                self.icon_worker.request(&a.exe, DOCK_ICON_SRC_SIZE);
+        let items = tray_mirror::build_shelf_items(&apps, &self.tray_raw_items);
+        for exe in items.iter().filter_map(|item| item.app_exe.as_deref()).filter(|exe| !exe.is_empty()) {
+            self.icon_worker.request(exe, DOCK_ICON_SRC_SIZE);
+        }
+        // 旧版保存在提示文字下的固定项，在其注册身份唯一时迁移到稳定键。
+        let mut pins = Vec::new();
+        for saved in &self.config.topbar.pinned_tray_keys {
+            let mut matches = items.iter().filter(|item| item.legacy_keys.contains(saved));
+            let key = if items.iter().any(|item| &item.key == saved) {
+                saved
+            } else {
+                matches.next().filter(|_| matches.next().is_none()).map_or(saved, |item| &item.key)
+            };
+            if !pins.contains(key) {
+                pins.push(key.clone());
             }
         }
-        let items = tray_mirror::build_shelf_items(&apps, &self.tray_raw_items);
+        if pins != self.config.topbar.pinned_tray_keys {
+            self.config.topbar.pinned_tray_keys = pins.clone();
+            let _ = self.store.save_config(&self.config);
+        }
         for bar in &mut self.topbars {
             bar.tray_items = items.clone();
+            bar.pinned.clone_from(&pins);
             if let Some(p) = bar.popover.as_mut() {
                 if p.visible {
-                    p.items = items.clone();
-                    p.render();
+                    p.pinned.clone_from(&pins);
+                    p.update_items(items.clone());
                 }
             }
             bar.layout(&self.config.topbar);
@@ -2526,16 +2566,16 @@ impl App {
             self.invoke_window_shelf_item(&item, false, screen);
             return;
         }
-        if let Some(TrayWork::Refresh { queued_click }) = &mut self.tray_work {
+        if let Some(work) = &mut self.tray_work {
+            let queued_click = match work {
+                TrayWork::Refresh { queued_click } | TrayWork::Click { queued_click, .. } => queued_click,
+            };
             *queued_click = Some((item, anchor));
-            return;
-        }
-        if self.tray_work.is_some() {
             return;
         }
         let peek = self.taskbar.begin_tray_peek();
         if tray_mirror::spawn_invocation(self.hwnd, item.clone(), anchor, peek, self.tray_icons.clone()) {
-            self.tray_work = Some(TrayWork::Click { right, screen });
+            self.tray_work = Some(TrayWork::Click { right, screen, queued_click: None });
         } else {
             self.taskbar.end_tray_peek();
             self.invoke_window_shelf_item(&item, right, screen);
@@ -2543,9 +2583,13 @@ impl App {
     }
 
     fn on_tray_invoked(&mut self, result: TrayInvocation) {
-        let Some(TrayWork::Click { right, screen }) = self.tray_work.take() else { return };
+        let Some(TrayWork::Click { right, screen, queued_click }) = self.tray_work.take() else { return };
         self.taskbar.end_tray_peek();
         self.apply_tray_snapshot(result.snapshot);
+        if let Some((item, anchor)) = queued_click {
+            self.invoke_tray_native(item, anchor);
+            return;
+        }
         // 普通窗口才回退到窗口菜单。
         if result.ordinary_window {
             self.invoke_window_shelf_item(&result.target, right, screen);
@@ -2984,6 +3028,11 @@ impl App {
     }
 
     fn open_popover(&mut self, bi: usize) {
+        if let TraySeed::Loading(pending) = &mut self.tray_seed {
+            let hwnd = self.topbars[bi].hwnd;
+            *pending = (*pending != Some(hwnd)).then_some(hwnd);
+            return;
+        }
         self.context_menu.close();
         self.status_panel.close();
         self.window_preview.close();
@@ -3024,6 +3073,9 @@ impl App {
     }
 
     pub fn close_popover(&mut self) {
+        if let TraySeed::Loading(pending) = &mut self.tray_seed {
+            *pending = None;
+        }
         let ptr = app_ptr() as isize;
         let mut closed = false;
         for bar in &mut self.topbars {
@@ -3215,6 +3267,11 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         crate::topbar::tray_mirror::WM_APP_TRAY_ITEMS => {
             if lparam.0 != 0 {
                 app.on_tray_refresh(*Box::from_raw(lparam.0 as *mut TrayRefresh));
+            }
+        }
+        crate::topbar::tray_mirror::WM_APP_TRAY_SEED => {
+            if lparam.0 != 0 {
+                app.on_tray_seed(*Box::from_raw(lparam.0 as *mut TraySnapshot));
             }
         }
         crate::topbar::tray_mirror::WM_APP_TRAY_INVOKED => {

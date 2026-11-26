@@ -55,6 +55,7 @@ pub struct Popover {
     pub pinned: Vec<String>,
     pub dark: bool,
     pub accent: (f32, f32, f32),
+    anchor: RECT,
 }
 
 static REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -112,6 +113,7 @@ impl Popover {
                 pinned: Vec::new(),
                 dark: false,
                 accent: (0.04, 0.52, 1.0),
+                anchor: RECT::default(),
             })
         }
     }
@@ -157,7 +159,43 @@ impl Popover {
         self.drag = None;
         self.dark = appearance.is_dark();
         self.accent = accent_from_config(appearance);
+        self.anchor = anchor;
+        self.resize_to_items();
+        unsafe {
+            self.visible = true;
+            self.render();
+            let _ = ShowWindow(self.hwnd, SW_SHOW);
+            let _ = SetForegroundWindow(self.hwnd);
+            let _ = SetFocus(self.hwnd);
+        }
+    }
 
+    /// 注册项后续增减时同步格子与窗口范围，避免留下旧的鼠标命中位置。
+    pub fn update_items(&mut self, mut items: Vec<TrayItem>) {
+        // 前台切换会改变运行窗口枚举顺序，已打开的收纳格保持原相对位置。
+        items.sort_by_key(|item| self.items.iter().position(|old| old.key == item.key).unwrap_or(usize::MAX));
+        let layout_changed = !self.items.iter().map(|item| &item.key).eq(items.iter().map(|item| &item.key));
+        self.items = items;
+        if layout_changed {
+            self.scroll = self.scroll.min(self.scroll_max());
+            self.hover_idx = None;
+            self.hover_since = None;
+            self.tip_visible = false;
+            self.press = None;
+            self.drag = None;
+            unsafe {
+                let _ = KillTimer(self.hwnd, TIMER_TIP);
+                if windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() == self.hwnd {
+                    let _ = ReleaseCapture();
+                }
+            }
+            self.resize_to_items();
+        }
+        self.render();
+    }
+
+    fn resize_to_items(&mut self) {
+        let anchor = self.anchor;
         let cols = if self.items.is_empty() {
             4
         } else {
@@ -189,11 +227,6 @@ impl Popover {
                 top = (anchor.top - self.h - 4).max(mi.rcWork.top + 8);
             }
             let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, left, top, self.w, self.h, SWP_NOACTIVATE | SWP_NOSENDCHANGING);
-            self.visible = true;
-            self.render();
-            let _ = ShowWindow(self.hwnd, SW_SHOW);
-            let _ = SetForegroundWindow(self.hwnd);
-            let _ = SetFocus(self.hwnd);
         }
     }
 
