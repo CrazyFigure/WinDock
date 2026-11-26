@@ -147,15 +147,16 @@ impl Popover {
     }
 
     pub fn cell_sz(&self) -> i32 {
-        dp(42, self.dpi)
+        // 与顶部栏 30dp 固定图标格保持接近，四周留白紧凑
+        dp(30, self.dpi)
     }
 
     pub fn cell_gap(&self) -> i32 {
-        dp(4, self.dpi)
+        dp(3, self.dpi)
     }
 
     pub fn pad(&self) -> i32 {
-        dp(10, self.dpi)
+        dp(7, self.dpi)
     }
 
     fn total_rows(&self) -> usize {
@@ -221,7 +222,11 @@ impl Popover {
         let card_h = pad * 2 + rows as i32 * cell + (rows as i32 - 1).max(0) * gap;
 
 
-        self.w = card_w.max(dp(190, self.dpi));
+        self.w = if self.items.is_empty() {
+            card_w.max(dp(140, self.dpi))
+        } else {
+            card_w
+        };
         self.card_top = 0;
         self.h = card_h;
 
@@ -362,8 +367,8 @@ impl Popover {
         let accent_bg = (self.accent.0, self.accent.1, self.accent.2, if self.dark { 0.22 } else { 0.14 });
         let accent_bd = (self.accent.0, self.accent.1, self.accent.2, 0.65);
 
-        sf.fill_rrect(&card, 12.0 * s, bg);
-        sf.stroke_rrect(&card, 12.0 * s, 1.0, bd);
+        sf.fill_rrect(&card, 10.0 * s, bg);
+        sf.stroke_rrect(&card, 10.0 * s, 1.0, bd);
 
         if self.items.is_empty() {
             draw_transparent_text_aligned(&mut sf, &mut self.scratch, "暂无打开的应用", self.font, &card, fg_dim, TextAlign::Center, false, s);
@@ -382,26 +387,26 @@ impl Popover {
                 let is_context = self.context_key.as_deref() == Some(item.key.as_str());
 
                 if is_press || is_context {
-                    sf.fill_rrect(&r, 9.0 * s, press_bg);
+                    sf.fill_rrect(&r, 7.0 * s, press_bg);
                 } else if is_hover {
-                    sf.fill_rrect(&r, 9.0 * s, hover_bg);
+                    sf.fill_rrect(&r, 7.0 * s, hover_bg);
                 } else if is_pinned {
-                    sf.fill_rrect(&r, 9.0 * s, accent_bg);
+                    sf.fill_rrect(&r, 7.0 * s, accent_bg);
                 }
                 if is_pinned || is_context {
-                    sf.stroke_rrect(&r, 9.0 * s, 1.0, accent_bd);
+                    sf.stroke_rrect(&r, 7.0 * s, 1.0, accent_bd);
                 }
 
                 let cx = (r.left + r.right) as f32 * 0.5;
                 let cy = (r.top + r.bottom) as f32 * 0.5;
-                let icon_sz = 22.0 * s;
+                let icon_sz = 18.0 * s;
                 draw_shelf_item_icon(&mut sf, &mut self.scratch, self.font, item, &app_icons, &tray_icons, cx, cy, icon_sz, self.dark, s);
 
                 // 右上角固定指示小圆点
                 if is_pinned {
-                    let dx = r.right as f32 - 6.5 * s;
-                    let dy = r.top as f32 + 6.5 * s;
-                    sf.fill_circle(dx, dy, 2.8 * s, (self.accent.0, self.accent.1, self.accent.2, 0.98));
+                    let dx = r.right as f32 - 4.5 * s;
+                    let dy = r.top as f32 + 4.5 * s;
+                    sf.fill_circle(dx, dy, 2.1 * s, (self.accent.0, self.accent.1, self.accent.2, 0.98));
                 }
 
             }
