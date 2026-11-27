@@ -657,7 +657,7 @@ impl Surface {
     }
 
     /// 绘制光学「液态玻璃」圆角胶囊：
-    /// 结合 SDF 边缘凸透镜折射、轻度棱镜色散、对角菲涅尔高光亮边、内倒角光晕与外围柔和环境投影。
+    /// 结合 SDF 边缘凸透镜折射、轻度棱镜色散、克制天光细边高光、温和背景提亮与外围柔和环境投影。
     pub fn fill_liquid_glass_capsule(
         &mut self,
         r: &RECT,
@@ -731,9 +731,11 @@ impl Surface {
         let sh_hh = ((h_f + 3.0 * s_dpi) * 0.5 - sh_rad).max(0.0);
         let sh_cy = cy + 3.2 * s_dpi;
         let sh_strength = if dark { 0.28 } else { 0.16 };
-        let rim_peak = 0.85 * s_dpi;
-        let rim_half = 1.65 * s_dpi;
-        let bevel_glow_w = 7.0 * s_dpi;
+        // 方案 A（柔和天光细边）：收窄镜面高光环与内倒角光晕，避免四周出现刺眼白框
+        let rim_peak = 0.55 * s_dpi;
+        let rim_half = 0.85 * s_dpi;
+        let bevel_glow_w = 2.2 * s_dpi;
+        let outer_edge_w = 0.85 * s_dpi;
         let refract_amp = 15.0 * s_dpi;
         let disp_amp = 2.4 * s_dpi;
 
@@ -751,16 +753,16 @@ impl Surface {
             let tint_r = top_tint.0 + (bot_tint.0 - top_tint.0) * vy;
             let tint_g = top_tint.1 + (bot_tint.1 - top_tint.1) * vy;
             let tint_b = top_tint.2 + (bot_tint.2 - top_tint.2) * vy;
-            // 顶部柔光高光带 + 底部微弱内反光
-            let top_sheen = if vy < 0.36 {
-                let k = 1.0 - vy / 0.36;
-                k * k * (if dark { 0.10 } else { 0.20 })
+            // 克制顶部柔光带与微弱底部反光，避免大面积泛白洗淡背景色彩
+            let top_sheen = if vy < 0.22 {
+                let k = 1.0 - vy / 0.22;
+                k * k * (if dark { 0.022 } else { 0.045 })
             } else {
                 0.0
             };
-            let bot_bounce = if vy > 0.80 {
-                let k = (vy - 0.80) / 0.20;
-                k * k * (if dark { 0.06 } else { 0.11 })
+            let bot_bounce = if vy > 0.88 {
+                let k = (vy - 0.88) / 0.12;
+                k * k * (if dark { 0.008 } else { 0.014 })
             } else {
                 0.0
             };
@@ -842,7 +844,7 @@ impl Surface {
                 gg = gg * (1.0 - eff_veil) + tint_g * eff_veil;
                 gb = gb * (1.0 - eff_veil) + tint_b * eff_veil;
 
-                // 叠加顶部流光高光与底部内反光
+                // 叠加克制的顶部流光与底部微弱反光
                 let sheen = top_sheen + bot_bounce;
                 if sheen > 0.001 {
                     gr = gr * (1.0 - sheen) + sheen;
@@ -850,35 +852,45 @@ impl Surface {
                     gb = gb * (1.0 - sheen) + sheen;
                 }
 
-                // 对角方向性菲涅尔亮边（左上主高光 + 右下二次反射，复刻液态玻璃立体轮廓；零 powf/exp 开销）
+                // 顶部天光主导 + 柔和左上高光，大幅压低左右两侧与下沿反光，消除四周“聚光灯打白”感
                 let light_dot = nx * -0.7071 + ny * -0.7071;
                 let ld_pos = light_dot.max(0.0);
                 let ld_neg = (-light_dot).max(0.0);
-                let fresnel_dir = ld_pos * ld_pos.sqrt() + ld_neg * ld_neg * 0.72 + 0.16;
+                let sky = (-ny).max(0.0);
+                let fresnel_dir = ld_pos * ld_pos * 0.38 + sky * 0.42 + ld_neg * ld_neg * 0.08 + 0.03;
 
+                // 边缘高光改用背景通透提亮 + 柔和冷银混色，避免纯白漆覆盖原有通透色彩
+                let rim_col = if dark { (0.80, 0.85, 0.92) } else { (0.94, 0.96, 0.99) };
                 if depth_in < bevel_glow_w {
                     let g_t = 1.0 - depth_in / bevel_glow_w;
-                    let bevel_a = g_t * g_t * fresnel_dir * (if dark { 0.14 } else { 0.22 });
-                    gr = (gr * (1.0 - bevel_a) + 0.96 * bevel_a).min(1.0);
-                    gg = (gg * (1.0 - bevel_a) + 0.98 * bevel_a).min(1.0);
-                    gb = (gb * (1.0 - bevel_a) + 1.00 * bevel_a).min(1.0);
+                    let bevel_a = g_t * g_t * fresnel_dir * (if dark { 0.022 } else { 0.032 });
+                    let tr = rim_col.0 * 0.54 + (gr + (1.0 - gr) * 0.45) * 0.46;
+                    let tg = rim_col.1 * 0.54 + (gg + (1.0 - gg) * 0.45) * 0.46;
+                    let tb = rim_col.2 * 0.54 + (gb + (1.0 - gb) * 0.45) * 0.46;
+                    gr = (gr * (1.0 - bevel_a) + tr * bevel_a).min(1.0);
+                    gg = (gg * (1.0 - bevel_a) + tg * bevel_a).min(1.0);
+                    gb = (gb * (1.0 - bevel_a) + tb * bevel_a).min(1.0);
                 }
 
-                // 1.3px 锐利镜面高光环（四次平滑钟形曲线替代 exp，高光边柔和顺滑）
+                // 极细 1px 级别柔和镜面高光环
                 let rim_u = ((depth_in - rim_peak).abs() / rim_half).min(1.0);
                 if rim_u < 1.0 {
                     let s = 1.0 - rim_u * rim_u;
                     let rim = s * s;
-                    let rim_a = (rim * fresnel_dir * (if dark { 0.58 } else { 0.85 })).clamp(0.0, 0.95);
-                    gr = (gr * (1.0 - rim_a) + 0.97 * rim_a).min(1.0);
-                    gg = (gg * (1.0 - rim_a) + 0.985 * rim_a).min(1.0);
-                    gb = (gb * (1.0 - rim_a) + 1.00 * rim_a).min(1.0);
+                    let rim_a = (rim * fresnel_dir * (if dark { 0.20 } else { 0.30 })).clamp(0.0, 0.95);
+                    let tr = rim_col.0 * 0.54 + (gr + (1.0 - gr) * 0.52) * 0.46;
+                    let tg = rim_col.1 * 0.54 + (gg + (1.0 - gg) * 0.52) * 0.46;
+                    let tb = rim_col.2 * 0.54 + (gb + (1.0 - gb) * 0.52) * 0.46;
+                    gr = (gr * (1.0 - rim_a) + tr * rim_a).min(1.0);
+                    gg = (gg * (1.0 - rim_a) + tg * rim_a).min(1.0);
+                    gb = (gb * (1.0 - rim_a) + tb * rim_a).min(1.0);
                 }
 
-                // 浅色玻璃仅在非高光外沿保留极微弱对比界线，深色玻璃保持干净亮边避免外黑框
-                if !dark && depth_in < 0.75 * s_dpi {
-                    let edge_t = 1.0 - depth_in / (0.75 * s_dpi);
-                    let dark_edge = 0.08 * edge_t * (1.0 - 0.65 * ld_pos);
+                // 最外沿轻柔对比收边，保证压暗高光后在浅色窗口和深色壁纸上仍轮廓干净
+                if depth_in < outer_edge_w {
+                    let oe = if dark { 0.12 } else { 0.10 };
+                    let edge_t = 1.0 - depth_in / outer_edge_w;
+                    let dark_edge = oe * edge_t * (1.0 - 0.40 * ld_pos * sky);
                     gr *= 1.0 - dark_edge;
                     gg *= 1.0 - dark_edge;
                     gb *= 1.0 - dark_edge;
@@ -3391,5 +3403,9 @@ mod tests {
             (0.82, 0.85, 0.90, 1.0),
         );
         assert_eq!(buf[(52 * w) + 360] >> 24, 0xFF);
+        // 5. 深色模式下右下非受光底角应保持克制，不再泛出刺眼亮白边
+        let br_rim = luma_at((cap.right - 7) as usize, (cap.bottom - 7) as usize);
+        let center_luma = luma_at(360, 52);
+        assert!(br_rim < center_luma * 2 + 250, "期望右下底角保持收敛({br_rim})，不过曝泛白");
     }
 }
