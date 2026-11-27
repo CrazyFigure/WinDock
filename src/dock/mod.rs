@@ -215,7 +215,7 @@ impl Dock {
                 icon_px_cached: 48,
                 gap_px: 8,
                 corner_dp: 18,
-                bottom_offset_px: 6,
+                bottom_offset_px: dp(cfg.bottom_offset_dp, monitor.dpi),
                 trigger_edge_px: 3,
                 magnify_scale: 1.45,
                 magnify_range: 2.5,
@@ -368,6 +368,10 @@ impl Dock {
     pub fn margin_y(&self) -> i32 {
         dp(12, self.dpi)
     }
+    /// 窗口内胶囊下方用于承载底部阴影的实际留白（不超过胶囊到屏幕底边的真实间距）。
+    pub fn bottom_margin_y(&self) -> i32 {
+        self.bottom_offset_px.max(0).min(self.margin_y())
+    }
     pub fn corner_radius(&self) -> f32 {
         dp(self.corner_dp, self.dpi) as f32
     }
@@ -421,18 +425,38 @@ impl Dock {
         self.bounce = Some((index, 0.0));
     }
 
-    /// 胶囊在窗口内的矩形。
+    /// 胶囊在窗口内的矩形（底部仅预留 bottom_margin_y，确保真正贴底时零多余缝隙）。
     pub fn capsule_rect(&self) -> RECT {
         let (w, h) = self.win_size;
         let cw = self.layout.capsule_w.round() as i32;
         let ch = self.layout.capsule_h.round() as i32;
         let left = ((w - cw) as f32 * 0.5).round() as i32;
+        let bot_margin = self.bottom_margin_y();
         RECT {
             left,
-            top: h - self.margin_y() - ch,
+            top: h - bot_margin - ch,
             right: left + cw,
-            bottom: h - self.margin_y(),
+            bottom: h - bot_margin,
         }
+    }
+
+    /// 计算 Dock 覆盖窗的垂直位置与高度：返回 `(win_top, win_h, bot_margin)`。
+    ///
+    /// 保证胶囊底边精确落在 `mon_bottom - bottom_offset_px`，同时窗口底边绝不超过 `mon_bottom`。
+    fn compute_vertical_bounds(
+        mon_bottom: i32,
+        capsule_h: i32,
+        grow_top: i32,
+        tooltip_h: i32,
+        top_margin_y: i32,
+        bottom_offset_px: i32,
+    ) -> (i32, i32, i32) {
+        let offset = bottom_offset_px.max(0);
+        let bot_margin = offset.min(top_margin_y);
+        let win_h = capsule_h + grow_top + tooltip_h + top_margin_y + bot_margin;
+        let win_offset = (offset - bot_margin).max(0);
+        let win_top = mon_bottom - win_offset - win_h;
+        (win_top, win_h, bot_margin)
     }
 
     /// 重新计算基础布局与窗口尺寸/位置（配置或条目变化时调用）。
@@ -466,11 +490,17 @@ impl Dock {
         // 窗口尺寸：基础胶囊 + 最大放大增量 + 边距（并保证极端精简 Dock 下也能完整容纳“WinDockFinder 设置”Tooltip）；高度：胶囊 + 向上突破 + Tooltip
         let grow_w = (self.icon_px() as f32 * (self.magnify_scale - 1.0) * self.magnify_range * 2.0 * 0.6).round() as i32;
         let w = (base.capsule_w.round() as i32 + grow_w + self.margin_x() * 2).max(dp(180, self.dpi));
-        let h = base.capsule_h.round() as i32 + base.grow_top.round() as i32 + self.tooltip_h() + self.margin_y() * 2;
         let mon = self.monitor;
+        let (top, h, _) = Self::compute_vertical_bounds(
+            mon.rect.bottom,
+            base.capsule_h.round() as i32,
+            base.grow_top.round() as i32,
+            self.tooltip_h(),
+            self.margin_y(),
+            self.bottom_offset_px,
+        );
         let mut left = mon.rect.left + (mon.width() - w) / 2;
         left = left.clamp(mon.rect.left, (mon.rect.right - w).max(mon.rect.left));
-        let top = mon.rect.bottom - self.bottom_offset_px - h;
         let prev_rect = self.win_rect;
         self.win_size = (w.max(1), h.max(1));
         self.win_rect = RECT {
@@ -898,4 +928,35 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
         _ => {}
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vertical_bounds_align_capsule_bottom_across_all_offsets() {
+        let mon_bottom = 1600;
+        let capsule_h = 87;
+        let grow_top = 28;
+        let tooltip_h = 57;
+        let top_margin_y = 18; // 12dp @ 150% DPI
+
+        for (offset_px, expected_bot_margin) in [(0, 0), (8, 8), (18, 18), (26, 18), (33, 18), (42, 18)] {
+            let (win_top, win_h, bot_margin) = Dock::compute_vertical_bounds(
+                mon_bottom,
+                capsule_h,
+                grow_top,
+                tooltip_h,
+                top_margin_y,
+                offset_px,
+            );
+            assert_eq!(bot_margin, expected_bot_margin);
+            let win_bottom = win_top + win_h;
+            let capsule_screen_bottom = win_top + (win_h - bot_margin);
+            // 胶囊底边必须精确位于 mon_bottom - offset_px，且窗口底边永不越出显示器
+            assert_eq!(capsule_screen_bottom, mon_bottom - offset_px);
+            assert!(win_bottom <= mon_bottom);
+        }
+    }
 }

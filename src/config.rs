@@ -13,7 +13,22 @@ use windows::Win32::Storage::FileSystem::{FlushFileBuffers, MoveFileExW, Replace
 use crate::log;
 use crate::win32::{data_dir, wide};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
+/// 默认底部间距（dp）：对应设置页「适中」档位。
+pub const DEFAULT_BOTTOM_OFFSET_DP: i32 = 17;
+/// 区分反序列化缺省与显式传入旧配置值的哨兵常量，仅用于 v1→v2 一次性迁移。
+const MISSING_BOTTOM_OFFSET_DP: i32 = i32::MIN;
+
+fn default_missing_bottom_offset_dp() -> i32 {
+    MISSING_BOTTOM_OFFSET_DP
+}
+
+fn default_dock_for_serde() -> DockCfg {
+    DockCfg {
+        bottom_offset_dp: MISSING_BOTTOM_OFFSET_DP,
+        ..DockCfg::default()
+    }
+}
 
 fn default_true() -> bool {
     true
@@ -74,6 +89,8 @@ pub struct DockCfg {
     pub trigger_edge_px: i32,
     pub show_delay_ms: u32,
     pub hide_delay_ms: u32,
+    // 缺省时使用哨兵值，便于在 Config::normalized 中精准区分旧配置显式值与缺省字段
+    #[serde(default = "default_missing_bottom_offset_dp")]
     pub bottom_offset_dp: i32,
     pub icon_size_dp: i32,
     pub icon_gap_dp: i32,
@@ -98,7 +115,7 @@ impl Default for DockCfg {
             trigger_edge_px: 3,
             show_delay_ms: 120,
             hide_delay_ms: 250,
-            bottom_offset_dp: 5,
+            bottom_offset_dp: DEFAULT_BOTTOM_OFFSET_DP,
             icon_size_dp: 48,
             icon_gap_dp: 8,
             magnify_enabled: true,
@@ -124,6 +141,10 @@ impl DockCfg {
         self.trigger_edge_px = self.trigger_edge_px.clamp(1, 12);
         self.show_delay_ms = self.show_delay_ms.min(2000);
         self.hide_delay_ms = self.hide_delay_ms.min(2000);
+        // 独立反序列化 DockCfg 且缺省该字段时回落到新版默认值
+        if self.bottom_offset_dp == MISSING_BOTTOM_OFFSET_DP {
+            self.bottom_offset_dp = DEFAULT_BOTTOM_OFFSET_DP;
+        }
         self.bottom_offset_dp = self.bottom_offset_dp.clamp(0, 40);
         self.icon_size_dp = self.icon_size_dp.clamp(28, 96);
         self.icon_gap_dp = self.icon_gap_dp.clamp(2, 24);
@@ -354,6 +375,7 @@ pub fn parse_hex_color(s: &str) -> Option<(u8, u8, u8)> {
 pub struct Config {
     pub schema_version: u32,
     pub general: General,
+    #[serde(default = "default_dock_for_serde")]
     pub dock: DockCfg,
     pub topbar: TopbarCfg,
     pub appearance: Appearance,
@@ -383,6 +405,10 @@ impl Default for Config {
 
 impl Config {
     fn normalized(mut self) -> Self {
+        // v1 配置中 Dock 底部额外叠加了 12dp 阴影留白；迁移为真实距底坐标时补齐 12dp，保持老用户视觉位置不变
+        if self.schema_version < 2 && self.dock.bottom_offset_dp != MISSING_BOTTOM_OFFSET_DP {
+            self.dock.bottom_offset_dp = self.dock.bottom_offset_dp.saturating_add(12);
+        }
         self.schema_version = SCHEMA_VERSION;
         self.general = self.general.normalized();
         self.dock = self.dock.normalized();
@@ -594,6 +620,7 @@ mod tests {
         assert!(c.topbar.has_status("brightness"));
         assert!(!c.general.startup_initialized);
         assert_eq!(c.appearance.dock_material, "liquid_glass");
+        assert_eq!(c.dock.bottom_offset_dp, DEFAULT_BOTTOM_OFFSET_DP);
         assert_eq!(c.schema_version, SCHEMA_VERSION);
 
         let invalid_mat = serde_json::from_str::<Config>(
@@ -671,5 +698,32 @@ mod tests {
         // 仅当系统主题不可读时才降级跟随壁纸明暗
         assert!(Appearance::resolve_dock_fallback_dark("system", None, || true));
         assert!(!Appearance::resolve_dock_fallback_dark("system", None, || false));
+    }
+
+    #[test]
+    fn v1_bottom_offset_migrates_to_preserve_visual_gap() {
+        for (old_dp, expected_dp) in [(0, 12), (5, 17), (10, 22), (16, 28)] {
+            let json = format!(r#"{{"schema_version":1,"dock":{{"bottom_offset_dp":{old_dp}}}}}"#);
+            let cfg = serde_json::from_str::<Config>(&json).unwrap().normalized();
+            assert_eq!(cfg.dock.bottom_offset_dp, expected_dp);
+            assert_eq!(cfg.schema_version, SCHEMA_VERSION);
+        }
+
+        // 缺少 bottom_offset_dp 的 v1 配置直接使用新版默认值，避免重复叠加 12dp
+        let missing_dock = serde_json::from_str::<Config>(r#"{"schema_version":1}"#)
+            .unwrap()
+            .normalized();
+        assert_eq!(missing_dock.dock.bottom_offset_dp, DEFAULT_BOTTOM_OFFSET_DP);
+
+        let missing_field = serde_json::from_str::<Config>(r#"{"schema_version":1,"dock":{}}"#)
+            .unwrap()
+            .normalized();
+        assert_eq!(missing_field.dock.bottom_offset_dp, DEFAULT_BOTTOM_OFFSET_DP);
+
+        // v2 配置保留真正的 0dp 贴底设置，不再重复迁移
+        let flush = serde_json::from_str::<Config>(r#"{"schema_version":2,"dock":{"bottom_offset_dp":0}}"#)
+            .unwrap()
+            .normalized();
+        assert_eq!(flush.dock.bottom_offset_dp, 0);
     }
 }

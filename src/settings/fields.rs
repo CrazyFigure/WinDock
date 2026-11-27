@@ -78,7 +78,14 @@ const CLOCK: Options = &[
 const TRIGGER_EDGE_OPTS: Options = &[("2", "2 px"), ("4", "4 px"), ("6", "6 px"), ("8", "8 px"), ("10", "10 px")];
 const SHOW_DELAY_OPTS: Options = &[("0", "立即"), ("80", "快"), ("120", "默认"), ("250", "慢")];
 const HIDE_DELAY_OPTS: Options = &[("150", "快"), ("250", "默认"), ("500", "较慢"), ("800", "慢")];
-const BOTTOM_OFFSET_OPTS: Options = &[("0", "贴底"), ("5", "紧凑"), ("10", "适中"), ("16", "宽松")];
+// 底部间距：首档为真正贴底（0dp），其余四档将原档位视觉参数整体右推一格
+const BOTTOM_OFFSET_OPTS: Options = &[
+    ("0", "贴底"),
+    ("12", "紧凑"),
+    ("17", "适中"),
+    ("22", "宽松"),
+    ("28", "极宽"),
+];
 const ICON_SIZE_OPTS: Options = &[
     ("36", "小"),
     ("42", "较小"),
@@ -439,5 +446,25 @@ mod tests {
         assert_eq!(Field::DockMaterial.get_choice(&cfg).map(|(i, _)| i), Some(1));
         Field::DockMaterial.set_from(&mut cfg, &Config::default());
         assert_eq!(cfg.appearance.dock_material, "liquid_glass");
+
+        // 底部间距：默认值对应「适中」（索引 2），五档双向映射无偏差
+        let def = Config::default();
+        assert_eq!(Field::BottomOffset.get_choice(&def).map(|(i, _)| i), Some(2));
+        for (idx, (dp_val, label)) in [
+            (0, "贴底"),
+            (12, "紧凑"),
+            (17, "适中"),
+            (22, "宽松"),
+            (28, "极宽"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            Field::BottomOffset.set_choice(&mut cfg, idx);
+            assert_eq!(cfg.dock.bottom_offset_dp, dp_val);
+            let (got_idx, opts) = Field::BottomOffset.get_choice(&cfg).unwrap();
+            assert_eq!(got_idx, idx);
+            assert_eq!(opts[got_idx].1, label);
+        }
     }
 }
