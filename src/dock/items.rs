@@ -3,14 +3,18 @@
 use std::path::{Path, PathBuf};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Shell::{
     SHQueryRecycleBinW, SHFILEOPSTRUCTW, SHQUERYRBINFO, ShellExecuteExW, FOF_ALLOWUNDO,
     FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FO_DELETE, SEE_MASK_NOASYNC,
 };
-use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows::Win32::UI::WindowsAndMessaging::{
+    IsIconic, IsWindow, PostMessageW, ShowWindowAsync, SC_MINIMIZE, SC_RESTORE, SHOW_WINDOW_CMD,
+    SW_MINIMIZE, SW_RESTORE, SW_SHOWNORMAL, WM_CLOSE, WM_SYSCOMMAND,
+};
 
 use crate::config::{DockItem, DockItems};
+use crate::dock::icons::running_image_key;
 use crate::monitor::RuntimeApp;
 use crate::win32::{bring_to_front, fnv1a64, open_shell_path, wide};
 
@@ -191,7 +195,14 @@ pub fn build_entries(items: &DockItems, apps: &[RuntimeApp], show_running: bool)
                     pinned: Some(idx),
                     running_exe: app.map(|_| key.clone()),
                     label,
-                    icon_key: if item.custom_icon.is_empty() { exe } else { item.custom_icon.clone() },
+                    // 自定义图标优先，运行中的固定项也使用映像资源策略。
+                    icon_key: if !item.custom_icon.is_empty() {
+                        item.custom_icon.clone()
+                    } else if app.is_some() {
+                        running_image_key(&exe)
+                    } else {
+                        exe
+                    },
                     windows: app.map(|a| a.windows.iter().map(|w| (w.hwnd.0 as isize, w.title.clone())).collect()).unwrap_or_default(),
                 });
             }
@@ -207,7 +218,7 @@ pub fn build_entries(items: &DockItems, apps: &[RuntimeApp], show_running: bool)
                 pinned: None,
                 running_exe: Some(app.key.clone()),
                 label: app.label.clone(),
-                icon_key: app.exe.clone(),
+                icon_key: running_image_key(&app.exe),
                 windows: app.windows.iter().map(|w| (w.hwnd.0 as isize, w.title.clone())).collect(),
             });
         }
@@ -233,25 +244,38 @@ pub fn has_windows(entry: &Entry) -> bool {
     !entry.windows.is_empty()
 }
 
-/// 激活窗口（最小化时还原并前置）。
+/// 请求窗口切换显示状态。部分窗口拒绝直接切换，改由目标处理原生系统菜单命令。
+fn change_window_state(hwnd: HWND, state: SHOW_WINDOW_CMD, command: u32) {
+    unsafe {
+        // 异步请求避免目标窗口未响应时阻塞 Dock 的鼠标处理。
+        if !ShowWindowAsync(hwnd, state).as_bool() {
+            let _ = PostMessageW(hwnd, WM_SYSCOMMAND, WPARAM(command as usize), LPARAM(0));
+        }
+    }
+}
+
+/// 激活有效窗口，最小化时先请求还原。
 pub fn activate_window(hwnd: HWND) {
     unsafe {
-        if windows::Win32::UI::WindowsAndMessaging::IsIconic(hwnd).as_bool() {
-            let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_RESTORE);
+        if !IsWindow(hwnd).as_bool() {
+            return;
         }
-        bring_to_front(hwnd);
+        if IsIconic(hwnd).as_bool() {
+            change_window_state(hwnd, SW_RESTORE, SC_RESTORE);
+        }
     }
+    bring_to_front(hwnd);
+}
+
+/// 最小化当前 Dock 条目对应的窗口。
+pub fn minimize_window(hwnd: HWND) {
+    change_window_state(hwnd, SW_MINIMIZE, SC_MINIMIZE);
 }
 
 /// 关闭窗口（WM_CLOSE）。
 pub fn close_window(hwnd: HWND) {
     unsafe {
-        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-            hwnd,
-            windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
-            windows::Win32::Foundation::WPARAM(0),
-            windows::Win32::Foundation::LPARAM(0),
-        );
+        let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
     }
 }
 

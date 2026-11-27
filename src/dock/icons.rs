@@ -23,9 +23,9 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::UI::Shell::{
     IShellItem, IShellItemImageFactory, IShellLinkW, ShellLink, SHCreateItemFromParsingName,
-    SIIGBF_ICONONLY, SIIGBF_RESIZETOFIT,
+    SHDefExtractIconW, SIIGBF_ICONONLY, SIIGBF_RESIZETOFIT,
 };
-use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+use windows::Win32::UI::WindowsAndMessaging::{HICON, PostMessageW};
 
 use crate::ui::IconPixels;
 use crate::win32::{exe_path, fnv1a64, wide};
@@ -37,6 +37,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 pub const ICON_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 /// Dock 图标统一高清源图尺寸（悬停放大不跨档重提，杜绝退回字母块闪烁）。
 pub const DOCK_ICON_SRC_SIZE: u32 = 128;
+const IMAGE_RESOURCE_PREFIX: &str = "image-resource:";
 
 pub type IconKey = (String, u32);
 
@@ -310,11 +311,35 @@ pub fn read_lnk_target(path: &Path) -> Option<String> {
     }
 }
 
+/// 非 .exe 的运行映像优先读取内嵌资源，使用独立缓存键避开旧的文件类型图标。
+pub fn running_image_key(path: &str) -> String {
+    if Path::new(path).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("exe")) {
+        path.to_owned()
+    } else {
+        format!("{IMAGE_RESOURCE_PREFIX}{path}")
+    }
+}
+
 /// 返回 (归一化预乘 BGRA 像素, 宽, 高)。仅在工作进程中调用。
 pub fn extract(key: &str, size: u32) -> Option<(Vec<u8>, u32, u32)> {
     let target = size.clamp(32, 192);
     // 请求 256px 高清原图后再经精确区域重采样缩小，显著提升细节锐度与抗锯齿质量
     let fetch_sz = target.max(256);
+    // 便携应用可能用 .dat 承载可执行映像，Shell 按扩展名只会返回文件类型图标。
+    let key = if let Some(path) = key.strip_prefix(IMAGE_RESOURCE_PREFIX) {
+        let mut icon = HICON::default();
+        let status = unsafe {
+            SHDefExtractIconW(PCWSTR(wide(path).as_ptr()), 0, 0, Some(&mut icon), None, fetch_sz)
+        };
+        if status.is_ok() && !icon.is_invalid() {
+            if let Some((px, w, h)) = hicon_to_straight_bgra(icon, fetch_sz) {
+                return Some(normalize_and_premultiply(px, w, h, target));
+            }
+        }
+        path
+    } else {
+        key
+    };
     let raw = extract_item(key, fetch_sz).or_else(|| {
         if Path::new(key).extension().map(|e| e.eq_ignore_ascii_case("lnk")).unwrap_or(false) {
             if let Some(t) = read_lnk_target(Path::new(key)) {
@@ -489,7 +514,12 @@ fn hicon_to_straight_bgra(hicon: windows::Win32::UI::WindowsAndMessaging::HICON,
             ..Default::default()
         };
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        let bmp = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &mut ptr, windows::Win32::Foundation::HANDLE::default(), 0).ok()?;
+        let Ok(bmp) = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &mut ptr, windows::Win32::Foundation::HANDLE::default(), 0) else {
+            // 分配失败时仍须释放已取得的设备上下文和图标句柄。
+            let _ = DeleteDC(hdc);
+            let _ = DestroyIcon(hicon);
+            return None;
+        };
         let old = windows::Win32::Graphics::Gdi::SelectObject(hdc, bmp);
         let ok = DrawIconEx(hdc, 0, 0, hicon, size as i32, size as i32, 0, windows::Win32::Graphics::Gdi::HBRUSH::default(), DI_NORMAL).is_ok();
         let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc, old);
@@ -1086,6 +1116,25 @@ impl IconCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 将系统 PE 改用 .dat 后缀，验证应用资源图标和普通文件图标使用不同缓存。
+    #[test]
+    fn running_image_extracts_embedded_icon_from_dat() {
+        let dir = tempfile::tempdir().unwrap();
+        let explorer = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("explorer.exe");
+        let image = dir.path().join("portable.dat");
+        std::fs::copy(explorer, &image).unwrap();
+
+        let path = image.to_str().unwrap();
+        let key = running_image_key(path);
+        assert_ne!(
+            IconWorker::cache_path(dir.path(), &key, DOCK_ICON_SRC_SIZE),
+            IconWorker::cache_path(dir.path(), path, DOCK_ICON_SRC_SIZE)
+        );
+        let (px, w, h) = extract(&key, DOCK_ICON_SRC_SIZE).expect("应提取 .dat 中的应用图标");
+        assert_eq!((w, h), (DOCK_ICON_SRC_SIZE, DOCK_ICON_SRC_SIZE));
+        assert!(px.chunks_exact(4).any(|p| p[3] > 200 && p[2].abs_diff(p[0]) > 60));
+    }
 
     #[test]
     fn lru_respects_budget() {

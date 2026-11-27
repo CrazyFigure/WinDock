@@ -2520,6 +2520,14 @@ impl App {
         }
         let item = e.pinned.and_then(|p| self.pinned_item(p));
         match id {
+            // 「打开」优先切回已运行窗口，避免把便携应用的映像路径当作文件交给 Shell。
+            M_APP_OPEN if items::has_windows(&e) => {
+                if let [(hwnd, _)] = e.windows.as_slice() {
+                    items::activate_window(HWND(*hwnd as *mut _));
+                } else {
+                    self.activate_entry(i);
+                }
+            }
             M_APP_OPEN | M_APP_NEW => {
                 if let Some(it) = &item {
                     items::launch_item(it);
@@ -2842,9 +2850,7 @@ impl App {
                 let target = HWND(e.windows[0].0 as *mut _);
                 let is_fg = unsafe { GetForegroundWindow() == target && !IsIconic(target).as_bool() };
                 if is_fg {
-                    unsafe {
-                        let _ = ShowWindow(target, SW_MINIMIZE);
-                    }
+                    items::minimize_window(target);
                 } else {
                     items::activate_window(target);
                 }
