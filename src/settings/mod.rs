@@ -13,8 +13,9 @@ use std::sync::OnceLock;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, DeleteObject, EndPaint, IntersectClipRect, InvalidateRect, RestoreDC,
-    SaveDC, ScreenToClient, HDC, HFONT, HGDIOBJ, PAINTSTRUCT, SRCCOPY,
+    BeginPaint, BitBlt, DeleteObject, EndPaint, GetDC, IntersectClipRect, InvalidateRect,
+    ReleaseDC, RestoreDC, SaveDC, ScreenToClient, ValidateRect, HDC, HFONT, HGDIOBJ, PAINTSTRUCT,
+    SRCCOPY,
 };
 use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -48,6 +49,7 @@ use pages::Row;
 
 pub const CLASS_SETTINGS: &str = "WinDockFinderSettings";
 const TIMER_TIP: usize = 301;
+const TIMER_DOCK_DRAG_SCROLL: usize = 302;
 const WM_PRINTCLIENT: u32 = 0x0318;
 const LIST_ROW_DP: f32 = 36.0;
 // Dock 固定项列表默认展示 6 行
@@ -155,6 +157,51 @@ struct UpdateState {
     scroll: i32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DockDragPress {
+    from_idx: usize,
+    start_x: i32,
+    start_y: i32,
+    grab_dy: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DockDrag {
+    from_idx: usize,
+    target_idx: usize,
+    y: i32,
+    grab_dy: i32,
+    auto_scroll_dir: i32,
+}
+
+/// 根据鼠标纵坐标 `y` 与抓手偏移计算设置页 Dock 固定项列表的目标落位索引（0..count）。
+fn compute_dock_list_target(
+    y: i32,
+    grab_dy: i32,
+    list_top: i32,
+    row_h: i32,
+    scroll: usize,
+    count: usize,
+) -> usize {
+    if count <= 1 || row_h <= 0 {
+        return 0;
+    }
+    let ghost_top = y - grab_dy;
+    let ghost_cy = ghost_top as f32 + row_h as f32 * 0.5;
+    let rel_slot = (ghost_cy - list_top as f32) / row_h as f32 + scroll as f32;
+    (rel_slot.floor() as isize).clamp(0, (count - 1) as isize) as usize
+}
+
+/// 计算设置页 Dock 固定项拖拽期间的视觉行映射（其余行实时让位，空出 `target_idx`）。
+fn dock_list_visual_order(count: usize, from_idx: usize, target_idx: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..count).collect();
+    if from_idx < count && target_idx < count && from_idx != target_idx {
+        let item = order.remove(from_idx);
+        order.insert(target_idx, item);
+    }
+    order
+}
+
 struct Dlg {
     app: *mut App,
     hwnd: HWND,
@@ -184,6 +231,8 @@ struct Dlg {
     capture: Option<Field>,
     capture_msg: Option<String>,
     drag_slider: Option<Field>,
+    dock_drag_press: Option<DockDragPress>,
+    dock_drag: Option<DockDrag>,
     dock_sel: usize,
     dock_scroll: usize,
     tray_scroll: usize,
@@ -538,6 +587,8 @@ impl Dlg {
             capture: None,
             capture_msg: None,
             drag_slider: None,
+            dock_drag_press: None,
+            dock_drag: None,
             dock_sel: 0,
             dock_scroll: 0,
             tray_scroll: 0,
@@ -601,6 +652,7 @@ impl Dlg {
     fn dispose(&mut self) {
         unsafe {
             let _ = KillTimer(self.hwnd, TIMER_TIP);
+            let _ = KillTimer(self.hwnd, TIMER_DOCK_DRAG_SCROLL);
         }
         self.destroy_fonts();
         self.color_text = None;
@@ -619,10 +671,65 @@ impl Dlg {
         self.pressed = Hit::None;
         self.focus = None;
         self.drag_slider = None;
+        self.cancel_dock_drag();
         self.tip_pending = None;
         self.tip_visible = None;
         self.capture = None;
         self.capture_msg = None;
+    }
+
+    /// 终止并清理设置页 Dock 固定项拖拽状态与边缘滚动定时器。
+    fn cancel_dock_drag(&mut self) {
+        self.dock_drag_press = None;
+        self.dock_drag = None;
+        if !self.hwnd.0.is_null() {
+            unsafe {
+                let _ = KillTimer(self.hwnd, TIMER_DOCK_DRAG_SCROLL);
+            }
+        }
+    }
+
+    /// 获取设置页 Dock 固定项列表矩形区域。
+    fn dock_list_rect(&self, l: &Layout, app: &App) -> Option<RECT> {
+        let ri = self.rows.iter().position(|r| matches!(r, Row::DockList))?;
+        let g = self.geom(self.dc(), app, l, ri);
+        g.list.map(|(r, _, _)| r)
+    }
+
+    /// 刷新设置页 Dock 固定项拖拽目标位置与列表上下边缘自动滚动状态。
+    fn update_dock_drag(&mut self, app: &App, l: &Layout, y: i32) {
+        let Some(list) = self.dock_list_rect(l, app) else { return };
+        let count = app.dock_items.items.len();
+        let row_h = self.px(LIST_ROW_DP);
+        let max_scroll = count.saturating_sub(DOCK_VISIBLE);
+        let edge_pad = self.px(16.0);
+        let dir = if y < list.top + edge_pad && self.dock_scroll > 0 {
+            -1
+        } else if y > list.bottom - edge_pad && self.dock_scroll < max_scroll {
+            1
+        } else {
+            0
+        };
+        let prev_dir = self.dock_drag.map(|d| d.auto_scroll_dir).unwrap_or(0);
+        let target_idx = if let Some(d) = self.dock_drag {
+            compute_dock_list_target(y, d.grab_dy, list.top, row_h, self.dock_scroll, count)
+        } else {
+            return;
+        };
+        if let Some(d) = self.dock_drag.as_mut() {
+            d.y = y;
+            d.target_idx = target_idx;
+            d.auto_scroll_dir = dir;
+        }
+        if dir != prev_dir && !self.hwnd.0.is_null() {
+            unsafe {
+                if dir == 0 {
+                    let _ = KillTimer(self.hwnd, TIMER_DOCK_DRAG_SCROLL);
+                } else if prev_dir == 0 {
+                    let _ = SetTimer(self.hwnd, TIMER_DOCK_DRAG_SCROLL, 95, None);
+                }
+            }
+        }
     }
 
     fn cancel_capture(&mut self, app: &mut App) {
@@ -1154,7 +1261,7 @@ impl Dlg {
                 let sorted = app.dock_items.sorted();
                 let it = sorted.get(i)?;
                 let rect = g.list.as_ref().map(|(_, r, _)| in_list(r, i, self.dock_scroll)).unwrap_or(g.row);
-                (rect, format!("{} · {}", dock_label(it), it.target))
+                (rect, format!("{} · {}（可拖动排序）", dock_label(it), it.target))
             }
             Hit::TrayRefresh => (g.button, "重新扫描系统托盘中的应用图标".to_string()),
             Hit::TrayRow(i) => {
@@ -1399,19 +1506,15 @@ impl Dlg {
     }
 
     fn move_dock(&mut self, app: &mut App, dir: i32) {
-        let sorted = app.dock_items.sorted();
+        let len = app.dock_items.items.len();
         let i = self.dock_sel;
         let Some(j) = i.checked_add_signed(dir as isize) else { return };
-        if i >= sorted.len() || j >= sorted.len() {
+        if i >= len || j >= len {
             return;
         }
-        let mut ids: Vec<String> = sorted.iter().map(|x| x.id.clone()).collect();
-        ids.swap(i, j);
         let mut di = app.dock_items.clone();
-        for (k, id) in ids.iter().enumerate() {
-            if let Some(it) = di.items.iter_mut().find(|x| &x.id == id) {
-                it.order = k as u32;
-            }
+        if !items::reorder_sorted(&mut di, i, j) {
+            return;
         }
         self.dock_sel = j;
         // 移动选中项超出可视区时同步调整滚动偏移，保持当前项可见
@@ -1958,6 +2061,58 @@ fn paint_row(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: HDC, ri: us
     }
 }
 
+/// 绘制单条 Dock 固定项行内容（抓手六点、应用图标、名称、类型标签），普通行与拖拽浮卡共用。
+fn paint_dock_row_content(
+    dlg: &Dlg,
+    app: &App,
+    sf: &mut Surface,
+    dc: HDC,
+    r: RECT,
+    it: &crate::config::DockItem,
+    grip_highlight: bool,
+) {
+    let s = dlg.scale;
+    let p = &dlg.pal;
+    // 左侧 2×3 拖动抓手圆点提示
+    let gx = r.left as f32 + dlg.px(11.0) as f32;
+    let gy_mid = (r.top + r.bottom) as f32 * 0.5;
+    let grip_col = (
+        p.text_secondary.0,
+        p.text_secondary.1,
+        p.text_secondary.2,
+        if grip_highlight { 0.88 } else { 0.42 },
+    );
+    let dot_r = (1.15 * s).max(1.0);
+    for col in [-1.8f32, 1.8f32] {
+        for row in [-4.0f32, 0.0f32, 4.0f32] {
+            sf.fill_circle(gx + col * s, gy_mid + row * s, dot_r, grip_col);
+        }
+    }
+
+    let isz = dlg.px(24.0);
+    let icx = r.left as f32 + dlg.px(24.0) as f32 + isz as f32 * 0.5;
+    let icy = (r.top + r.bottom) as f32 * 0.5;
+    let half = isz as f32 * 0.5;
+    if it.kind == "winlaunchpad" {
+        draw_launchpad_icon(sf, icx, icy, isz as f32);
+    } else {
+        let key = dock_icon_key(it);
+        app.icon_worker.request(&key, DOCK_ICON_SRC_SIZE);
+        if let Some(px) = app.icons.pixels(&key, DOCK_ICON_SRC_SIZE) {
+            sf.draw_icon_bilinear(&px, icx, icy, isz as f32, false, 0.0);
+        } else {
+            sf.fill_rrect(
+                &rc((icx - half) as i32, (icy - half) as i32, (icx + half) as i32, (icy + half) as i32),
+                6.0 * s,
+                p.control_bg,
+            );
+        }
+    }
+    let tx = (icx + half) as i32 + dlg.px(10.0);
+    draw_text(dc, &dock_label(it), dlg.font_body, &rc(tx, r.top, r.right - dlg.px(76.0), r.bottom), p.text, TextAlign::Left, true, false);
+    draw_text(dc, dock_kind_label(it), dlg.font_sub, &rc(r.right - dlg.px(72.0), r.top, r.right - dlg.px(10.0), r.bottom), p.text_secondary, TextAlign::Right, true, false);
+}
+
 fn paint_dock_list(dlg: &Dlg, app: &App, sf: &mut Surface, dc: HDC, g: &Geom) {
     let s = dlg.scale;
     let p = &dlg.pal;
@@ -1982,34 +2137,58 @@ fn paint_dock_list(dlg: &Dlg, app: &App, sf: &mut Surface, dc: HDC, g: &Geom) {
         return;
     }
     with_gdi_clip(sf, dc, *list, |sf| {
-        let isz = dlg.px(24.0);
-        for (vi, r) in rows.iter().enumerate() {
-            let idx = dlg.dock_scroll + vi;
-            let Some(it) = sorted.get(idx) else { break };
-            let rr = inset(*r, dlg.px(3.0));
-            if idx == dlg.dock_sel {
-                sf.fill_rrect(&rr, 7.0 * s, accent_alpha(p, dlg.dark, 0.12));
-            } else if dlg.hover == Hit::DockRow(idx) {
-                sf.fill_rrect(&rr, 7.0 * s, p.card_hover);
-            }
-            let icx = r.left as f32 + dlg.px(14.0) as f32 + isz as f32 * 0.5;
-            let icy = (r.top + r.bottom) as f32 * 0.5;
-            let half = isz as f32 * 0.5;
-            if it.kind == "winlaunchpad" {
-                draw_launchpad_icon(sf, icx, icy, isz as f32);
-            } else {
-                let key = dock_icon_key(it);
-                app.icon_worker.request(&key, DOCK_ICON_SRC_SIZE);
-                if let Some(px) = app.icons.pixels(&key, DOCK_ICON_SRC_SIZE) {
-                    sf.draw_icon_bilinear(&px, icx, icy, isz as f32, false, 0.0);
-                } else {
-                    sf.fill_rrect(&rc((icx - half) as i32, (icy - half) as i32, (icx + half) as i32, (icy + half) as i32), 6.0 * s, p.control_bg);
+        if let Some(drag) = dlg.dock_drag {
+            let vis_order = dock_list_visual_order(sorted.len(), drag.from_idx, drag.target_idx);
+            for (vi, r) in rows.iter().enumerate() {
+                let abs_slot = dlg.dock_scroll + vi;
+                let Some(&orig_idx) = vis_order.get(abs_slot) else { break };
+                let rr = inset(*r, dlg.px(3.0));
+                if orig_idx == drag.from_idx {
+                    // 目标落位空槽虚线占位，精确对齐释放后的实际下标
+                    sf.fill_rrect(&rr, 7.0 * s, accent_alpha(p, dlg.dark, 0.08));
+                    sf.stroke_rrect_dashed(
+                        &rr,
+                        7.0 * s,
+                        (1.2 * s).max(1.0),
+                        dlg.px(4.0).max(3),
+                        (p.accent.0, p.accent.1, p.accent.2, 0.68),
+                    );
+                } else if let Some(it) = sorted.get(orig_idx) {
+                    paint_dock_row_content(dlg, app, sf, dc, *r, it, false);
                 }
             }
-            let tx = (icx + half) as i32 + dlg.px(10.0);
-            draw_text(dc, &dock_label(it), dlg.font_body, &rc(tx, r.top, r.right - dlg.px(76.0), r.bottom), p.text, TextAlign::Left, true, false);
-            draw_text(dc, dock_kind_label(it), dlg.font_sub, &rc(r.right - dlg.px(72.0), r.top, r.right - dlg.px(10.0), r.bottom), p.text_secondary, TextAlign::Right, true, false);
-            focus_ring(dlg, sf, Hit::DockRow(idx), rr, s);
+            // 随鼠标纵坐标移动的悬浮拖拽卡片（跟随抓手偏移，限制在列表框内）
+            if let Some(drag_it) = sorted.get(drag.from_idx) {
+                let lrh = dlg.px(LIST_ROW_DP);
+                let row_h = (lrh - dlg.px(2.0)).max(dlg.px(20.0));
+                let ghost_top = (drag.y - drag.grab_dy).clamp(list.top, (list.bottom - row_h).max(list.top));
+                let ghost_r = rc(list.left, ghost_top, list.right, (ghost_top + row_h).min(list.bottom));
+                let rr = inset(ghost_r, dlg.px(2.0));
+                let shadow = rc(rr.left, rr.top + dlg.px(2.0), rr.right, rr.bottom + dlg.px(3.0));
+                sf.fill_rrect(&shadow, 7.0 * s, (0.0, 0.0, 0.0, if dlg.dark { 0.34 } else { 0.14 }));
+                sf.fill_rrect(&rr, 7.0 * s, p.card);
+                sf.fill_rrect(&rr, 7.0 * s, accent_alpha(p, dlg.dark, 0.12));
+                sf.stroke_rrect(&rr, 7.0 * s, (1.2 * s).max(1.0), (p.accent.0, p.accent.1, p.accent.2, 0.85));
+                paint_dock_row_content(dlg, app, sf, dc, ghost_r, drag_it, true);
+            }
+        } else {
+            for (vi, r) in rows.iter().enumerate() {
+                let idx = dlg.dock_scroll + vi;
+                let Some(it) = sorted.get(idx) else { break };
+                let rr = inset(*r, dlg.px(3.0));
+                let selected = idx == dlg.dock_sel;
+                let hovered = dlg.hover == Hit::DockRow(idx);
+                let pressed = dlg.pressed == Hit::DockRow(idx);
+                if selected {
+                    sf.fill_rrect(&rr, 7.0 * s, accent_alpha(p, dlg.dark, if pressed { 0.18 } else { 0.12 }));
+                } else if pressed {
+                    sf.fill_rrect(&rr, 7.0 * s, accent_alpha(p, dlg.dark, 0.10));
+                } else if hovered {
+                    sf.fill_rrect(&rr, 7.0 * s, p.card_hover);
+                }
+                paint_dock_row_content(dlg, app, sf, dc, *r, it, selected || hovered || pressed);
+                focus_ring(dlg, sf, Hit::DockRow(idx), rr, s);
+            }
         }
     });
     draw_scrollbar(sf, &rc(list.right - dlg.px(4.0), list.top + 2, list.right - 1, list.bottom - 2), sorted.len(), DOCK_VISIBLE, dlg.dock_scroll, false, s);
@@ -2329,6 +2508,27 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         dlg.tip_visible = Some((*r, text.clone()));
                         let _ = InvalidateRect(hwnd, None, false);
                     }
+                } else if wparam.0 == TIMER_DOCK_DRAG_SCROLL {
+                    if let Some(d) = dlg.dock_drag {
+                        let max_scroll = app.dock_items.items.len().saturating_sub(DOCK_VISIBLE);
+                        let next_scroll = (dlg.dock_scroll as isize + d.auto_scroll_dir as isize)
+                            .clamp(0, max_scroll as isize) as usize;
+                        if next_scroll != dlg.dock_scroll {
+                            dlg.dock_scroll = next_scroll;
+                            let l = dlg.layout(dlg.dc(), app);
+                            dlg.update_dock_drag(app, &l, d.y);
+                            let wdc = GetDC(hwnd);
+                            if !wdc.is_invalid() {
+                                paint_to_dc(dlg, app, wdc);
+                                let _ = ReleaseDC(hwnd, wdc);
+                                let _ = ValidateRect(hwnd, None);
+                            }
+                        } else {
+                            let _ = KillTimer(hwnd, TIMER_DOCK_DRAG_SCROLL);
+                        }
+                    } else {
+                        let _ = KillTimer(hwnd, TIMER_DOCK_DRAG_SCROLL);
+                    }
                 }
                 LRESULT(0)
             }
@@ -2336,6 +2536,34 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 let dc = dlg.dc();
                 let (x, y) = (get_x_lparam(lparam.0), get_y_lparam(lparam.0));
                 let l = dlg.layout(dc, app);
+                if let Some(press) = dlg.dock_drag_press {
+                    if dlg.dock_drag.is_none() {
+                        let dist2 = (x - press.start_x).pow(2) + (y - press.start_y).pow(2);
+                        if (dist2 as f32) >= (5.0 * dlg.scale).powi(2) {
+                            dlg.dock_drag = Some(DockDrag {
+                                from_idx: press.from_idx,
+                                target_idx: press.from_idx,
+                                y,
+                                grab_dy: press.grab_dy,
+                                auto_scroll_dir: 0,
+                            });
+                            dlg.tip_pending = None;
+                            dlg.tip_visible = None;
+                            let _ = KillTimer(hwnd, TIMER_TIP);
+                        }
+                    }
+                }
+                if dlg.dock_drag.is_some() {
+                    dlg.update_dock_drag(app, &l, y);
+                    // 拖拽期间同步直绘窗口客户区，保证悬浮卡片跟手且零拖影
+                    let wdc = GetDC(hwnd);
+                    if !wdc.is_invalid() {
+                        paint_to_dc(dlg, app, wdc);
+                        let _ = ReleaseDC(hwnd, wdc);
+                        let _ = ValidateRect(hwnd, None);
+                    }
+                    return LRESULT(0);
+                }
                 if let Some(f) = dlg.drag_slider {
                     dlg.set_slider(app, f, &l, x);
                 }
@@ -2396,6 +2624,9 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                             let visible = list_visible(&dlg.rows[ri]);
                             let max = n.saturating_sub(visible) as i32;
                             *cur = (*cur as i32 + step).clamp(0, max) as usize;
+                            if matches!(&dlg.rows[ri], Row::DockList) && dlg.dock_drag.is_some() {
+                                dlg.update_dock_drag(app, &l, pt.y);
+                            }
                             let _ = InvalidateRect(hwnd, None, false);
                             return LRESULT(0);
                         }
@@ -2429,6 +2660,26 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     dlg.focus = Some(hit);
                     let _ = SetCapture(hwnd);
                 }
+                if let Hit::DockRow(i) = hit {
+                    if i < app.dock_items.items.len() {
+                        dlg.dock_sel = i;
+                        let lrh = dlg.px(LIST_ROW_DP);
+                        let row_top = dlg
+                            .hover_row
+                            .and_then(|ri| {
+                                dlg.geom(dc, app, &l, ri)
+                                    .list
+                                    .and_then(|(_, rows, _)| rows.get(i.saturating_sub(dlg.dock_scroll)).map(|r| r.top))
+                            })
+                            .unwrap_or(y - lrh / 2);
+                        dlg.dock_drag_press = Some(DockDragPress {
+                            from_idx: i,
+                            start_x: x,
+                            start_y: y,
+                            grab_dy: (y - row_top).clamp(0, lrh),
+                        });
+                    }
+                }
                 if let Hit::Slider(f) = hit {
                     dlg.drag_slider = Some(f);
                     dlg.set_slider(app, f, &l, x);
@@ -2443,14 +2694,35 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
             }
             WM_LBUTTONUP => {
                 let pressed = dlg.pressed;
-                let was_drag = dlg.drag_slider.take().is_some();
-                let _ = ReleaseCapture();
+                let was_slider_drag = dlg.drag_slider.take().is_some();
+                dlg.dock_drag_press = None;
+                let dock_drag = dlg.dock_drag.is_some();
                 let dc = dlg.dc();
                 let (x, y) = (get_x_lparam(lparam.0), get_y_lparam(lparam.0));
                 let l = dlg.layout(dc, app);
+                if dock_drag {
+                    dlg.update_dock_drag(app, &l, y);
+                }
+                let finished_dock_drag = dlg.dock_drag.take();
+                let _ = KillTimer(hwnd, TIMER_DOCK_DRAG_SCROLL);
+                let _ = ReleaseCapture();
                 let hit = dlg.hit_test(&l, dc, app, x, y);
                 dlg.pressed = Hit::None;
-                if was_drag {
+                if let Some(drag) = finished_dock_drag {
+                    if drag.from_idx != drag.target_idx {
+                        let mut di = app.dock_items.clone();
+                        if items::reorder_sorted(&mut di, drag.from_idx, drag.target_idx) {
+                            dlg.dock_sel = drag.target_idx;
+                            dlg.focus = Some(Hit::DockRow(drag.target_idx));
+                            app.set_dock_items(di);
+                        }
+                    }
+                    dlg.hover = hit;
+                    dlg.update_tip(&l, app, dc, hit);
+                    let _ = InvalidateRect(hwnd, None, false);
+                    return LRESULT(0);
+                }
+                if was_slider_drag {
                     app.persist();
                 } else if pressed != Hit::None && pressed == hit {
                     dlg.activate(app, hit, dc, &l, 0);
@@ -2461,8 +2733,12 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
             }
             WM_CAPTURECHANGED => {
                 dlg.pressed = Hit::None;
+                let had_dock_drag = dlg.dock_drag.is_some() || dlg.dock_drag_press.is_some();
+                dlg.cancel_dock_drag();
                 if dlg.drag_slider.take().is_some() {
                     app.persist();
+                    let _ = InvalidateRect(hwnd, None, false);
+                } else if had_dock_drag {
                     let _ = InvalidateRect(hwnd, None, false);
                 }
                 LRESULT(0)
@@ -2497,6 +2773,12 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 let dc = dlg.dc();
                 let l = dlg.layout(dc, app);
                 if is(VK_ESCAPE) {
+                    if dlg.dock_drag.is_some() || dlg.dock_drag_press.is_some() {
+                        dlg.cancel_dock_drag();
+                        let _ = ReleaseCapture();
+                        let _ = InvalidateRect(hwnd, None, false);
+                        return LRESULT(0);
+                    }
                     let _ = DestroyWindow(hwnd);
                     return LRESULT(0);
                 }
@@ -2626,5 +2908,51 @@ mod tests {
         assert_eq!(secondary.ptMaxPosition.y, 32);
         assert_eq!(secondary.ptMaxSize.x, 1920);
         assert_eq!(secondary.ptMaxSize.y, 1008);
+    }
+
+    #[test]
+    fn dock_list_drag_target_and_visual_order_align() {
+        // 列表顶部 100，行高 36，可见 6 行，共 8 项
+        let list_top = 100;
+        let row_h = 36;
+        let count = 8;
+
+        // 从第 0 行中部(grab_dy=18)向下拖到第 1 行(y=138..172)
+        let t1 = compute_dock_list_target(142, 18, list_top, row_h, 0, count);
+        assert_eq!(t1, 1);
+        assert_eq!(dock_list_visual_order(count, 0, t1), vec![1, 0, 2, 3, 4, 5, 6, 7]);
+
+        // 向下滚动 2 行后(scroll=2)，拖到第 3 可见槽位（绝对索引 5）
+        let t2 = compute_dock_list_target(list_top + 3 * row_h + 18, 18, list_top, row_h, 2, count);
+        assert_eq!(t2, 5);
+        assert_eq!(dock_list_visual_order(count, 1, t2), vec![0, 2, 3, 4, 5, 1, 6, 7]);
+
+        // 拖出列表上下边界时应稳健夹紧在 0..count-1
+        assert_eq!(compute_dock_list_target(10, 18, list_top, row_h, 0, count), 0);
+        assert_eq!(compute_dock_list_target(999, 18, list_top, row_h, 2, count), count - 1);
+
+        // 全区段扫掠验证：任何 (from, scroll, y, grab_dy) 组合下，视觉让位空槽与 reorder_sorted 落点完全一致
+        let mut base = crate::config::DockItems::default();
+        for idx in 0..count {
+            let mut it = items::new_item("app", &format!(r"C:\app{idx}.exe"), &format!("App{idx}"));
+            it.order = idx as u32;
+            base.items.push(it);
+        }
+        for scroll in [0usize, 2usize] {
+            for from in 0..count {
+                for grab_dy in [4, 18, 32] {
+                    for y in (list_top - 20..=list_top + 6 * row_h + 20).step_by(9) {
+                        let target = compute_dock_list_target(y, grab_dy, list_top, row_h, scroll, count);
+                        let vis_order = dock_list_visual_order(count, from, target);
+                        assert_eq!(vis_order[target], from, "视觉让位表未在目标槽位空出拖拽项");
+                        let mut di = base.clone();
+                        let moved_id = base.items[from].id.clone();
+                        let _ = items::reorder_sorted(&mut di, from, target);
+                        let final_idx = di.sorted().iter().position(|it| it.id == moved_id).unwrap();
+                        assert_eq!(final_idx, target, "设置页列表预览槽位 {target} 与重排落点 {final_idx} 不一致");
+                    }
+                }
+            }
+        }
     }
 }

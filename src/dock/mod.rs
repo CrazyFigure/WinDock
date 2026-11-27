@@ -32,10 +32,77 @@ pub const WM_APP_FRAME: u32 = WM_APP + 10;
 
 #[derive(Clone, Debug)]
 pub struct DragState {
+    /// 拖拽条目在 `entries.apps` 中的索引
     pub from: usize,
+    /// 当前鼠标在窗口坐标系下的位置
     pub x: f32,
     pub y: f32,
-    pub over: Option<usize>,
+    /// 按下瞬间图标中心相对鼠标的偏移，避免起拖瞬间图标中心跳变
+    pub grab_dx: f32,
+    pub grab_dy: f32,
+    /// 当前预览插入的固定项槽位索引（处于删除区域时为 None）
+    pub target: Option<usize>,
+    /// 当前鼠标是否悬停在回收站上
+    pub over_trash: bool,
+    /// 释放后是否从固定项移除
+    pub remove: bool,
+}
+
+/// 收集当前应用区中所有固定项的索引。
+pub fn pinned_app_indices(apps: &[crate::dock::items::Entry]) -> Vec<usize> {
+    apps.iter()
+        .enumerate()
+        .filter_map(|(i, e)| e.pinned.map(|_| i))
+        .collect()
+}
+
+/// 根据拖拽图标视觉中心 `preview_cx` 计算在静止 1.0x 基准槽位中最近的固定项目标索引。
+pub fn compute_dock_drag_target(
+    base_centers: &[f32],
+    base_cap_left: f32,
+    pinned_indices: &[usize],
+    preview_cx: f32,
+) -> Option<usize> {
+    pinned_indices
+        .iter()
+        .copied()
+        .filter(|&idx| idx < base_centers.len())
+        .min_by(|&a, &b| {
+            let da = (preview_cx - (base_cap_left + base_centers[a])).abs();
+            let db = (preview_cx - (base_cap_left + base_centers[b])).abs();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+/// 计算拖拽过程中条目 `orig_idx` 应该呈现的目标槽位索引（其他固定项顺滑让位）。
+pub fn visual_slot_for_entry(
+    orig_idx: usize,
+    from: usize,
+    target: Option<usize>,
+    pinned_indices: &[usize],
+) -> usize {
+    let Some(target_idx) = target else {
+        return orig_idx;
+    };
+    let Some(pos_from) = pinned_indices.iter().position(|&k| k == from) else {
+        return orig_idx;
+    };
+    let Some(pos_target) = pinned_indices.iter().position(|&k| k == target_idx) else {
+        return orig_idx;
+    };
+    let Some(pos_orig) = pinned_indices.iter().position(|&k| k == orig_idx) else {
+        return orig_idx;
+    };
+    if orig_idx == from {
+        return target_idx;
+    }
+    if pos_target > pos_from && pos_orig > pos_from && pos_orig <= pos_target {
+        pinned_indices[pos_orig - 1]
+    } else if pos_target < pos_from && pos_orig >= pos_target && pos_orig < pos_from {
+        pinned_indices[pos_orig + 1]
+    } else {
+        orig_idx
+    }
 }
 
 pub struct Dock {
@@ -52,6 +119,10 @@ pub struct Dock {
     pub vels: Vec<f32>,
     pub layout: DockLayout,
     pub base_centers: Vec<f32>,
+    pub base_capsule_w: f32,
+    pub slot_draw_x: Vec<f32>,
+    pub drop_settle: bool,
+    pub last_drag_render: Option<Instant>,
     pub win_rect: RECT,
     pub win_size: (i32, i32),
     pub window_visible: bool,
@@ -183,6 +254,10 @@ impl Dock {
                 vels: Vec::new(),
                 layout: DockLayout::default(),
                 base_centers: Vec::new(),
+                base_capsule_w: 0.0,
+                slot_draw_x: Vec::new(),
+                drop_settle: false,
+                last_drag_render: None,
                 win_rect: RECT::default(),
                 win_size: (0, 0),
                 window_visible: false,
@@ -440,6 +515,21 @@ impl Dock {
         }
     }
 
+    /// 1.0x 静止状态下的胶囊基准矩形（用于拖拽目标判定，避免放大收缩期间坐标漂移）。
+    pub fn base_capsule_rect(&self) -> RECT {
+        let (w, h) = self.win_size;
+        let cw = self.base_capsule_w.round() as i32;
+        let ch = self.layout.capsule_h.round() as i32;
+        let left = ((w - cw) as f32 * 0.5).round() as i32;
+        let bot_margin = self.bottom_margin_y();
+        RECT {
+            left,
+            top: h - bot_margin - ch,
+            right: left + cw,
+            bottom: h - bot_margin,
+        }
+    }
+
     /// 计算 Dock 覆盖窗的垂直位置与高度：返回 `(win_top, win_h, bot_margin)`。
     ///
     /// 保证胶囊底边精确落在 `mon_bottom - bottom_offset_px`，同时窗口底边绝不超过 `mon_bottom`。
@@ -486,6 +576,7 @@ impl Dock {
             self.magnify_scale,
         );
         self.base_centers = base.slots.iter().map(|s| s.center_x).collect();
+        self.base_capsule_w = base.capsule_w;
         self.layout = base.clone();
         // 窗口尺寸：基础胶囊 + 最大放大增量 + 边距（并保证极端精简 Dock 下也能完整容纳“WinDockFinder 设置”Tooltip）；高度：胶囊 + 向上突破 + Tooltip
         let grow_w = (self.icon_px() as f32 * (self.magnify_scale - 1.0) * self.magnify_range * 2.0 * 0.6).round() as i32;
@@ -509,6 +600,10 @@ impl Dock {
             right: left + w,
             bottom: top + h,
         };
+        if self.drag.is_none() && !self.drop_settle {
+            let cap_left = self.capsule_rect().left as f32;
+            self.slot_draw_x = self.layout.slots.iter().map(|s| cap_left + s.center_x).collect();
+        }
         unsafe {
             let _ = SetWindowPos(
                 self.hwnd_overlay,
@@ -576,9 +671,134 @@ impl Dock {
         let n = self.entry_count();
         self.scales.resize(n, 1.0);
         self.vels.resize(n, 0.0);
+        if !self.drop_settle && self.drag.is_none() {
+            let cap_left = self.capsule_rect().left as f32;
+            self.slot_draw_x.resize(n, 0.0);
+            for i in 0..n.min(self.layout.slots.len()) {
+                self.slot_draw_x[i] = cap_left + self.layout.slots[i].center_x;
+            }
+        }
         self.hover = self.hover.filter(|h| *h < n);
         self.dirty = true;
         self.backdrop_dirty = true;
+    }
+
+    /// 获取条目当前用于渲染的水平中心坐标（拖拽让位或落位过渡期间返回平滑插值坐标）。
+    pub fn slot_x(&self, i: usize) -> f32 {
+        if (self.drag.is_some() || self.drop_settle) && i < self.slot_draw_x.len() {
+            return self.slot_draw_x[i];
+        }
+        self.capsule_rect().left as f32 + self.layout.slots.get(i).map(|s| s.center_x).unwrap_or(0.0)
+    }
+
+    /// 获取当前拖拽状态下某条目的视觉目标槽位索引。
+    pub fn visual_slot(&self, orig_idx: usize) -> usize {
+        let Some(d) = &self.drag else { return orig_idx };
+        let pinned = pinned_app_indices(&self.entries.apps);
+        visual_slot_for_entry(orig_idx, d.from, d.target, &pinned)
+    }
+
+    /// 进入 Dock 拖拽模式，记录按下偏移并锁定当前所有图标初始绘制位置。
+    pub fn begin_drag(&mut self, from: usize, press_x: f32, press_y: f32, x: f32, y: f32) {
+        let Some(slot) = self.layout.slots.get(from).copied() else { return };
+        if self.entries.apps.get(from).and_then(|e| e.pinned).is_none() {
+            return;
+        }
+        let cap = self.capsule_rect();
+        let n = self.entry_count();
+        self.slot_draw_x = (0..n)
+            .map(|i| cap.left as f32 + self.layout.slots.get(i).map(|s| s.center_x).unwrap_or(0.0))
+            .collect();
+        let slot_cx = cap.left as f32 + slot.center_x;
+        let slot_cy = cap.top as f32 + slot.center_y;
+        let half = slot.size * 0.5;
+        let grab_dx = (slot_cx - press_x).clamp(-half, half);
+        let grab_dy = (slot_cy - press_y).clamp(-half, half);
+        self.hover = None;
+        self.hover_since = None;
+        self.tooltip_visible = false;
+        self.drop_settle = false;
+        self.last_drag_render = None;
+        self.drag = Some(DragState {
+            from,
+            x,
+            y,
+            grab_dx,
+            grab_dy,
+            target: Some(from),
+            over_trash: false,
+            remove: false,
+        });
+        self.update_drag(x, y);
+    }
+
+    /// 根据当前鼠标坐标刷新 Dock 拖拽目标槽位与移除判定，保证预览与落点完全一致。
+    pub fn update_drag(&mut self, x: f32, y: f32) {
+        let s_dpi = self.dpi_scale();
+        let base_cap = self.base_capsule_rect();
+        let cap = self.capsule_rect();
+        let app_n = self.entries.apps.len();
+        let mut over_trash = false;
+        for (ri, f) in self.entries.right.iter().enumerate() {
+            if matches!(f.kind, FuncKind::Trash) {
+                let si = app_n + ri;
+                if let Some(slot) = self.layout.slots.get(si) {
+                    let cx = cap.left as f32 + slot.center_x;
+                    let half = slot.size * 0.5 + 4.0 * s_dpi;
+                    if x >= cx - half
+                        && x <= cx + half
+                        && y >= base_cap.top as f32 - 14.0 * s_dpi
+                        && y <= base_cap.bottom as f32 + 14.0 * s_dpi
+                    {
+                        over_trash = true;
+                        break;
+                    }
+                }
+            }
+        }
+        let below = y > base_cap.bottom as f32 + 12.0 * s_dpi;
+        let far_above = y < base_cap.top as f32 - (self.icon_px() as f32 * 0.95).max(36.0 * s_dpi);
+        let remove = over_trash || below || far_above;
+        let pinned = pinned_app_indices(&self.entries.apps);
+        let Some(d) = self.drag.as_mut() else { return };
+        d.x = x;
+        d.y = y;
+        d.over_trash = over_trash;
+        d.remove = remove;
+        if remove {
+            d.target = None;
+        } else {
+            let preview_cx = x + d.grab_dx;
+            d.target = compute_dock_drag_target(&self.base_centers, base_cap.left as f32, &pinned, preview_cx)
+                .or(Some(d.from));
+        }
+        self.dirty = true;
+    }
+
+    /// 在重排后映射 `slot_draw_x`，使被拖放的图标从释放位置平滑落入目标槽位且其余图标无跳变。
+    pub fn prepare_drop_settle(&mut self, from: usize, target: usize, drop_gx: f32) {
+        let n = self.entry_count();
+        if from >= n || target >= n || self.slot_draw_x.len() != n {
+            return;
+        }
+        let pinned = pinned_app_indices(&self.entries.apps);
+        let mut new_draw_x = self.slot_draw_x.clone();
+        let mut new_scales = self.scales.clone();
+        let mut new_vels = self.vels.clone();
+        for orig in 0..n {
+            let vis = visual_slot_for_entry(orig, from, Some(target), &pinned);
+            if vis < n {
+                new_draw_x[vis] = if orig == from { drop_gx } else { self.slot_draw_x[orig] };
+                if orig < self.scales.len() && vis < new_scales.len() {
+                    new_scales[vis] = self.scales[orig];
+                    new_vels[vis] = self.vels[orig];
+                }
+            }
+        }
+        self.slot_draw_x = new_draw_x;
+        self.scales = new_scales;
+        self.vels = new_vels;
+        self.drop_settle = true;
     }
 
     pub fn set_want_visible(&mut self, v: bool) {
@@ -593,6 +813,7 @@ impl Dock {
                 self.tooltip_visible = false;
                 self.drag = None;
                 self.press = None;
+                self.drop_settle = false;
                 unsafe {
                     if windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() == self.hwnd_overlay {
                         let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
@@ -669,25 +890,34 @@ impl Dock {
                 animating = true;
             }
         }
-        // 放大弹簧
+        // 放大弹簧（拖拽期间无过冲平滑回落到 1.0x，避免胶囊边缘抖动）
         let mouse_x = if self.mouse_in { Some(self.mouse.0) } else { None };
         let pitch = (self.icon_px() + self.gap_px) as f32;
         let cap_left = self.capsule_rect().left as f32;
         let n = self.entry_count();
         for i in 0..n.min(self.scales.len()) {
             let base = *self.base_centers.get(i).unwrap_or(&0.0);
-            let target = match (mouse_x, self.drag.as_ref()) {
-                (Some(mx), None) if self.magnify_scale > 1.0 => {
-                    let d = (mx - cap_left - base).abs();
-                    1.0 + (self.magnify_scale - 1.0) * layout::influence(d, pitch, self.magnify_range)
+            if self.drag.is_some() {
+                let before = self.scales[i];
+                let next = layout::ease_to(before, 1.0, dt_ms, if reduce { 0.0 } else { 80.0 }, reduce);
+                self.scales[i] = next;
+                self.vels[i] = 0.0;
+                if (next - 1.0).abs() > 0.002 {
+                    animating = true;
                 }
-                _ => 1.0,
-            };
-            let _v = self.vels[i];
-            let before = self.scales[i];
-            self.scales[i] = layout::spring_step(before, &mut self.vels[i], target, dt, 260.0, 0.84);
-            if (self.scales[i] - target).abs() > 0.002 || self.vels[i].abs() > 0.02 {
-                animating = true;
+            } else {
+                let target = match mouse_x {
+                    Some(mx) if self.magnify_scale > 1.0 => {
+                        let d = (mx - cap_left - base).abs();
+                        1.0 + (self.magnify_scale - 1.0) * layout::influence(d, pitch, self.magnify_range)
+                    }
+                    _ => 1.0,
+                };
+                let before = self.scales[i];
+                self.scales[i] = layout::spring_step(before, &mut self.vels[i], target, dt, 260.0, 0.84);
+                if (self.scales[i] - target).abs() > 0.002 || self.vels[i].abs() > 0.02 {
+                    animating = true;
+                }
             }
         }
         // 启动弹跳动画（480ms 完成一次柔和起落）
@@ -700,11 +930,27 @@ impl Dock {
                 animating = true;
             }
         }
-        // 布局
+        // 布局（拖拽期间把各条目缩放映射至其让位后的视觉槽位，防止让位图标借用旧槽位缩放瞬间变大）
         let seps = self.separator_after();
+        let layout_scales: Vec<f32> = if let Some(d) = &self.drag {
+            let pinned = pinned_app_indices(&self.entries.apps);
+            let mut vs = vec![1.0f32; n];
+            for orig in 0..n.min(self.scales.len()) {
+                if orig == d.from {
+                    continue;
+                }
+                let vis = visual_slot_for_entry(orig, d.from, d.target, &pinned);
+                if vis < n {
+                    vs[vis] = self.scales[orig];
+                }
+            }
+            vs
+        } else {
+            self.scales.clone()
+        };
         self.layout = layout::compute(
             n,
-            &self.scales,
+            &layout_scales,
             &seps,
             self.icon_px() as f32,
             self.gap_px as f32,
@@ -712,6 +958,42 @@ impl Dock {
             self.pad_y_px() as f32,
             self.magnify_scale,
         );
+        // 拖拽让位与松手落位水平平滑插值
+        let cap_left = self.capsule_rect().left as f32;
+        if self.slot_draw_x.len() != n {
+            self.slot_draw_x.resize(n, 0.0);
+            for i in 0..n.min(self.layout.slots.len()) {
+                self.slot_draw_x[i] = cap_left + self.layout.slots[i].center_x;
+            }
+        }
+        if let Some(d) = self.drag.clone() {
+            let pinned = pinned_app_indices(&self.entries.apps);
+            for i in 0..n.min(self.layout.slots.len()) {
+                let vis = visual_slot_for_entry(i, d.from, d.target, &pinned);
+                let target_x = cap_left + self.layout.slots[vis].center_x;
+                let next = layout::ease_to(self.slot_draw_x[i], target_x, dt_ms, if reduce { 0.0 } else { 85.0 }, reduce);
+                if (next - target_x).abs() > 0.25 {
+                    animating = true;
+                }
+                self.slot_draw_x[i] = next;
+            }
+        } else if self.drop_settle {
+            let mut still = false;
+            for i in 0..n.min(self.layout.slots.len()) {
+                let target_x = cap_left + self.layout.slots[i].center_x;
+                let next = layout::ease_to(self.slot_draw_x[i], target_x, dt_ms, if reduce { 0.0 } else { 90.0 }, reduce);
+                if (next - target_x).abs() > 0.25 {
+                    still = true;
+                    animating = true;
+                }
+                self.slot_draw_x[i] = next;
+            }
+            self.drop_settle = still;
+        } else {
+            for i in 0..n.min(self.layout.slots.len()) {
+                self.slot_draw_x[i] = cap_left + self.layout.slots[i].center_x;
+            }
+        }
         // Tooltip 延迟
         if let Some(t) = self.hover_since {
             if self.hover.is_some() && !self.tooltip_visible && t.elapsed().as_millis() >= 100 {
@@ -728,6 +1010,8 @@ impl Dock {
     pub fn animating(&self) -> bool {
         let target_t = if self.want_visible { 1.0 } else { 0.0 };
         (self.show_t - target_t).abs() > 0.001
+            || self.drag.is_some()
+            || self.drop_settle
             || self.scales.iter().enumerate().any(|(i, s)| {
                 let base = *self.base_centers.get(i).unwrap_or(&0.0);
                 let d = if self.mouse_in { (self.mouse.0 - self.capsule_rect().left as f32 - base).abs() } else { f32::MAX };
@@ -749,6 +1033,7 @@ impl Dock {
         layout::hit_slot(&self.layout, x - cap.left as f32, y - cap.top as f32, 2.0)
     }
 
+    #[allow(dead_code)]
     pub fn in_capsule(&self, x: f32, y: f32) -> bool {
         let cap = self.capsule_rect();
         x >= cap.left as f32 && x <= cap.right as f32 && y >= cap.top as f32 - 10.0 && y <= cap.bottom as f32
@@ -958,5 +1243,201 @@ mod tests {
             assert_eq!(capsule_screen_bottom, mon_bottom - offset_px);
             assert!(win_bottom <= mon_bottom);
         }
+    }
+
+    #[test]
+    fn dock_drag_target_and_visual_slots_match_final_order() {
+        use crate::dock::items::Entry;
+        let mk = |id: &str, pinned: Option<usize>| Entry {
+            id: id.into(),
+            pinned,
+            running_exe: None,
+            label: id.into(),
+            icon_key: id.into(),
+            windows: Vec::new(),
+        };
+        // 含前置未固定启动台(0)、3个固定应用(1..=3)、1个未固定运行应用(4)
+        let apps = vec![
+            mk("special:launchpad", None),
+            mk("a", Some(0)),
+            mk("b", Some(1)),
+            mk("c", Some(2)),
+            mk("run:x", None),
+        ];
+        let pinned = pinned_app_indices(&apps);
+        assert_eq!(pinned, vec![1, 2, 3]);
+
+        // 5 个应用槽位中心（步距 56px）
+        let base_centers = [34.0, 90.0, 146.0, 202.0, 258.0];
+        let cap_left = 100.0;
+
+        // 拖动 a(1) 越过 b(2) 中心后落在槽位 2，预览槽位为 [b->1, gap->2, c->3]
+        let t1 = compute_dock_drag_target(&base_centers, cap_left, &pinned, cap_left + 150.0);
+        assert_eq!(t1, Some(2));
+        assert_eq!(visual_slot_for_entry(0, 1, t1, &pinned), 0);
+        assert_eq!(visual_slot_for_entry(2, 1, t1, &pinned), 1);
+        assert_eq!(visual_slot_for_entry(3, 1, t1, &pinned), 3);
+        assert_eq!(visual_slot_for_entry(4, 1, t1, &pinned), 4);
+
+        // 拖动最右 c(3) 向左越过 a(1) 中心，落在槽位 1，a/b 依次右移让位
+        let t2 = compute_dock_drag_target(&base_centers, cap_left, &pinned, cap_left + 85.0);
+        assert_eq!(t2, Some(1));
+        assert_eq!(visual_slot_for_entry(1, 3, t2, &pinned), 2);
+        assert_eq!(visual_slot_for_entry(2, 3, t2, &pinned), 3);
+        assert_eq!(visual_slot_for_entry(0, 3, t2, &pinned), 0);
+        assert_eq!(visual_slot_for_entry(4, 3, t2, &pinned), 4);
+    }
+
+    #[test]
+    fn dock_drag_sweep_preview_gap_always_matches_committed_order() {
+        use crate::config::DockItems;
+        use crate::dock::items::{new_item, reorder_app_entries, Entry};
+        use crate::dock::layout;
+
+        let items_vec = vec![
+            new_item("app", r"C:\1.exe", "One"),
+            new_item("app", r"C:\2.exe", "Two"),
+            new_item("app", r"C:\3.exe", "Three"),
+            new_item("app", r"C:\4.exe", "Four"),
+        ];
+        let mut di_base = DockItems::default();
+        for (idx, mut it) in items_vec.into_iter().enumerate() {
+            it.order = idx as u32;
+            di_base.items.push(it);
+        }
+        let entries_base: Vec<Entry> = di_base
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, it)| Entry {
+                id: it.id.clone(),
+                pinned: Some(i),
+                running_exe: None,
+                label: it.label.clone(),
+                icon_key: it.target.clone(),
+                windows: Vec::new(),
+            })
+            .collect();
+        let pinned = pinned_app_indices(&entries_base);
+
+        // 在 100% 和 150% DPI 下全区间扫掠鼠标位置与抓手偏移
+        for scale in [1.0f32, 1.5f32] {
+            let icon = 48.0 * scale;
+            let gap = 8.0 * scale;
+            let pad_x = 10.0 * scale;
+            let pad_y = 8.0 * scale;
+            let l = layout::compute(4, &[1.0; 4], &[], icon, gap, pad_x, pad_y, 1.45);
+            let centers: Vec<f32> = l.slots.iter().map(|s| s.center_x).collect();
+            let cap_left = 120.0;
+            for from in 0..4 {
+                for grab_dx in [-12.0 * scale, 0.0, 12.0 * scale] {
+                    let mut x = cap_left - 20.0;
+                    while x <= cap_left + l.capsule_w + 20.0 {
+                        let preview_cx = x + grab_dx;
+                        let target = compute_dock_drag_target(&centers, cap_left, &pinned, preview_cx).unwrap();
+                        // 1) 所有其他固定项映射后的槽位互不冲突且恰好空出 target
+                        let mut occupied = [false; 4];
+                        for orig in 0..4 {
+                            if orig == from {
+                                continue;
+                            }
+                            let vis = visual_slot_for_entry(orig, from, Some(target), &pinned);
+                            assert!(!occupied[vis], "视觉槽位发生重叠");
+                            occupied[vis] = true;
+                        }
+                        assert!(!occupied[target], "目标槽位未空出");
+
+                        // 2) 提交重排后的最终下标必须严格等于预览空出的 target
+                        let mut di = di_base.clone();
+                        let mut ordered: Vec<String> = entries_base.iter().map(|e| e.id.clone()).collect();
+                        let moved = ordered.remove(from);
+                        ordered.insert(target, moved);
+                        let _ = reorder_app_entries(&mut di, &ordered);
+                        let final_pos = di.sorted().iter().position(|it| it.id == entries_base[from].id).unwrap();
+                        assert_eq!(final_pos, target, "预览目标 {target} 与提交落点 {final_pos} 不一致");
+                        x += 7.0;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dock_stateful_drag_preserves_grab_offset_animates_slots_and_detects_remove_zones() {
+        use crate::dock::items::{Entry, EntryList, FuncEntry, FuncKind};
+        let mon = crate::win32::primary_monitor().unwrap_or(MonitorInfo {
+            hmonitor: windows::Win32::Graphics::Gdi::HMONITOR::default(),
+            rect: RECT { left: 0, top: 0, right: 1920, bottom: 1080 },
+            work: RECT { left: 0, top: 0, right: 1920, bottom: 1080 },
+            dpi: 96,
+            primary: true,
+        });
+        let cfg = DockCfg::default();
+        let app_cfg = Appearance::default();
+        let mut dock = Dock::new(std::ptr::null_mut(), mon, &cfg, &app_cfg).expect("Dock test window should create");
+        let mk = |id: &str, p: usize| Entry {
+            id: id.into(),
+            pinned: Some(p),
+            running_exe: None,
+            label: id.into(),
+            icon_key: "special:settings".into(),
+            windows: Vec::new(),
+        };
+        dock.set_entries(EntryList {
+            apps: vec![mk("a", 0), mk("b", 1), mk("c", 2)],
+            right: vec![FuncEntry {
+                kind: FuncKind::Trash,
+                label: "回收站".into(),
+                icon_key: "special:trash".into(),
+            }],
+        });
+        dock.relayout(&cfg, &app_cfg);
+        dock.want_visible = true;
+        dock.show_t = 1.0;
+
+        // 模拟按下第 0 项右侧偏 12px 处起拖
+        let cap = dock.capsule_rect();
+        let slot0 = dock.layout.slots[0];
+        let slot0_cx = cap.left as f32 + slot0.center_x;
+        let slot0_cy = cap.top as f32 + slot0.center_y;
+        let press_x = slot0_cx + 12.0;
+        let press_y = slot0_cy + 4.0;
+        dock.begin_drag(0, press_x, press_y, press_x + 6.0, press_y);
+        let d0 = dock.drag.as_ref().expect("drag should start");
+        assert!((d0.grab_dx - (-12.0)).abs() < 0.01);
+        assert!((d0.grab_dy - (-4.0)).abs() < 0.01);
+        // 拖拽图标视觉中心从 slot0_cx + 6 开始，零跳变
+        assert!(((d0.x + d0.grab_dx) - (slot0_cx + 6.0)).abs() < 0.01);
+        assert_eq!(d0.target, Some(0));
+
+        // 拖到第 2 项位置，应选中 target=2 并触发第 1、2 项向左平滑让位
+        let base_cap = dock.base_capsule_rect();
+        let slot2_cx = base_cap.left as f32 + dock.base_centers[2];
+        dock.update_drag(slot2_cx - d0.grab_dx, slot0_cy);
+        assert_eq!(dock.drag.as_ref().unwrap().target, Some(2));
+        assert!(!dock.drag.as_ref().unwrap().remove);
+        for _ in 0..30 {
+            let _ = dock.tick(16.0, &cfg, &app_cfg, 150);
+        }
+        // 第 1 项应已滑到槽位 0，第 2 项应已滑到槽位 1
+        let final_cap = dock.capsule_rect();
+        assert!((dock.slot_x(1) - (final_cap.left as f32 + dock.layout.slots[0].center_x)).abs() < 1.0);
+        assert!((dock.slot_x(2) - (final_cap.left as f32 + dock.layout.slots[1].center_x)).abs() < 1.0);
+
+        // 拖到回收站上方应触发 over_trash 与 remove
+        let trash_cx = final_cap.left as f32 + dock.layout.slots[3].center_x;
+        dock.update_drag(trash_cx, slot0_cy);
+        assert!(dock.drag.as_ref().unwrap().over_trash);
+        assert!(dock.drag.as_ref().unwrap().remove);
+        assert_eq!(dock.drag.as_ref().unwrap().target, None);
+
+        // 拖回 Dock 内再向上拖出移除阈值，应识别为 remove，拖回则恢复重排
+        dock.update_drag(slot2_cx, base_cap.top as f32 - 60.0 * dock.dpi_scale());
+        assert!(dock.drag.as_ref().unwrap().remove);
+        dock.update_drag(slot2_cx, slot0_cy);
+        assert!(!dock.drag.as_ref().unwrap().remove);
+        assert!(dock.drag.as_ref().unwrap().target.is_some());
+
+        dock.destroy();
     }
 }

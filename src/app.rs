@@ -37,7 +37,7 @@ use crate::topbar::status;
 use crate::topbar::tray_mirror::{self, TrayIconCache, TrayInvocation, TrayItem, TrayRefreshRequest, TraySnapshot};
 use crate::topbar::tray_popover::Popover;
 use crate::topbar::tray_tooltip::{TipTarget, TrayTooltip, TIMER_TRAY_TIP};
-use crate::topbar::{Hit, TopBar, TopbarDrag};
+use crate::topbar::{Hit, TopBar};
 use crate::tray::Tray;
 use crate::ui::DibTarget;
 use crate::win32::{all_monitors, class_name, monitor_at_cursor, wide, wide_static, window_dpi, MonitorInfo};
@@ -878,7 +878,8 @@ impl App {
                     || e.label == crate::win32::FILE_MANAGER_NAME
             }) {
                 let real_pos = exp_pos + 1;
-                if real_pos != 1 {
+                // 仅在文件管理器未固定时自动紧随启动台，避免覆盖用户自定义的固定排序
+                if real_pos != 1 && list.apps[real_pos].pinned.is_none() {
                     let exp = list.apps.remove(real_pos);
                     list.apps.insert(1, exp);
                 }
@@ -1699,8 +1700,10 @@ impl App {
                 self.render_dock(i);
             }
         }
+        let reduce = self.config.appearance.reduce_motion;
         for bar in &mut self.topbars {
             animating |= bar.tick_color(dt, transition);
+            animating |= bar.tick_tray_anim(dt, reduce);
         }
         if !animating {
             unsafe {
@@ -2595,18 +2598,9 @@ impl App {
         self.mouse_in_dock = true;
         self.hide_at = None;
         self.edge_since = None;
+        let mut render_now = false;
         {
             let dock = &mut self.docks[i];
-            let hit = dock.hit(x, y);
-            let inside = dock.in_capsule(x, y);
-            if hit != dock.hover {
-                dock.hover = hit;
-                dock.hover_since = hit.map(|_| Instant::now());
-                if hit.is_none() {
-                    dock.tooltip_visible = false;
-                }
-                dock.dirty = true;
-            }
             dock.mouse = (x, y);
             dock.mouse_in = true;
             // 按住固定应用拖动超过阈值后自动启动拖拽排序/拖出移除
@@ -2614,24 +2608,32 @@ impl App {
                 if let Some((pi, px, py)) = dock.press {
                     let dist = ((x - px).powi(2) + (y - py).powi(2)).sqrt();
                     let is_pinned = dock.entries.apps.get(pi).and_then(|e| e.pinned).is_some();
-                    if is_pinned && dist >= 6.0 * dock.dpi_scale() {
-                        dock.drag = Some(crate::dock::DragState {
-                            from: pi,
-                            x,
-                            y,
-                            over: if inside { hit } else { None },
-                        });
-                        dock.tooltip_visible = false;
-                        dock.dirty = true;
+                    if is_pinned && dist >= 5.0 * dock.dpi_scale() {
+                        dock.begin_drag(pi, px, py, x, y);
                     }
                 }
             }
-            if let Some(d) = dock.drag.as_mut() {
-                d.x = x;
-                d.y = y;
-                d.over = if inside { hit } else { None };
-                dock.dirty = true;
+            if dock.drag.is_some() {
+                dock.update_drag(x, y);
+                // 拖拽期间立即刷新分层窗口，规避 16ms 帧定时器节流导致的拖影滞后
+                if dock.last_drag_render.is_none_or(|t| t.elapsed() >= Duration::from_millis(4)) {
+                    dock.last_drag_render = Some(Instant::now());
+                    render_now = true;
+                }
+            } else {
+                let hit = dock.hit(x, y);
+                if hit != dock.hover {
+                    dock.hover = hit;
+                    dock.hover_since = hit.map(|_| Instant::now());
+                    if hit.is_none() {
+                        dock.tooltip_visible = false;
+                    }
+                    dock.dirty = true;
+                }
             }
+        }
+        if render_now {
+            self.render_dock(i);
         }
         self.ensure_frame();
     }
@@ -2673,42 +2675,43 @@ impl App {
         let Some(i) = self.dock_index(hwnd) else { return };
         let (drag, press, hit) = {
             let dock = &mut self.docks[i];
+            if dock.drag.is_some() {
+                dock.update_drag(x, y);
+            }
             let hit = dock.hit(x, y);
             (dock.drag.take(), dock.press.take(), hit)
         };
-        if let Some(d) = drag.clone() {
-            let below = y > self.docks[i].capsule_rect().bottom as f32 + 8.0 * self.docks[i].dpi_scale();
-            let over_trash = d.over.map(|o| matches!(self.docks[i].func_kind(o), Some(FuncKind::Trash))).unwrap_or(false);
-            let n = self.docks[i].entries.apps.len();
-            let from = self.docks[i].entries.apps.get(d.from).cloned();
-            if let Some(e) = from.filter(|e| e.pinned.is_some()) {
-                let over_entry = d.over.filter(|o| *o < n).and_then(|o| self.docks[i].entries.apps.get(o).cloned());
-                let after = match d.over {
-                    Some(o) if o < n => {
-                        let dock = &self.docks[i];
-                        let cap = dock.capsule_rect();
-                        x > cap.left as f32 + dock.layout.slots.get(o).map(|s| s.center_x).unwrap_or(0.0)
-                    }
-                    _ => false,
-                };
-                if over_trash || (below && d.over.is_none()) {
+        if let Some(d) = drag {
+            let entry = self.docks[i].entries.apps.get(d.from).cloned();
+            if let Some(e) = entry.filter(|e| e.pinned.is_some()) {
+                if d.remove {
+                    self.docks[i].slot_draw_x.clear();
+                    self.docks[i].drop_settle = false;
                     items::remove_pinned(&mut self.dock_items, &e.id);
                     self.after_items_change();
-                } else if let Some(oe) = over_entry {
-                    let before_id = if after {
-                        self.docks[i].entries.apps.get(d.over.unwrap_or(0) + 1).filter(|x| x.pinned.is_some()).map(|x| x.id.clone())
-                    } else {
-                        Some(oe.id.clone())
-                    };
-                    items::reorder(&mut self.dock_items, &e.id, before_id.as_deref());
-                    self.after_items_change();
-                } else if d.over.is_some() {
-                    // 放到功能区左侧：移动到固定项末尾
-                    let last = self.docks[i].entries.apps.iter().rev().find(|x| x.pinned.is_some()).map(|x| x.id.clone());
-                    items::reorder(&mut self.dock_items, &e.id, last.as_deref());
-                    self.after_items_change();
+                } else if let Some(target) = d.target {
+                    let pinned = crate::dock::pinned_app_indices(&self.docks[i].entries.apps);
+                    if let (Some(pf), Some(pt)) = (
+                        pinned.iter().position(|&k| k == d.from),
+                        pinned.iter().position(|&k| k == target),
+                    ) {
+                        let drop_gx = d.x + d.grab_dx;
+                        self.docks[i].prepare_drop_settle(d.from, target, drop_gx);
+                        let mut ordered_ids: Vec<String> = pinned
+                            .iter()
+                            .filter_map(|&k| self.docks[i].entries.apps.get(k).map(|x| x.id.clone()))
+                            .collect();
+                        if pf < ordered_ids.len() && pt < ordered_ids.len() && pf != pt {
+                            let moved = ordered_ids.remove(pf);
+                            ordered_ids.insert(pt, moved);
+                            if items::reorder_app_entries(&mut self.dock_items, &ordered_ids) {
+                                self.after_items_change();
+                            }
+                        }
+                    }
                 }
             }
+            self.render_dock(i);
         } else if let Some((pi, _, _)) = press {
             if hit == Some(pi) {
                 self.activate_entry(pi);
@@ -2770,6 +2773,9 @@ impl App {
         let Some(i) = self.dock_index(hwnd) else { return };
         self.docks[i].drag = None;
         self.docks[i].press = None;
+        self.docks[i].drop_settle = false;
+        self.docks[i].slot_draw_x.clear();
+        self.docks[i].dirty = true;
         self.ensure_frame();
     }
 
@@ -2916,37 +2922,44 @@ impl App {
 
     pub fn topbar_mouse_move(&mut self, hwnd: HWND, x: i32, y: i32) {
         let Some(i) = self.topbar_index(hwnd) else { return };
-        let bar = &mut self.topbars[i];
-        if let Some((pkey, px, py)) = bar.press_icon.clone() {
-            if bar.drag.is_none() {
-                let dist = (((x - px).pow(2) + (y - py).pow(2)) as f32).sqrt();
-                if dist >= 5.0 * (bar.dpi as f32 / 96.0) {
-                    let (ins_before, ins_x) = Self::compute_topbar_insert(bar, &pkey, x);
-                    bar.drag = Some(TopbarDrag {
-                        key: pkey,
-                        x,
-                        insert_before: ins_before,
-                        insert_x: ins_x,
-                    });
-                    invalidate(bar.hwnd);
-                    self.tray_tip.clear(self.hwnd);
-                    return;
+        let mut start_drag = false;
+        let mut paint_now = false;
+        {
+            let bar = &mut self.topbars[i];
+            if let Some((pkey, px, py)) = bar.press_icon.clone() {
+                if bar.drag.is_none() {
+                    let dist = (((x - px).pow(2) + (y - py).pow(2)) as f32).sqrt();
+                    if dist >= 4.0 * (bar.dpi as f32 / 96.0) && bar.begin_tray_drag(&pkey, px, x) {
+                        bar.last_drag_paint = Some(Instant::now());
+                        start_drag = true;
+                        paint_now = true;
+                    }
+                }
+            }
+            if !start_drag && bar.drag.is_some() {
+                bar.update_tray_drag(x);
+                if bar.last_drag_paint.is_none_or(|t| t.elapsed() >= Duration::from_millis(4)) {
+                    bar.last_drag_paint = Some(Instant::now());
+                    paint_now = true;
                 }
             }
         }
-        if let Some(d) = bar.drag.as_ref() {
-            let key = d.key.clone();
-            let (ins_before, ins_x) = Self::compute_topbar_insert(bar, &key, x);
-            if let Some(d) = bar.drag.as_mut() {
-                d.x = x;
-                d.insert_before = ins_before;
-                d.insert_x = ins_x;
+        if start_drag {
+            self.tray_tip.clear(self.hwnd);
+        }
+        if self.topbars[i].drag.is_some() {
+            if paint_now {
+                let t = &self.config.topbar;
+                let a = &self.config.appearance;
+                let icons = &self.tray_icons;
+                let bar = &mut self.topbars[i];
+                crate::topbar::render::paint_immediate(hwnd, bar, t, a, icons);
             }
-            invalidate(bar.hwnd);
+            self.ensure_frame();
             return;
         }
-        let hit = bar.hit_test(x, y);
-        bar.set_hover(hit);
+        let hit = self.topbars[i].hit_test(x, y);
+        self.topbars[i].set_hover(hit);
         self.update_tray_tip(hwnd, x, y);
     }
 
@@ -3016,46 +3029,6 @@ impl App {
         }
     }
 
-    fn compute_topbar_insert(bar: &TopBar, drag_key: &str, x: i32) -> (Option<String>, i32) {
-        let mut slots: Vec<(String, RECT)> = bar
-            .hits
-            .iter()
-            .filter_map(|(r, h)| match h {
-                Hit::TrayIcon(k) => Some((k.clone(), *r)),
-                _ => None,
-            })
-            .collect();
-        // hits 从右向左生成，按屏幕上从左到右排列，匹配 pinned_tray_keys 的视觉顺序（rev()）
-        slots.sort_by_key(|(_, r)| r.left);
-        // 找到最近插入间隙：在顶部栏中，pinned 列表按 rev() 从右往左排，即最左边的图标在 pinned 末尾，最右边的在 pinned 开头
-        if slots.is_empty() {
-            return (None, x);
-        }
-        // 用视觉位置判断落在第几个图标右侧/左侧
-        // 视觉上第 idx 个槽位在 pinned 中的顺序是逆序的；若要放在视觉左侧（视觉更靠左 = pinned 更靠后），实际上直接按视觉索引排布最直观：
-        // 构造当前视觉从左到右的键序，移除 drag_key 后按 x 插入，再反转即新的 pinned_tray_keys！
-        let mut best_x = slots[0].1.left;
-        let mut min_dist = (x - slots[0].1.left).abs();
-        let mut insert_visual_idx = 0usize;
-        for (idx, (_, r)) in slots.iter().enumerate() {
-            let d_l = (x - r.left).abs();
-            if d_l < min_dist {
-                min_dist = d_l;
-                best_x = r.left;
-                insert_visual_idx = idx;
-            }
-            let d_r = (x - r.right).abs();
-            if d_r < min_dist {
-                min_dist = d_r;
-                best_x = r.right;
-                insert_visual_idx = idx + 1;
-            }
-        }
-        // 将视觉插槽映射回 pinned_tray_keys 的 "before_key" 标识（使用特殊标记或直接通过 reorder_topbar_visual 重排）
-        let _ = drag_key;
-        (Some(format!("__vis_idx:{insert_visual_idx}")), best_x)
-    }
-
     pub fn topbar_mouse_leave(&mut self, hwnd: HWND) {
         if self.tray_tip.owner() == Some(hwnd) {
             self.tray_tip.clear(self.hwnd);
@@ -3081,6 +3054,9 @@ impl App {
 
     pub fn topbar_lbutton_up(&mut self, hwnd: HWND, x: i32, y: i32) {
         let Some(i) = self.topbar_index(hwnd) else { return };
+        if self.topbars[i].drag.is_some() {
+            self.topbars[i].update_tray_drag(x);
+        }
         let press = self.topbars[i].press_icon.take();
         let drag = self.topbars[i].drag.take();
         unsafe {
@@ -3089,12 +3065,16 @@ impl App {
             }
         }
         if let Some(d) = drag {
-            if let Some(vis_str) = d.insert_before.as_deref().and_then(|s| s.strip_prefix("__vis_idx:")) {
-                if let Ok(vis_idx) = vis_str.parse::<usize>() {
-                    self.reorder_topbar_by_visual(i, &d.key, vis_idx);
-                }
-            }
-            invalidate(hwnd);
+            let drop_cx = (d.x + d.grab_dx) as f32;
+            self.topbars[i].prepare_tray_drop_settle(&d.key, drop_cx);
+            self.reorder_topbar_by_visual(i, &d.key, d.target_idx);
+            let hit = self.topbars[i].hit_test(x, y);
+            self.topbars[i].set_hover(hit);
+            let t = &self.config.topbar;
+            let a = &self.config.appearance;
+            let icons = &self.tray_icons;
+            crate::topbar::render::paint_immediate(hwnd, &mut self.topbars[i], t, a, icons);
+            self.ensure_frame();
             return;
         }
         if let Some((pkey, _, _)) = press {
@@ -3109,6 +3089,8 @@ impl App {
     pub fn topbar_capture_lost(&mut self, hwnd: HWND) {
         if let Some(i) = self.topbar_index(hwnd) {
             self.topbars[i].press_icon = None;
+            self.topbars[i].tray_draw_x.clear();
+            self.topbars[i].tray_drop_settle = false;
             if self.topbars[i].drag.take().is_some() {
                 invalidate(hwnd);
             }
@@ -3219,37 +3201,17 @@ impl App {
         }
     }
 
-    fn reorder_topbar_by_visual(&mut self, bar_idx: usize, key: &str, visual_idx: usize) {
-        let mut vis_keys: Vec<(String, i32)> = self.topbars[bar_idx]
-            .hits
-            .iter()
-            .filter_map(|(r, h)| match h {
-                Hit::TrayIcon(k) => Some((k.clone(), r.left)),
-                _ => None,
-            })
+    fn reorder_topbar_by_visual(&mut self, bar_idx: usize, key: &str, target_idx: usize) {
+        let ordered: Vec<String> = crate::topbar::tray_slots_sorted(&self.topbars[bar_idx].hits)
+            .into_iter()
+            .map(|(k, _)| k)
             .collect();
-        vis_keys.sort_by_key(|(_, l)| *l);
-        let mut ordered: Vec<String> = vis_keys.into_iter().map(|(k, _)| k).collect();
-        let Some(old_pos) = ordered.iter().position(|k| k == key) else { return };
-        let item = ordered.remove(old_pos);
-        let target = if visual_idx > old_pos {
-            (visual_idx - 1).min(ordered.len())
-        } else {
-            visual_idx.min(ordered.len())
-        };
-        ordered.insert(target, item);
-        // topbar 从右向左渲染 pinned.iter().rev()，所以把可见区顺序反转后拼回
-        let new_visible_pinned: Vec<String> = ordered.into_iter().rev().collect();
-        let mut hidden_pinned: Vec<String> = self
-            .config
-            .topbar
-            .pinned_tray_keys
-            .iter()
-            .filter(|k| !new_visible_pinned.contains(k))
-            .cloned()
-            .collect();
-        let mut merged = new_visible_pinned;
-        merged.append(&mut hidden_pinned);
+        let merged = crate::topbar::reorder_pinned_tray_keys(
+            &ordered,
+            &self.config.topbar.pinned_tray_keys,
+            key,
+            target_idx,
+        );
         self.apply_pinned_tray_keys(merged);
     }
 

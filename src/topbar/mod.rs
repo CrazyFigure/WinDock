@@ -10,6 +10,8 @@ pub(crate) mod tray_tooltip;
 mod tray_popup;
 mod tray_registry;
 
+use std::time::Instant;
+
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{HFONT, InvalidateRect};
@@ -79,10 +81,85 @@ fn register_classes(hinst: windows::Win32::Foundation::HINSTANCE) {
 
 #[derive(Clone, Debug)]
 pub struct TopbarDrag {
+    /// 被拖拽的托盘固定键
     pub key: String,
+    /// 当前鼠标在顶部栏客户区的 X 坐标
     pub x: i32,
-    pub insert_before: Option<String>,
-    pub insert_x: i32,
+    /// 按下时槽位中心相对鼠标的偏移，保证起拖不跳变
+    pub grab_dx: i32,
+    /// 起拖前在可见托盘槽位中的索引（从左到右）
+    pub from_idx: usize,
+    /// 当前目标槽位索引（从左到右）
+    pub target_idx: usize,
+    /// 当前目标槽位矩形（用于渲染落位指示）
+    pub target_rect: RECT,
+}
+
+/// 收集顶部栏当前可见的托盘固定图标槽位（按屏幕从左到右排列）。
+pub fn tray_slots_sorted(hits: &[(RECT, Hit)]) -> Vec<(String, RECT)> {
+    let mut slots: Vec<(String, RECT)> = hits
+        .iter()
+        .filter_map(|(r, h)| match h {
+            Hit::TrayIcon(k) => Some((k.clone(), *r)),
+            _ => None,
+        })
+        .collect();
+    // hits 从右向左生成，按屏幕上从左到右排列，匹配 pinned_tray_keys 的视觉顺序（rev()）
+    slots.sort_by_key(|(_, r)| r.left);
+    slots
+}
+
+/// 根据拖拽图标中心 `preview_cx` 计算最近的可见目标槽位索引与矩形。
+pub fn compute_tray_drag_target(slots: &[(String, RECT)], preview_cx: f32) -> Option<(usize, RECT)> {
+    slots
+        .iter()
+        .enumerate()
+        .min_by(|(_, (_, a)), (_, (_, b))| {
+            let ca = (a.left + a.right) as f32 * 0.5;
+            let cb = (b.left + b.right) as f32 * 0.5;
+            (preview_cx - ca)
+                .abs()
+                .partial_cmp(&(preview_cx - cb).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(idx, (_, r))| (idx, *r))
+}
+
+/// 计算拖拽过程中某个可见托盘槽位应移动到的让位槽位索引。
+pub fn visual_tray_slot_index(orig_idx: usize, from_idx: usize, target_idx: usize) -> usize {
+    if orig_idx == from_idx {
+        return target_idx;
+    }
+    if target_idx > from_idx && orig_idx > from_idx && orig_idx <= target_idx {
+        orig_idx - 1
+    } else if target_idx < from_idx && orig_idx >= target_idx && orig_idx < from_idx {
+        orig_idx + 1
+    } else {
+        orig_idx
+    }
+}
+
+/// 根据视觉从左到右的最终目标索引 `target_idx` 重排可见固定图标并拼回不可见项。
+pub fn reorder_pinned_tray_keys(
+    ordered_visible: &[String],
+    existing_pinned: &[String],
+    key: &str,
+    target_idx: usize,
+) -> Vec<String> {
+    let mut ordered = ordered_visible.to_vec();
+    if let Some(old_pos) = ordered.iter().position(|k| k == key) {
+        let item = ordered.remove(old_pos);
+        let target = target_idx.min(ordered.len());
+        ordered.insert(target, item);
+    }
+    // TopBar::layout 使用 pinned.iter().rev() 从右向左推入，因此 pinned 自身就是从左到右的视觉顺序
+    let mut merged = ordered;
+    for k in existing_pinned {
+        if !merged.contains(k) {
+            merged.push(k.clone());
+        }
+    }
+    merged
 }
 
 pub struct TopBar {
@@ -100,6 +177,9 @@ pub struct TopBar {
     pub active_hit: Option<Hit>,
     pub press_icon: Option<(String, i32, i32)>,
     pub drag: Option<TopbarDrag>,
+    pub tray_draw_x: Vec<(String, f32)>,
+    pub tray_drop_settle: bool,
+    pub last_drag_paint: Option<Instant>,
     pub popover: Option<Popover>,
     pub mode: ColorMode,
     pub fused_from: Rgb,
@@ -182,6 +262,9 @@ impl TopBar {
                 active_hit: None,
                 press_icon: None,
                 drag: None,
+                tray_draw_x: Vec::new(),
+                tray_drop_settle: false,
+                last_drag_paint: None,
                 popover: None,
                 mode: ColorMode::Glass,
                 fused_from: base_rgb,
@@ -549,6 +632,23 @@ impl TopBar {
         }
         push_right(&mut rx, (14.0 * s).round() as i32, Hit::TrayToggle, &mut hits);
         self.hits = hits;
+        self.sync_drag_after_layout();
+    }
+
+    /// 布局重算后同步校验托盘拖拽状态，确保热更新或时钟变化后目标框不偏移。
+    fn sync_drag_after_layout(&mut self) {
+        let Some(cur_x) = self.drag.as_ref().map(|d| d.x) else { return };
+        let still_exists = self
+            .hits
+            .iter()
+            .any(|(_, h)| matches!(h, Hit::TrayIcon(k) if self.drag.as_ref().is_some_and(|d| &d.key == k)));
+        if !still_exists {
+            self.drag = None;
+            self.tray_draw_x.clear();
+            self.tray_drop_settle = false;
+        } else {
+            self.update_tray_drag(cur_x);
+        }
     }
 
     fn measure(&mut self, font: HFONT, text: &str) -> (i32, i32) {
@@ -578,6 +678,122 @@ impl TopBar {
             return true;
         }
         false
+    }
+
+    /// 进入顶部栏托盘图标拖拽排序模式，记录抓手偏移与初始位置。
+    pub fn begin_tray_drag(&mut self, key: &str, press_x: i32, x: i32) -> bool {
+        let slots = tray_slots_sorted(&self.hits);
+        let Some(from_idx) = slots.iter().position(|(k, _)| k == key) else {
+            return false;
+        };
+        let r = slots[from_idx].1;
+        let slot_cx = (r.left + r.right) as f32 * 0.5;
+        let half = ((r.right - r.left) as f32 * 0.5).max(1.0) as i32;
+        let grab_dx = (slot_cx.round() as i32 - press_x).clamp(-half, half);
+        self.tray_draw_x = slots
+            .iter()
+            .map(|(k, sr)| (k.clone(), (sr.left + sr.right) as f32 * 0.5))
+            .collect();
+        self.tray_drop_settle = false;
+        self.last_drag_paint = None;
+        self.hover = None;
+        self.drag = Some(TopbarDrag {
+            key: key.to_string(),
+            x,
+            grab_dx,
+            from_idx,
+            target_idx: from_idx,
+            target_rect: r,
+        });
+        self.update_tray_drag(x);
+        true
+    }
+
+    /// 根据当前鼠标坐标刷新顶部栏托盘图标拖拽预览与目标槽位。
+    pub fn update_tray_drag(&mut self, x: i32) {
+        let slots = tray_slots_sorted(&self.hits);
+        let Some(d) = self.drag.as_mut() else { return };
+        d.x = x;
+        let Some(from_idx) = slots.iter().position(|(k, _)| k == &d.key) else { return };
+        d.from_idx = from_idx;
+        let preview_cx = (x + d.grab_dx) as f32;
+        if let Some((target_idx, target_rect)) = compute_tray_drag_target(&slots, preview_cx) {
+            d.target_idx = target_idx;
+            d.target_rect = target_rect;
+        }
+    }
+
+    /// 记录释放瞬间的拖拽图标位置，使图标在重排后平滑落入目标槽位。
+    pub fn prepare_tray_drop_settle(&mut self, key: &str, drop_cx: f32) {
+        if let Some(entry) = self.tray_draw_x.iter_mut().find(|(k, _)| k == key) {
+            entry.1 = drop_cx;
+        } else {
+            self.tray_draw_x.push((key.to_string(), drop_cx));
+        }
+        self.tray_drop_settle = true;
+    }
+
+    /// 推进顶部栏托盘图标让位与落位平滑动画；返回是否仍需继续重绘。
+    pub fn tick_tray_anim(&mut self, dt_ms: f32, reduce: bool) -> bool {
+        if self.drag.is_none() && !self.tray_drop_settle {
+            return false;
+        }
+        let slots = tray_slots_sorted(&self.hits);
+        if slots.is_empty() {
+            self.tray_draw_x.clear();
+            self.tray_drop_settle = false;
+            return false;
+        }
+        let mut still_moving = false;
+        let mut changed = false;
+        for (idx, (k, r)) in slots.iter().enumerate() {
+            let target_cx = if let Some(d) = &self.drag {
+                let vis = visual_tray_slot_index(idx, d.from_idx, d.target_idx);
+                let tr = slots[vis].1;
+                (tr.left + tr.right) as f32 * 0.5
+            } else {
+                (r.left + r.right) as f32 * 0.5
+            };
+            if let Some((_, cur)) = self.tray_draw_x.iter_mut().find(|(dk, _)| dk == k) {
+                let next = crate::dock::layout::ease_to(
+                    *cur,
+                    target_cx,
+                    dt_ms,
+                    if reduce { 0.0 } else { 85.0 },
+                    reduce,
+                );
+                if (next - *cur).abs() > 0.05 {
+                    changed = true;
+                }
+                if (next - target_cx).abs() > 0.25 {
+                    still_moving = true;
+                }
+                *cur = next;
+            } else {
+                self.tray_draw_x.push((k.clone(), target_cx));
+                changed = true;
+            }
+        }
+        if self.drag.is_none() && !still_moving {
+            self.tray_drop_settle = false;
+            self.tray_draw_x.clear();
+            changed = true;
+        }
+        if changed {
+            unsafe {
+                let _ = InvalidateRect(self.hwnd, None, false);
+            }
+        }
+        self.drag.is_some() || self.tray_drop_settle || still_moving
+    }
+
+    /// 获取托盘图标当前用于绘制的中心 X（拖拽让位或落位动画期间返回插值位置）。
+    pub fn tray_draw_center(&self, key: &str) -> Option<f32> {
+        if self.drag.is_some() || self.tray_drop_settle {
+            self.tray_draw_x.iter().find(|(k, _)| k == key).map(|(_, x)| *x)
+        } else {
+            None
+        }
     }
 }
 
@@ -680,3 +896,151 @@ pub fn is_wallpaper_setting_change(wparam: usize, lparam: isize) -> bool {
 
 #[allow(dead_code)]
 fn _unused(_: HWINEVENTHOOK, _: POINT) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tray_drag_target_and_reorder_match_visual_slots() {
+        let hits = vec![
+            (RECT { left: 260, top: 0, right: 292, bottom: 30 }, Hit::TrayIcon("c".into())),
+            (RECT { left: 230, top: 0, right: 262, bottom: 30 }, Hit::TrayIcon("b".into())),
+            (RECT { left: 200, top: 0, right: 232, bottom: 30 }, Hit::TrayIcon("a".into())),
+        ];
+        let slots = tray_slots_sorted(&hits);
+        let ordered_vis: Vec<String> = slots.iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(ordered_vis, vec!["a", "b", "c"]);
+
+        // 拖动最左 "a"(0) 向右跨过 "b"(1) 中心(246) 到达 248 -> 目标槽位 1，b 让位到 0
+        let (target_idx, target_rect) = compute_tray_drag_target(&slots, 248.0).unwrap();
+        assert_eq!(target_idx, 1);
+        assert_eq!(target_rect.left, 230);
+        assert_eq!(visual_tray_slot_index(1, 0, target_idx), 0);
+        assert_eq!(visual_tray_slot_index(2, 0, target_idx), 2);
+
+        // 重排后视觉顺序应为 [b, a, c]，与 pinned_tray_keys 前向顺序一致并保留隐藏项
+        let existing = vec!["a".into(), "b".into(), "c".into(), "hidden".into()];
+        let merged = reorder_pinned_tray_keys(&ordered_vis, &existing, "a", target_idx);
+        assert_eq!(merged, vec!["b", "a", "c", "hidden"]);
+
+        // 拖动最右 "c"(2) 向左跨过 "a"(0) 中心(216) 到达 210 -> 目标槽位 0
+        let (target_left, _) = compute_tray_drag_target(&slots, 210.0).unwrap();
+        assert_eq!(target_left, 0);
+        assert_eq!(visual_tray_slot_index(0, 2, target_left), 1);
+        assert_eq!(visual_tray_slot_index(1, 2, target_left), 2);
+        let merged_left = reorder_pinned_tray_keys(&ordered_vis, &existing, "c", target_left);
+        assert_eq!(merged_left, vec!["c", "a", "b", "hidden"]);
+    }
+
+    #[test]
+    fn topbar_drag_sweep_preview_matches_drop_across_all_positions() {
+        // 模拟 TopBar::layout push_right 产生的相邻 2px 重叠槽位（150% DPI）
+        let hits = vec![
+            (RECT { left: 538, top: 0, right: 586, bottom: 45 }, Hit::TrayIcon("k3".into())),
+            (RECT { left: 493, top: 0, right: 541, bottom: 45 }, Hit::TrayIcon("k2".into())),
+            (RECT { left: 448, top: 0, right: 496, bottom: 45 }, Hit::TrayIcon("k1".into())),
+            (RECT { left: 403, top: 0, right: 451, bottom: 45 }, Hit::TrayIcon("k0".into())),
+        ];
+        let slots = tray_slots_sorted(&hits);
+        let ordered_vis: Vec<String> = slots.iter().map(|(k, _)| k.clone()).collect();
+        let existing = ordered_vis.clone();
+
+        for from_idx in 0..4 {
+            let drag_key = &ordered_vis[from_idx];
+            for grab_dx in [-10, 0, 10] {
+                for x in (380..=610).step_by(5) {
+                    let (target_idx, target_rect) = compute_tray_drag_target(&slots, (x + grab_dx) as f32).unwrap();
+                    assert_eq!(target_rect, slots[target_idx].1);
+
+                    let mut occupied = [false; 4];
+                    for orig in 0..4 {
+                        if orig == from_idx {
+                            continue;
+                        }
+                        let vis = visual_tray_slot_index(orig, from_idx, target_idx);
+                        assert!(!occupied[vis], "顶部栏视觉槽位发生重叠");
+                        occupied[vis] = true;
+                    }
+                    assert!(!occupied[target_idx], "顶部栏目标槽位未空出");
+
+                    let new_pinned = reorder_pinned_tray_keys(&ordered_vis, &existing, drag_key, target_idx);
+                    let final_pos = new_pinned.iter().position(|k| k == drag_key).unwrap();
+                    assert_eq!(final_pos, target_idx, "顶部栏预览槽位 {target_idx} 与最终位置 {final_pos} 不一致");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn topbar_stateful_drag_clears_hover_animates_slots_and_settles() {
+        let mon = crate::win32::primary_monitor().unwrap_or(MonitorInfo {
+            hmonitor: windows::Win32::Graphics::Gdi::HMONITOR::default(),
+            rect: RECT { left: 0, top: 0, right: 1920, bottom: 1080 },
+            work: RECT { left: 0, top: 0, right: 1920, bottom: 1080 },
+            dpi: 96,
+            primary: true,
+        });
+        let cfg = TopbarCfg::default();
+        let app_cfg = Appearance::default();
+        let mut bar = TopBar::new(std::ptr::null_mut(), mon, &cfg, &app_cfg).expect("TopBar test window should create");
+        let mk_item = |key: &str| TrayItem {
+            key: key.into(),
+            name: key.into(),
+            native_tip: None,
+            uia_key: None,
+            registration: None,
+            legacy_keys: Vec::new(),
+            overflow: false,
+            app_exe: None,
+            app_hwnds: Vec::new(),
+        };
+        bar.tray_items = vec![mk_item("a"), mk_item("b"), mk_item("c")];
+        // topbar.layout 按 pinned.iter().rev() 从右往左排，因此 pinned=["a","b","c"] 时屏幕从左到右正好为 ["a","b","c"]
+        bar.pinned = vec!["a".into(), "b".into(), "c".into()];
+        bar.layout(&cfg);
+        bar.set_hover(Some(Hit::TrayIcon("a".into())));
+
+        let slots = tray_slots_sorted(&bar.hits);
+        assert_eq!(slots.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), vec!["a", "b", "c"]);
+        let cx0 = (slots[0].1.left + slots[0].1.right) / 2;
+        let cx2 = (slots[2].1.left + slots[2].1.right) / 2;
+
+        // 按下 "a" 偏左 6px 起拖
+        assert!(bar.begin_tray_drag("a", cx0 - 6, cx0 - 1));
+        assert!(bar.hover.is_none(), "进入拖拽后应清除旧槽位悬停态");
+        assert_eq!(bar.drag.as_ref().unwrap().grab_dx, 6);
+
+        // 拖向 "c" 槽位中心并验证顶部栏离屏渲染无异常
+        bar.update_tray_drag(cx2 - 6);
+        assert_eq!(bar.drag.as_ref().unwrap().target_idx, 2);
+        for _ in 0..30 {
+            let _ = bar.tick_tray_anim(16.0, false);
+        }
+        assert!(crate::topbar::render::render_buffer(&mut bar, &cfg, &app_cfg, &crate::topbar::tray_mirror::TrayIconCache::default()).is_some());
+        // "b" 应滑到原 "a" 槽位，"c" 应滑到原 "b" 槽位
+        let cx1 = (slots[1].1.left + slots[1].1.right) as f32 * 0.5;
+        assert!((bar.tray_draw_center("b").unwrap() - cx0 as f32).abs() < 1.0);
+        assert!((bar.tray_draw_center("c").unwrap() - cx1).abs() < 1.0);
+
+        // 释放并落位重排后，验证 TopBar::layout 实际布局与预览 ["b", "c", "a"] 100% 一致
+        let d = bar.drag.take().unwrap();
+        bar.prepare_tray_drop_settle(&d.key, (d.x + d.grab_dx) as f32);
+        bar.pinned = reorder_pinned_tray_keys(
+            &["a".into(), "b".into(), "c".into()],
+            &bar.pinned,
+            &d.key,
+            d.target_idx,
+        );
+        bar.layout(&cfg);
+        let after_slots = tray_slots_sorted(&bar.hits);
+        assert_eq!(after_slots.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), vec!["b", "c", "a"]);
+        for _ in 0..30 {
+            let _ = bar.tick_tray_anim(16.0, false);
+        }
+        assert!(!bar.tray_drop_settle);
+        assert!(bar.tray_draw_center("a").is_none());
+
+        bar.destroy();
+    }
+}

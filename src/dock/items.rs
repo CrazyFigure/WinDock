@@ -328,11 +328,19 @@ pub fn item_from_path(path: &str) -> Option<DockItem> {
     Some(new_item("file", path, ""))
 }
 
+/// 按 `order` 对固定项就地归一化排序并重写连续序号，保证 Vec 顺序与 `sorted()` 始终一致。
+fn normalize_orders(items: &mut DockItems) {
+    items.items.sort_by_key(|i| i.order);
+    for (i, it) in items.items.iter_mut().enumerate() {
+        it.order = i as u32;
+    }
+}
+
 /// 添加固定项并保存（返回新条目 id）。
 pub fn add_pinned(items: &mut DockItems, item: DockItem) -> String {
-    let max_order = items.items.iter().map(|i| i.order).max().unwrap_or(0);
+    normalize_orders(items);
     let mut item = item;
-    item.order = if max_order == u32::MAX { 0 } else { max_order + 1 };
+    item.order = items.items.len() as u32;
     let id = item.id.clone();
     items.items.push(item);
     id
@@ -341,10 +349,13 @@ pub fn add_pinned(items: &mut DockItems, item: DockItem) -> String {
 /// 取消固定（从固定项中删除）。
 pub fn remove_pinned(items: &mut DockItems, id: &str) {
     items.items.retain(|i| i.id != id);
+    normalize_orders(items);
 }
 
 /// 重排：把 `id` 移动到 `before_id` 之前（before_id 为空则放到末尾）。
+#[allow(dead_code)]
 pub fn reorder(items: &mut DockItems, id: &str, before_id: Option<&str>) {
+    normalize_orders(items);
     let Some(pos) = items.items.iter().position(|i| i.id == id) else { return };
     let item = items.items.remove(pos);
     let target = before_id
@@ -354,6 +365,61 @@ pub fn reorder(items: &mut DockItems, id: &str, before_id: Option<&str>) {
     for (i, it) in items.items.iter_mut().enumerate() {
         it.order = i as u32;
     }
+}
+
+/// 按 `sorted()` 索引把固定项从 `from_idx` 移动到 `target_idx`（设置页列表拖拽与上下移共用）。
+pub fn reorder_sorted(items: &mut DockItems, from_idx: usize, target_idx: usize) -> bool {
+    normalize_orders(items);
+    let len = items.items.len();
+    if from_idx >= len || target_idx >= len || from_idx == target_idx {
+        return false;
+    }
+    let item = items.items.remove(from_idx);
+    items.items.insert(target_idx, item);
+    for (i, it) in items.items.iter_mut().enumerate() {
+        it.order = i as u32;
+    }
+    true
+}
+
+/// 按 Dock 应用区展示顺序重排固定应用，保留文件夹/文件等其他条目相对次序。
+pub fn reorder_app_entries(items: &mut DockItems, ordered_app_ids: &[String]) -> bool {
+    if ordered_app_ids.len() < 2 {
+        return false;
+    }
+    normalize_orders(items);
+    let mut positions = Vec::with_capacity(ordered_app_ids.len());
+    let mut by_id = Vec::with_capacity(ordered_app_ids.len());
+    for (idx, it) in items.items.iter().enumerate() {
+        if ordered_app_ids.iter().any(|id| id == &it.id) {
+            positions.push(idx);
+        }
+    }
+    if positions.len() != ordered_app_ids.len() {
+        return false;
+    }
+    let unchanged = positions
+        .iter()
+        .zip(ordered_app_ids.iter())
+        .all(|(&pos, id)| items.items[pos].id == *id);
+    if unchanged {
+        return false;
+    }
+    for id in ordered_app_ids {
+        if let Some(it) = items.items.iter().find(|x| &x.id == id).cloned() {
+            by_id.push(it);
+        }
+    }
+    if by_id.len() != positions.len() {
+        return false;
+    }
+    for (slot, item) in positions.into_iter().zip(by_id.into_iter()) {
+        items.items[slot] = item;
+    }
+    for (i, it) in items.items.iter_mut().enumerate() {
+        it.order = i as u32;
+    }
+    true
 }
 
 // ---------- 回收站 ----------
@@ -536,6 +602,35 @@ mod tests {
         let first = seeded.items.first().expect("seeded items should not be empty");
         assert!(first.target.to_lowercase().ends_with("explorer.exe"));
         assert_eq!(first.label, "文件管理器");
+    }
+
+    #[test]
+    fn reorder_sorted_and_app_entries_keep_order_consistent() {
+        let mut di = DockItems::default();
+        let mut a = new_item("app", r"C:\a.exe", "A");
+        a.order = 2;
+        let mut b = new_item("app", r"C:\b.exe", "B");
+        b.order = 0;
+        let mut f = new_item("folder", r"C:\Docs", "Docs");
+        f.order = 1;
+        let mut c = new_item("app", r"C:\c.exe", "C");
+        c.order = 3;
+        // 故意打乱 Vec 顺序，验证重排函数会先按 order 归一化
+        di.items = vec![a.clone(), f.clone(), b.clone(), c.clone()];
+
+        assert!(reorder_sorted(&mut di, 0, 3)); // B (0) 移到最后 -> [Docs, A, C, B]
+        let labels: Vec<_> = di.sorted().into_iter().map(|it| it.label.as_str()).collect();
+        assert_eq!(labels, ["Docs", "A", "C", "B"]);
+        assert_eq!(
+            di.items.iter().map(|it| (it.label.as_str(), it.order)).collect::<Vec<_>>(),
+            vec![("Docs", 0), ("A", 1), ("C", 2), ("B", 3)]
+        );
+
+        // 重排应用区顺序 [C, B, A] 时应保留文件夹 Docs 的相对位置
+        assert!(reorder_app_entries(&mut di, &[c.id.clone(), b.id.clone(), a.id.clone()]));
+        let labels2: Vec<_> = di.sorted().into_iter().map(|it| it.label.as_str()).collect();
+        assert_eq!(labels2, ["Docs", "C", "B", "A"]);
+        assert!(!reorder_app_entries(&mut di, &[c.id.clone(), b.id.clone(), a.id.clone()]));
     }
 }
 

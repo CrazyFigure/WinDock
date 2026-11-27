@@ -223,16 +223,47 @@ pub fn render(dock: &mut Dock, ctx: &mut RenderCtx) {
         sf.thick_line(x, y0, x, y1, (1.0 * s_dpi).max(1.0), sep_col);
     }
 
-    // 图标
+    // 拖拽目标让位空槽提示（柔和半透明槽位指示，与释放后落位完全对齐）
     let n = dock.entry_count();
+    if let Some(d) = &dock.drag {
+        if let Some(t) = d.target.filter(|&t| t < dock.layout.slots.len()) {
+            let slot = dock.layout.slots[t];
+            let tcx = cap.left as f32 + slot.center_x;
+            let tcy = cap.top as f32 + slot.center_y + slide;
+            let half = dock.icon_px() as f32 * 0.46;
+            let accent = accent_from_config(ctx.appearance);
+            let slot_rc = RECT {
+                left: (tcx - half).round() as i32,
+                top: (tcy - half).round() as i32,
+                right: (tcx + half).round() as i32,
+                bottom: (tcy + half).round() as i32,
+            };
+            sf.fill_rrect(&slot_rc, half * 0.44, (accent.0, accent.1, accent.2, 0.14 * fg_alpha));
+            sf.stroke_rrect_dashed(
+                &slot_rc,
+                half * 0.44,
+                (1.2 * s_dpi).max(1.0),
+                (4.0 * s_dpi).round().max(3.0) as i32,
+                (accent.0, accent.1, accent.2, 0.62 * fg_alpha),
+            );
+        }
+    }
+
+    // 图标
     let bounce_state = dock.bounce;
     let pressed_idx = dock.press.map(|(idx, _, _)| idx);
     for i in 0..n {
         if i >= dock.layout.slots.len() {
             break;
         }
-        let slot = dock.layout.slots[i];
-        let cx = cap.left as f32 + slot.center_x;
+        if let Some(d) = &dock.drag {
+            if d.from == i {
+                continue;
+            }
+        }
+        let vis = dock.visual_slot(i);
+        let slot = dock.layout.slots[vis.min(dock.layout.slots.len() - 1)];
+        let cx = dock.slot_x(i);
         let mut cy = cap.top as f32 + slot.center_y + slide;
         // 启动弹跳（平滑抛物线起跳）
         if let Some((bi, prog)) = bounce_state {
@@ -247,11 +278,6 @@ pub fn render(dock: &mut Dock, ctx: &mut RenderCtx) {
             cy += 2.0 * s_dpi;
             draw_size *= 0.94;
         }
-        if let Some(d) = &dock.drag {
-            if d.from == i {
-                continue;
-            }
-        }
         let (key, label) = dock.entry_key_label(i);
         let key = key.to_string();
         let label = label.to_string();
@@ -264,24 +290,38 @@ pub fn render(dock: &mut Dock, ctx: &mut RenderCtx) {
         }
         // 拖拽悬停在回收站上的柔和红环反馈
         if let Some(d) = &dock.drag {
-            if d.over == Some(i) && matches!(dock.func_kind(i), Some(FuncKind::Trash)) {
+            if d.over_trash && matches!(dock.func_kind(i), Some(FuncKind::Trash)) {
                 let hl = RECT {
                     left: (cx - slot.size * 0.56) as i32,
                     top: (cy - slot.size * 0.56) as i32,
                     right: (cx + slot.size * 0.56) as i32,
                     bottom: (cy + slot.size * 0.56) as i32,
                 };
-                sf.stroke_rrect(&hl, slot.size * 0.28, 2.0, (1.0, 0.27, 0.23, 0.92 * fg_alpha));
+                sf.stroke_rrect(&hl, slot.size * 0.28, (2.0 * s_dpi).max(1.5), (1.0, 0.27, 0.23, 0.92 * fg_alpha));
             }
         }
     }
 
-    // 拖拽幽灵
+    // 拖拽幽灵（按抓手偏移紧贴鼠标绘制，处于移除区时展示红色移除环提示）
     if let Some(d) = dock.drag.clone() {
         let (key, label) = dock.entry_key_label(d.from);
         let key = key.to_string();
         let label = label.to_string();
-        draw_entry_icon(&mut sf, ctx, &key, &label, d.x, d.y, dock.icon_px() as f32 * 1.12, dark);
+        let ghost_size = dock.icon_px() as f32 * 1.14;
+        let half = ghost_size * 0.52;
+        let gx = (d.x + d.grab_dx).clamp(half + 2.0, (w as f32 - half - 2.0).max(half + 2.0));
+        let gy = (d.y + d.grab_dy).clamp(half + 2.0, (h as f32 - half - 2.0).max(half + 2.0));
+        if d.remove {
+            let rm_rc = RECT {
+                left: (gx - half).round() as i32,
+                top: (gy - half).round() as i32,
+                right: (gx + half).round() as i32,
+                bottom: (gy + half).round() as i32,
+            };
+            sf.fill_rrect(&rm_rc, ghost_size * 0.24, (1.0, 0.23, 0.19, 0.20 * fg_alpha));
+            sf.stroke_rrect(&rm_rc, ghost_size * 0.24, (1.8 * s_dpi).max(1.4), (1.0, 0.27, 0.23, 0.92 * fg_alpha));
+        }
+        draw_entry_icon(&mut sf, ctx, &key, &label, gx, gy, ghost_size, dark);
     }
 
     // macOS 风格 Tooltip 气泡（窗口预览开启时由预览浮窗替代，避免视觉重叠）

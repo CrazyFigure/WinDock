@@ -2,40 +2,23 @@
 
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, EndPaint, SRCCOPY, PAINTSTRUCT,
+    BeginPaint, BitBlt, EndPaint, GetDC, ReleaseDC, ValidateRect, HDC, PAINTSTRUCT, SRCCOPY,
 };
 
 use crate::config::{Appearance, TopbarCfg};
 use crate::topbar::tray_mirror::TrayIconCache;
-use crate::topbar::{ColorMode, Hit, TopBar};
+use crate::topbar::{tray_slots_sorted, ColorMode, Hit, TopBar};
 use crate::ui::*;
 
-pub fn paint(hwnd: HWND, bar: &mut TopBar, _cfg: &TopbarCfg, appearance: &Appearance, tray_icons: &TrayIconCache) {
-    let mut ps = PAINTSTRUCT::default();
-    let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
-    if hdc.is_invalid() {
-        return;
-    }
+/// 将顶部栏内容绘制到离线 DIB 缓冲，供 `WM_PAINT` 与拖拽即时直绘共用。
+pub(crate) fn render_buffer(bar: &mut TopBar, _cfg: &TopbarCfg, appearance: &Appearance, tray_icons: &TrayIconCache) -> Option<(HDC, i32, i32)> {
     let w = bar.monitor.width();
     let h = bar.height;
     if !bar.target.ensure(w.max(1), h.max(1)) {
-        unsafe {
-            let _ = EndPaint(hwnd, &ps);
-        }
-        return;
+        return None;
     }
-    let Some(dc) = bar.target.mem_dc else {
-        unsafe {
-            let _ = EndPaint(hwnd, &ps);
-        }
-        return;
-    };
-    let Some(mut sf) = bar.target.surface() else {
-        unsafe {
-            let _ = EndPaint(hwnd, &ps);
-        }
-        return;
-    };
+    let dc = bar.target.mem_dc?;
+    let mut sf = bar.target.surface()?;
     // 全透明黑 = 透出 DWM 毛玻璃
     sf.clear_rect_transparent(w, h);
     let s = bar.dpi as f32 / 96.0;
@@ -82,24 +65,40 @@ pub fn paint(hwnd: HWND, bar: &mut TopBar, _cfg: &TopbarCfg, appearance: &Appear
         }
     }
 
-    // 悬停高亮（macOS 柔和圆角胶囊，不刺眼）
-    if let Some(hv) = &bar.hover {
-        if bar.active_hit.as_ref() != Some(hv) {
-            if let Some(r) = bar.rect_of(hv) {
-                let hr = RECT {
-                    left: r.left + (1.0 * s) as i32,
-                    top: (3.0 * s) as i32,
-                    right: r.right - (1.0 * s) as i32,
-                    bottom: h - (3.0 * s) as i32,
-                };
-                let hl = if bar.dark_text {
-                    (0.0, 0.0, 0.0, 0.10)
-                } else {
-                    (1.0, 1.0, 1.0, 0.18)
-                };
-                sf.fill_rrect(&hr, 5.0 * s, hl);
+    // 悬停高亮（拖拽期间隐藏原槽位悬停底色，改为目标落位提示）
+    if bar.drag.is_none() {
+        if let Some(hv) = &bar.hover {
+            if bar.active_hit.as_ref() != Some(hv) {
+                if let Some(r) = bar.rect_of(hv) {
+                    let hr = RECT {
+                        left: r.left + (1.0 * s) as i32,
+                        top: (3.0 * s) as i32,
+                        right: r.right - (1.0 * s) as i32,
+                        bottom: h - (3.0 * s) as i32,
+                    };
+                    let hl = if bar.dark_text {
+                        (0.0, 0.0, 0.0, 0.10)
+                    } else {
+                        (1.0, 1.0, 1.0, 0.18)
+                    };
+                    sf.fill_rrect(&hr, 5.0 * s, hl);
+                }
             }
         }
+    }
+
+    // 拖拽时的目标落位胶囊指示（紧贴空出槽位，与释放实际落位 1:1 对齐）
+    let accent = accent_from_config(appearance);
+    if let Some(drag) = &bar.drag {
+        let tr = RECT {
+            left: drag.target_rect.left + (1.0 * s) as i32,
+            top: (3.0 * s) as i32,
+            right: drag.target_rect.right - (1.0 * s) as i32,
+            bottom: h - (3.0 * s) as i32,
+        };
+        let fill_a = if bar.dark_text { 0.16 } else { 0.24 };
+        sf.fill_rrect(&tr, 5.0 * s, (accent.0, accent.1, accent.2, fill_a));
+        sf.stroke_rrect(&tr, 5.0 * s, (1.1 * s).max(1.0), (accent.0, accent.1, accent.2, 0.78));
     }
 
     // 左侧：单色徽标 + 前台应用名 + 文件/窗口/前往 菜单；右侧：托盘收纳/状态图标/时钟
@@ -133,7 +132,7 @@ pub fn paint(hwnd: HWND, bar: &mut TopBar, _cfg: &TopbarCfg, appearance: &Appear
                 if bar.drag.as_ref().is_some_and(|d| &d.key == key) {
                     continue;
                 }
-                let cx = (r.left + r.right) as f32 * 0.5;
+                let cx = bar.tray_draw_center(key).unwrap_or((r.left + r.right) as f32 * 0.5);
                 let cy = h as f32 * 0.5;
                 if let Some(item) = bar.tray_items.iter().find(|t| &t.key == key) {
                     crate::topbar::tray_popover::draw_shelf_item_icon(&mut sf, &mut bar.scratch, bar.font, item, &app_icons, tray_icons, cx, cy, 16.0 * s, !bar.dark_text, s);
@@ -187,21 +186,34 @@ pub fn paint(hwnd: HWND, bar: &mut TopBar, _cfg: &TopbarCfg, appearance: &Appear
         }
     }
 
-    // 顶部栏拖拽重排时的插入指示线与跟随图标
+    // 顶部栏拖拽重排时的跟随浮起图标（限定在托盘图标区横向区间内，紧贴抓手偏移跟随鼠标）
     if let Some(drag) = &bar.drag {
-        let accent = accent_from_config(appearance);
-        sf.fill_rrect(
-            &RECT {
-                left: drag.insert_x - 1,
-                top: (4.0 * s) as i32,
-                right: drag.insert_x + 2,
-                bottom: h - (4.0 * s) as i32,
-            },
-            1.5 * s,
-            (accent.0, accent.1, accent.2, 0.98),
-        );
+        let slots = tray_slots_sorted(&bar.hits);
+        let draw_cx = if let (Some((_, first)), Some((_, last))) = (slots.first(), slots.last()) {
+            let min_cx = (first.left + first.right) as f32 * 0.5 - 4.0 * s;
+            let max_cx = (last.left + last.right) as f32 * 0.5 + 4.0 * s;
+            ((drag.x + drag.grab_dx) as f32).clamp(min_cx, max_cx)
+        } else {
+            (drag.x + drag.grab_dx) as f32
+        };
+        let half_pill = (12.0 * s).round() as i32;
+        let pill = RECT {
+            left: (draw_cx.round() as i32) - half_pill,
+            top: (3.0 * s) as i32,
+            right: (draw_cx.round() as i32) + half_pill,
+            bottom: h - (3.0 * s) as i32,
+        };
+        let pill_bg = if bar.dark_text {
+            (1.0, 1.0, 1.0, 0.72)
+        } else {
+            (0.16, 0.17, 0.20, 0.72)
+        };
+        sf.fill_rrect(&pill, 6.0 * s, pill_bg);
+        sf.stroke_rrect(&pill, 6.0 * s, (1.0 * s).max(1.0), (accent.0, accent.1, accent.2, 0.75));
         if let Some(item) = bar.tray_items.iter().find(|t| t.key == drag.key) {
-            crate::topbar::tray_popover::draw_shelf_item_icon(&mut sf, &mut bar.scratch, bar.font, item, &app_icons, tray_icons, drag.x as f32, h as f32 * 0.5, 18.0 * s, !bar.dark_text, s);
+            crate::topbar::tray_popover::draw_shelf_item_icon(&mut sf, &mut bar.scratch, bar.font, item, &app_icons, tray_icons, draw_cx, h as f32 * 0.5, 17.5 * s, !bar.dark_text, s);
+        } else if let Some(p) = tray_icons.get(&drag.key) {
+            sf.draw_icon_adaptive(&p, draw_cx, h as f32 * 0.5, 17.5 * s, !bar.dark_text, false, 0.0);
         }
     }
 
@@ -211,8 +223,35 @@ pub fn paint(hwnd: HWND, bar: &mut TopBar, _cfg: &TopbarCfg, appearance: &Appear
         sf.fill_rect(&RECT { left: 0, top: h - 1, right: w, bottom: h }, line_col);
     }
     drop(sf);
+    Some((dc, w, h))
+}
+
+pub fn paint(hwnd: HWND, bar: &mut TopBar, cfg: &TopbarCfg, appearance: &Appearance, tray_icons: &TrayIconCache) {
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
+    if hdc.is_invalid() {
+        return;
+    }
+    if let Some((dc, w, h)) = render_buffer(bar, cfg, appearance, tray_icons) {
+        unsafe {
+            let _ = BitBlt(hdc, 0, 0, w, h, dc, 0, 0, SRCCOPY);
+        }
+    }
     unsafe {
-        let _ = BitBlt(hdc, 0, 0, w, h, dc, 0, 0, SRCCOPY);
         let _ = EndPaint(hwnd, &ps);
+    }
+}
+
+/// 在鼠标拖拽回调内直接同步刷屏，规避 `handler_busy()` 与 `WM_PAINT` 合并导致的拖影滞后。
+pub fn paint_immediate(hwnd: HWND, bar: &mut TopBar, cfg: &TopbarCfg, appearance: &Appearance, tray_icons: &TrayIconCache) {
+    if let Some((dc, w, h)) = render_buffer(bar, cfg, appearance, tray_icons) {
+        unsafe {
+            let wdc = GetDC(hwnd);
+            if !wdc.is_invalid() {
+                let _ = BitBlt(wdc, 0, 0, w, h, dc, 0, 0, SRCCOPY);
+                let _ = ReleaseDC(hwnd, wdc);
+                let _ = ValidateRect(hwnd, None);
+            }
+        }
     }
 }
