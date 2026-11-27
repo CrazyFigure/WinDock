@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
 
 const CNB_API = 'https://api.cnb.cool';
-const CNB_REPOSITORY = 'crazy-figure/WinDockFinder';
+const CNB_REPOSITORY = 'crazy-figure/WinDock';
 const token = process.env.CNB_TOKEN;
 
 // CNB OpenAPI 的读写请求统一走仓库路径，允许首次发布时查不到现有 Release。

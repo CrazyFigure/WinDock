@@ -119,7 +119,7 @@ impl TrayTooltip {
                         | WS_EX_TOPMOST
                         | WS_EX_TRANSPARENT,
                     w!("Static"),
-                    w!("WinDockFinder tray tooltip"),
+                    w!("WinDock tray tooltip"),
                     WS_POPUP | WS_DISABLED,
                     0,
                     0,

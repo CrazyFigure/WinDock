@@ -3156,7 +3156,7 @@ pub fn draw_launchpad_icon(sf: &mut Surface, cx: f32, cy: f32, size: f32) {
     }
 }
 
-/// 绘制 WinDockFinder 自身徽标（与 assets/app.ico 一致：顶栏条 + Dock 胶囊 + 三色方块）。
+/// 绘制 WinDock 自身徽标（与 assets/app.ico 一致：顶栏条 + Dock 胶囊 + 三色方块）。
 pub fn draw_app_badge(surface: &mut Surface, cx: f32, cy: f32, size: f32, scale: f32) {
     let half = size * 0.5;
     let r = RECT {

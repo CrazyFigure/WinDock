@@ -28,7 +28,7 @@ const SETTINGS: PCWSTR = w!("Control Panel\\NotifyIconSettings");
 const MAX_SETTINGS: u32 = 512;
 const MAX_ICON_BYTES: u32 = 256 * 1024;
 
-/// 注册项和当前屏幕位置都有效时才使用该项，历史记录不会出现在 Finder 中。
+/// 注册项和当前屏幕位置都有效时才使用该项，历史记录不会出现在顶部栏中。
 pub(super) struct Registration {
     pub id: u64,
     pub exe: String,
@@ -357,7 +357,7 @@ pub(super) fn active_registrations(
         };
         let exe_key = exe.to_lowercase();
         let file = exe_key.rsplit(['\\', '/']).next().unwrap_or(&exe_key);
-        if file == "windockfinder.exe" {
+        if matches!(file, "windock.exe" | "windockfinder.exe") {
             continue;
         }
         let windows = by_exe.get(&exe_key).map(Vec::as_slice).unwrap_or_default();

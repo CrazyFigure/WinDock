@@ -17,11 +17,11 @@ BEGIN
         BLOCK "080404b0"
         BEGIN
             VALUE "CompanyName",      "CrazyFigure"
-            VALUE "FileDescription",  "WinDockFinder - macOS 风格 Dock 与顶部菜单栏"
+            VALUE "FileDescription",  "WinDock - macOS 风格 Dock 与顶部菜单栏"
             VALUE "FileVersion",      "0.0.2"
-            VALUE "InternalName",     "WinDockFinder"
-            VALUE "OriginalFilename", "WinDockFinder.exe"
-            VALUE "ProductName",      "WinDockFinder"
+            VALUE "InternalName",     "WinDock"
+            VALUE "OriginalFilename", "WinDock.exe"
+            VALUE "ProductName",      "WinDock"
             VALUE "LegalCopyright",   "Copyright (C) 2026 CrazyFigure"
         END
     END

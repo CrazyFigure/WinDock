@@ -57,7 +57,7 @@ use crate::config::Appearance;
 use crate::ui::*;
 use crate::win32::{dp, get_x_lparam, get_y_lparam, wide, wide_static};
 
-pub const CLASS_PANEL: &str = "WinDockFinderStatusPanel";
+pub const CLASS_PANEL: &str = "WinDockStatusPanel";
 pub const WM_APP_PANEL_DATA: u32 = WM_APP + 35;
 
 const PKEY_DEVICE_FRIENDLY_NAME: PROPERTYKEY = PROPERTYKEY {

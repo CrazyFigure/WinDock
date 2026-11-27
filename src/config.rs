@@ -1,6 +1,6 @@
 //! 版本化配置模型、校验限域、原子落盘与备份恢复。
 //!
-//! 所有用户数据保存在 `%LOCALAPPDATA%\WinDockFinder\`，写入统一采用
+//! 所有用户数据保存在 `%LOCALAPPDATA%\WinDock\`，写入统一采用
 //! 同目录临时文件 + FlushFileBuffers + ReplaceFileW 原子替换 + `.bak` 可读备份。
 
 use std::path::{Path, PathBuf};

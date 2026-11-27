@@ -26,7 +26,7 @@ use crate::dock::icons::{IconCache, DOCK_ICON_SRC_SIZE};
 use crate::ui::*;
 use crate::win32::{dp, get_x_lparam, get_y_lparam, wide_static, MonitorInfo};
 
-pub const CLASS_PREVIEW: &str = "WinDockFinderDockPreview";
+pub const CLASS_PREVIEW: &str = "WinDockDockPreview";
 
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 

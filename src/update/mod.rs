@@ -1,6 +1,6 @@
 //! 版本检测（GitHub 优先 / CNB 回退）、流式下载、Ed25519 验签、启动原生更新协调器。
 //!
-//! 签名格式（v2）：Ed25519( b"WinDockFinder update v2\0" || filename || 0 || sha256(setup) )。
+//! 签名格式（v2）：Ed25519( b"WinDock update v2\0" || filename || 0 || sha256(setup) )。
 //! 下载使用 64 KB 有限缓冲流式写盘并同步计算 SHA-256，全程内存增量 < 1 MB。
 
 pub mod apply;
@@ -25,7 +25,7 @@ pub const WM_APP_UPDATE_PROGRESS: u32 = WM_APP + 51;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const PUBLIC_KEY: &str = include_str!("../../assets/update-public-key.hex");
-const SIGNATURE_CONTEXT: &[u8] = b"WinDockFinder update v2\0";
+const SIGNATURE_CONTEXT: &[u8] = b"WinDock update v2\0";
 const RELEASE_LIST_LIMIT: usize = 1024 * 1024;
 const SETUP_LIMIT: u64 = 32 * 1024 * 1024;
 const SIG_LIMIT: usize = 64;
@@ -61,8 +61,8 @@ impl Channel {
     /// 固定官方路径；客户端忽略元数据中的任何外部跳转 URL。
     fn download(self, version: &str, name: &str) -> (&'static str, String) {
         match self {
-            Self::GitHub => ("github.com", format!("/CrazyFigure/WinDockFinder/releases/download/v{version}/{name}")),
-            Self::Cnb => ("cnb.cool", format!("/crazy-figure/WinDockFinder/-/releases/download/v{version}/{name}")),
+            Self::GitHub => ("github.com", format!("/CrazyFigure/WinDock/releases/download/v{version}/{name}")),
+            Self::Cnb => ("cnb.cool", format!("/crazy-figure/WinDock/-/releases/download/v{version}/{name}")),
         }
     }
 
@@ -148,7 +148,7 @@ fn newer(a: [u64; 3], b: [u64; 3]) -> bool {
 }
 
 pub fn asset_name(version: &str) -> String {
-    format!("WinDockFinder_{version}_windows_x64_setup.exe")
+    format!("WinDock_{version}_windows_x64_setup.exe")
 }
 
 /// 解析 Release 正文 Markdown 为结构化日志分组。
@@ -231,8 +231,8 @@ fn collect_updates(releases: Vec<RemoteRelease>, channel: Channel, current: [u64
 
 fn check_channel(channel: Channel) -> Result<Option<UpdateBundle>, String> {
     let (host, path, accept) = match channel {
-        Channel::GitHub => ("api.github.com", "/repos/CrazyFigure/WinDockFinder/releases?per_page=30", w!("application/vnd.github+json")),
-        Channel::Cnb => ("cnb.cool", "/crazy-figure/WinDockFinder/-/releases?page=1&page_size=30", w!("application/json")),
+        Channel::GitHub => ("api.github.com", "/repos/CrazyFigure/WinDock/releases?per_page=30", w!("application/vnd.github+json")),
+        Channel::Cnb => ("cnb.cool", "/crazy-figure/WinDock/-/releases?page=1&page_size=30", w!("application/json")),
     };
     let data = http::get(host, path, accept, RELEASE_LIST_LIMIT)?;
     let releases = serde_json::from_slice::<Vec<RemoteRelease>>(&data).map_err(|e| format!("发布列表格式错误：{e}"))?;
@@ -405,9 +405,9 @@ pub fn spawn_download(hwnd: HWND, mut bundle: UpdateBundle) {
 /// 把自身复制到临时目录并以 `--apply-update` 启动原生更新协调器（零 PowerShell 依赖）。
 pub fn start_installation(setup: &Path) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("无法定位当前程序：{e}"))?;
-    let dir = std::env::temp_dir().join(format!("WinDockFinder-update-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("WinDock-update-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建更新工作目录：{e}"))?;
-    let copy = dir.join("WinDockFinder.exe");
+    let copy = dir.join("WinDock.exe");
     std::fs::copy(&exe, &copy).map_err(|e| format!("复制更新协调器失败：{e}"))?;
     let install_dir = exe.parent().ok_or("无法定位安装目录")?;
     std::process::Command::new(&copy)
@@ -432,7 +432,9 @@ pub fn cleanup_stale_workdirs() {
     let current = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
     for ent in rd.flatten() {
         let name = ent.file_name().to_string_lossy().to_string();
-        if name.starts_with("WinDockFinder-update-") && current.as_ref().map(|c| *c != ent.path()).unwrap_or(true) {
+        if (name.starts_with("WinDock-update-") || name.starts_with("WinDockFinder-update-"))
+            && current.as_ref().map(|c| *c != ent.path()).unwrap_or(true)
+        {
             let _ = std::fs::remove_dir_all(ent.path());
         }
     }
@@ -485,15 +487,16 @@ mod tests {
         let cnb = check_channel(Channel::Cnb).expect("CNB check_channel failed");
         println!("CNB check_channel succeeded: {:?}", cnb.as_ref().map(|b| &b.version));
 
-        // 顺带验证 CNB 与 GitHub 下载重定向及 Ed25519 验签（v0.0.1）。
+        // 顺带验证 CNB 与 GitHub 下载重定向及 Ed25519 验签（取当前可用更新版本或当前版本）。
+        let target_ver = bundle.as_ref().map(|b| b.version.as_str()).unwrap_or(VERSION);
         for channel in [Channel::Cnb, Channel::GitHub] {
-            let name = asset_name("0.0.1");
-            let (shost, spath) = channel.download("0.0.1", &format!("{name}.sig"));
+            let name = asset_name(target_ver);
+            let (shost, spath) = channel.download(target_ver, &format!("{name}.sig"));
             let sig = http::get(shost, &spath, w!("application/octet-stream"), SIG_LIMIT)
                 .unwrap_or_else(|e| panic!("{channel:?} sig download failed: {e}"));
             assert_eq!(sig.len(), 64);
 
-            let (host, path) = channel.download("0.0.1", &name);
+            let (host, path) = channel.download(target_ver, &name);
             let mut hasher = Sha256::new();
             let mut got = 0u64;
             http::stream(host, &path, SETUP_LIMIT, |chunk, received, total| {

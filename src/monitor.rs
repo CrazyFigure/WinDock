@@ -127,7 +127,7 @@ const SHORTCUT_INDEX_TTL: Duration = Duration::from_secs(300);
 
 /// 判断是否为顶部栏、Dock、自绘菜单或浮窗等内部壳层窗口（设置窗口按普通应用窗口参与前景与列表跟踪）。
 fn is_our_window(class: &str) -> bool {
-    (class.starts_with("WinDockFinder") && class != crate::settings::CLASS_SETTINGS)
+    (class.starts_with("WinDock") && class != crate::settings::CLASS_SETTINGS)
         || class == "SysShadow"
 }
 
@@ -178,7 +178,7 @@ fn known_system_name(file_lower: &str) -> Option<&'static str> {
         "wechat.exe" | "weixin.exe" => "微信",
         "qq.exe" => "QQ",
         // 设置窗口作为普通应用展示统一短名称，避免回退为带副标题的 PE 文件描述
-        "windockfinder.exe" => "WinDockFinder 设置",
+        "windock.exe" | "windockfinder.exe" => "WinDock 设置",
         _ => return None,
     })
 }
@@ -1167,7 +1167,7 @@ pub fn refresh() -> bool {
         } else {
             let class = class_name(fg);
             if is_our_window(&class) || is_transient_tray_or_popup_class(&class) {
-                // 点击 Finder/托盘触发自绘面板、右键菜单或系统托盘溢出弹窗时，保留先前外部应用状态
+                // 点击顶部栏/托盘触发自绘面板、右键菜单或系统托盘溢出弹窗时，保留先前外部应用状态
                 if is_live_foreground_candidate(HWND(prev.foreground as *mut _)) {
                     new_state.foreground = prev.foreground;
                     new_state.foreground_exe = prev.foreground_exe.clone();
@@ -1528,18 +1528,18 @@ mod tests {
     fn settings_window_is_treated_as_regular_app_window() {
         assert!(!is_our_window(crate::settings::CLASS_SETTINGS));
         assert!(!is_desktop_class(crate::settings::CLASS_SETTINGS));
-        assert!(is_our_window("WinDockFinderTopBar"));
-        assert!(is_our_window("WinDockFinderDockOverlay"));
-        assert!(is_our_window("WinDockFinderDockTrigger"));
-        assert!(is_our_window("WinDockFinderDockPreview"));
-        assert!(is_our_window("WinDockFinderContextMenu"));
-        assert!(is_our_window("WinDockFinderStatusPanel"));
-        assert!(is_our_window("WinDockFinderPopover"));
-        assert!(is_our_window("WinDockFinderMain"));
+        assert!(is_our_window("WinDockTopBar"));
+        assert!(is_our_window("WinDockDockOverlay"));
+        assert!(is_our_window("WinDockDockTrigger"));
+        assert!(is_our_window("WinDockDockPreview"));
+        assert!(is_our_window("WinDockContextMenu"));
+        assert!(is_our_window("WinDockStatusPanel"));
+        assert!(is_our_window("WinDockPopover"));
+        assert!(is_our_window("WinDockMain"));
         assert!(is_our_window("SysShadow"));
         assert_eq!(
-            app_display_name(r"C:\Program Files\WinDockFinder\WinDockFinder.exe", Some("WinDockFinder 设置")),
-            "WinDockFinder 设置"
+            app_display_name(r"C:\Program Files\WinDock\WinDock.exe", Some("WinDock 设置")),
+            "WinDock 设置"
         );
     }
 

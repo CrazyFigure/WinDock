@@ -21,7 +21,7 @@ use crate::ui::DibTarget;
 use crate::win32::{class_name, monitor_info, monitor_of_window};
 
 /// 遮罩只复制目标区域的原桌面，Explorer 临时展开期间继续显示这块内容。
-/// Finder 创建遮罩，短暂以原生面板作为所有者，使其保持在面板前方。
+/// WinDock 创建遮罩，短暂以原生面板作为所有者，使其保持在面板前方。
 /// 自己的消息线程持续派发窗口消息，Explorer 切换焦点和 Z 序时无需等待 UIA 线程。
 pub(super) struct DesktopCover {
     thread_id: u32,
@@ -82,7 +82,7 @@ impl DesktopCover {
         })
     }
 
-    /// 用 Finder 自己的临时任务栏按钮请求展开，不激活 Explorer 或移动光标。
+    /// 用 WinDock 自己的临时任务栏按钮请求展开，不激活 Explorer 或移动光标。
     pub fn wake_without_focus(&self) -> bool {
         unsafe { PostThreadMessageW(self.thread_id, WM_WAKE_TRAY, WPARAM(0), LPARAM(0)).is_ok() }
     }
@@ -139,7 +139,7 @@ impl CoverWindow {
                         | WS_EX_NOACTIVATE
                         | WS_EX_TRANSPARENT,
                     w!("Static"),
-                    w!("WinDockFinder tray cover"),
+                    w!("WinDock tray cover"),
                     WS_POPUP | WS_DISABLED,
                     bounds.left,
                     bounds.top,
@@ -200,7 +200,7 @@ struct AttentionWindow(HWND);
 impl AttentionWindow {
     fn new(bounds: RECT) -> Option<Self> {
         static CLASS: OnceLock<bool> = OnceLock::new();
-        let name = w!("WinDockFinderTrayWake");
+        let name = w!("WinDockTrayWake");
         let instance = crate::win32::hinstance();
         unsafe {
             if !CLASS.get_or_init(|| {
@@ -216,7 +216,7 @@ impl AttentionWindow {
             CreateWindowExW(
                 WS_EX_APPWINDOW | WS_EX_NOACTIVATE,
                 name,
-                w!("WinDockFinder"),
+                w!("WinDock"),
                 WS_VISIBLE | WS_POPUP,
                 bounds.left + (bounds.right - bounds.left) / 2,
                 GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN) + 1,
@@ -284,7 +284,7 @@ fn revealed_bounds(bounds: RECT, screen: RECT) -> RECT {
     }
 }
 
-/// 从 Finder 图标下方打开原生菜单，空间不足时向上弹，并限制在该屏幕的工作区内。
+/// 从顶部栏图标下方打开原生菜单，空间不足时向上弹，并限制在该屏幕的工作区内。
 fn menu_position(anchor: RECT, work: RECT, width: i32, height: i32, gap: i32) -> POINT {
     let left = anchor
         .left

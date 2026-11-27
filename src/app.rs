@@ -42,8 +42,8 @@ use crate::tray::Tray;
 use crate::ui::DibTarget;
 use crate::win32::{all_monitors, class_name, monitor_at_cursor, wide, wide_static, window_dpi, MonitorInfo};
 
-pub const CLASS_MAIN: &str = "WinDockFinderMain";
-pub const MUTEX_NAME: &str = "Local\\WinDockFinder-SingleInstance";
+pub const CLASS_MAIN: &str = "WinDockMain";
+pub const MUTEX_NAME: &str = "Local\\WinDock-SingleInstance";
 pub const WM_APP_IPC: u32 = WM_APP + 1;
 pub const WM_APP_TRAY: u32 = WM_APP + 2;
 pub const WM_APP_COLOR: u32 = WM_APP + 32;
@@ -102,7 +102,7 @@ const M_FG_CLOSE: usize = 303;
 const M_FG_LEFT_HALF: usize = 304;
 const M_FG_RIGHT_HALF: usize = 305;
 const M_SHOW_DESKTOP: usize = 306;
-const M_NEW_FINDER: usize = 307;
+const M_OPEN_FILE_MANAGER: usize = 307;
 const M_OPEN_TERMINAL: usize = 308;
 const M_OPEN_BASE: usize = 310;
 const M_OPEN_LAST: usize = M_OPEN_BASE + 5;
@@ -251,7 +251,7 @@ fn is_desktop_class(class: &str) -> bool {
         || class.starts_with("Xaml_WindowedPopupClass")
         || class.contains("QWindowPopup")
         // 仅过滤内部壳层与浮窗；设置窗口作为独立应用窗口允许前台菜单与窗口管理操作
-        || (class.starts_with("WinDockFinder") && class != crate::settings::CLASS_SETTINGS)
+        || (class.starts_with("WinDock") && class != crate::settings::CLASS_SETTINGS)
 }
 
 #[derive(Clone, Default)]
@@ -292,7 +292,7 @@ enum TrayWork {
 }
 
 struct TrayContext {
-    /// 发起右键菜单的 Finder 窗口（顶部栏或收纳浮层）
+    /// 发起右键菜单的顶部栏或收纳浮层窗口
     owner: HWND,
     /// 发起右键菜单的图标键，用于仅屏蔽该图标自身的悬浮提示
     key: String,
@@ -302,7 +302,7 @@ struct TrayContext {
     menu: Option<HWND>,
 }
 
-/// 跟踪 Finder 托盘右键菜单及其对应图标的悬浮预览抑制状态。
+/// 跟踪顶部栏托盘右键菜单及其对应图标的悬浮预览抑制状态。
 #[derive(Default)]
 struct TrayTipGate {
     context: Option<TrayContext>,
@@ -469,7 +469,7 @@ pub fn run(open_settings: bool) -> i32 {
         }
     };
     let hwnd = match unsafe {
-        CreateWindowExW(WS_EX_TOOLWINDOW, wide_static(CLASS_MAIN), w!("WinDockFinder"), WS_POPUP, 0, 0, 0, 0, None, None, hinst, None)
+        CreateWindowExW(WS_EX_TOOLWINDOW, wide_static(CLASS_MAIN), w!("WinDock"), WS_POPUP, 0, 0, 0, 0, None, None, hinst, None)
     } {
         Ok(h) => h,
         Err(e) => {
@@ -662,7 +662,7 @@ impl App {
                 // 等待守护进程握手（窗口出现），最多 3 秒
                 let start = Instant::now();
                 while start.elapsed() < Duration::from_secs(3) {
-                    if unsafe { FindWindowW(w!("WinDockFinderGuard"), None) }.is_ok() {
+                    if unsafe { FindWindowW(w!("WinDockGuard"), None) }.is_ok() {
                         return;
                     }
                     std::thread::sleep(Duration::from_millis(30));
@@ -793,7 +793,7 @@ impl App {
         args
     }
 
-    /// 重启 WinDockFinder：先拉起等待子进程再正常退出清理，确保新实例接管前已释放单实例锁与恢复任务栏。
+    /// 重启 WinDock：先拉起等待子进程再正常退出清理，确保新实例接管前已释放单实例锁与恢复任务栏。
     pub fn restart(&mut self) {
         if self.exiting {
             return;
@@ -812,12 +812,12 @@ impl App {
         cmd.creation_flags(CREATE_NO_WINDOW);
         match cmd.spawn() {
             Ok(_) => {
-                crate::log::log("用户触发重启 WinDockFinder");
+                crate::log::log("用户触发重启 WinDock");
                 self.quit();
             }
             Err(e) => {
-                crate::log::log(&format!("重启 WinDockFinder 启动新实例失败: {e}"));
-                self.notify_tray("重启 WinDockFinder 失败，请手动重新打开。");
+                crate::log::log(&format!("重启 WinDock 启动新实例失败: {e}"));
+                self.notify_tray("重启 WinDock 失败，请手动重新打开。");
             }
         }
     }
@@ -944,7 +944,7 @@ impl App {
                 }
             }
         }
-        // 在用户自定义文件夹之后追加内置功能区（回收站与最右侧的 WinDockFinder 设置）。
+        // 在用户自定义文件夹之后追加内置功能区（回收站与最右侧的 WinDock 设置）。
         Self::append_builtin_right_entries(&mut list.right, cfg.show_trash);
         let appearance = &self.config.appearance;
         let mut changed = false;
@@ -964,7 +964,7 @@ impl App {
         }
     }
 
-    /// 追加 Dock 右侧内置功能条目，并将 WinDockFinder 设置固定在最右侧。
+    /// 追加 Dock 右侧内置功能条目，并将 WinDock 设置固定在最右侧。
     fn append_builtin_right_entries(right: &mut Vec<items::FuncEntry>, show_trash: bool) {
         if show_trash {
             right.push(items::FuncEntry {
@@ -976,7 +976,7 @@ impl App {
         // 使用明确的产品名称，避免在 Dock Tooltip 中与 Windows 系统“设置”混淆。
         right.push(items::FuncEntry {
             kind: FuncKind::Settings,
-            label: "WinDockFinder 设置".into(),
+            label: "WinDock 设置".into(),
             icon_key: items::settings_icon_key().into(),
         });
     }
@@ -1043,7 +1043,7 @@ impl App {
         }
         self.sync_edge_timer();
 
-        // 最大化窗口自动取色融合（按显示器独立跟踪最上层可见最大化窗口，点击 Finder 或切出浮窗不失真）
+        // 最大化窗口自动取色融合（按显示器独立跟踪最上层可见最大化窗口，点击顶部栏或切出浮窗不失真）
         let cfg = &self.config.topbar;
         let mut need_sample = false;
         let mut any_glass_changed = false;
@@ -2474,8 +2474,8 @@ impl App {
     /// 构建产品菜单（顶部栏左上角图标 & Dock 空白区右键菜单）条目列表。
     fn product_menu_items(dock_visible: bool, topbar_visible: bool, taskbar_label: &'static str) -> Vec<MenuItem> {
         vec![
-            MenuItem::normal(M_SETTINGS, "WinDockFinder设置"),
-            MenuItem::normal(M_ABOUT, "关于 WinDockFinder"),
+            MenuItem::normal(M_SETTINGS, "WinDock 设置"),
+            MenuItem::normal(M_ABOUT, "关于 WinDock"),
             MenuItem::sep(),
             MenuItem::normal(M_TOGGLE_DOCK, if dock_visible { "隐藏 Dock" } else { "显示 Dock" }),
             MenuItem::normal(M_TOGGLE_TOPBAR, if topbar_visible { "隐藏顶部栏" } else { "显示顶部栏" }),
@@ -2487,8 +2487,8 @@ impl App {
             MenuItem::danger(M_SHUTDOWN, "关机"),
             MenuItem::sep(),
             MenuItem::normal(M_TASKMGR, "任务管理器"),
-            MenuItem::normal(M_RESTART_APP, "重启 WinDockFinder"),
-            MenuItem::danger(M_EXIT, "退出 WinDockFinder"),
+            MenuItem::normal(M_RESTART_APP, "重启 WinDock"),
+            MenuItem::danger(M_EXIT, "退出 WinDock"),
         ]
     }
 
@@ -2500,7 +2500,7 @@ impl App {
         startup_item: MenuItem,
     ) -> Vec<MenuItem> {
         vec![
-            MenuItem::normal(M_SETTINGS, "WinDockFinder设置"),
+            MenuItem::normal(M_SETTINGS, "WinDock 设置"),
             MenuItem::sep(),
             MenuItem::normal(M_TOGGLE_DOCK, if dock_visible { "隐藏 Dock" } else { "显示 Dock" }),
             MenuItem::normal(M_TOGGLE_TOPBAR, if topbar_visible { "隐藏顶部栏" } else { "显示顶部栏" }),
@@ -2508,8 +2508,8 @@ impl App {
             MenuItem::sep(),
             startup_item,
             MenuItem::sep(),
-            MenuItem::normal(M_RESTART_APP, "重启 WinDockFinder"),
-            MenuItem::danger(M_EXIT, "退出 WinDockFinder"),
+            MenuItem::normal(M_RESTART_APP, "重启 WinDock"),
+            MenuItem::danger(M_EXIT, "退出 WinDock"),
         ]
     }
 
@@ -2566,7 +2566,7 @@ impl App {
         let mut info = [0u16; 256];
         fill_buf(&mut info, text);
         let mut title = [0u16; 64];
-        fill_buf(&mut title, "WinDockFinder");
+        fill_buf(&mut title, "WinDock");
         let data = NOTIFYICONDATAW {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: self.hwnd,
@@ -2664,7 +2664,7 @@ impl App {
                     }
                 }
             }
-            M_NEW_FINDER => {
+            M_OPEN_FILE_MANAGER => {
                 let _ = crate::win32::open_shell_path("open", "explorer.exe", Some("shell:MyComputerFolder"));
             }
             M_OPEN_TERMINAL => {
@@ -3269,7 +3269,7 @@ impl App {
         tray_anchor(owner, local)
     }
 
-    /// 判断物理光标当前是否仍停留在指定 Finder 图标区域内。
+    /// 判断物理光标当前是否仍停留在指定顶部栏图标区域内。
     fn cursor_on_tray_item(&self, owner: HWND, key: &str) -> bool {
         let Some(rect) = self.tray_item_screen_rect(owner, key) else {
             return false;
@@ -3690,8 +3690,8 @@ impl App {
                     }
                     None => (
                         vec![
-                            MenuItem::normal(M_NEW_FINDER, "打开文件管理器"),
-                            MenuItem::normal(M_SETTINGS, "WinDockFinder设置"),
+                            MenuItem::normal(M_OPEN_FILE_MANAGER, "打开文件管理器"),
+                            MenuItem::normal(M_SETTINGS, "WinDock 设置"),
                         ],
                         MenuCtx::None,
                     ),
@@ -3700,7 +3700,7 @@ impl App {
             }
             Hit::MenuFile => {
                 let mut v = vec![
-                    MenuItem::normal(M_NEW_FINDER, "新建文件管理器窗口"),
+                    MenuItem::normal(M_OPEN_FILE_MANAGER, "新建文件管理器窗口"),
                     MenuItem::normal(M_OPEN_TERMINAL, "打开终端"),
                 ];
                 let ctx = if let Some(fg) = self.foreground_window() {
@@ -4453,8 +4453,8 @@ mod tests {
 
     #[test]
     fn desktop_and_tray_classes_are_filtered_from_foreground_actions() {
-        assert!(is_desktop_class("WinDockFinderTopBar"));
-        assert!(is_desktop_class("WinDockFinderContextMenu"));
+        assert!(is_desktop_class("WinDockTopBar"));
+        assert!(is_desktop_class("WinDockContextMenu"));
         assert!(!is_desktop_class(crate::settings::CLASS_SETTINGS));
         assert!(is_desktop_class("#32768"));
         assert!(is_desktop_class("Windows.UI.Input.InputSite.WindowClass"));
@@ -4486,7 +4486,7 @@ mod tests {
         let exit_idx = product.iter().position(|it| !it.separator && it.id == M_EXIT).unwrap();
         assert_eq!(exit_idx, product.len() - 1);
         assert_eq!(product[exit_idx - 1].id, M_RESTART_APP);
-        assert_eq!(product[exit_idx - 1].label, "重启 WinDockFinder");
+        assert_eq!(product[exit_idx - 1].label, "重启 WinDock");
         assert!(!product[exit_idx - 1].danger);
         assert!(product[exit_idx].danger);
 
@@ -4494,7 +4494,7 @@ mod tests {
         let tray_exit_idx = tray.iter().position(|it| !it.separator && it.id == M_EXIT).unwrap();
         assert_eq!(tray_exit_idx, tray.len() - 1);
         assert_eq!(tray[tray_exit_idx - 1].id, M_RESTART_APP);
-        assert_eq!(tray[tray_exit_idx - 1].label, "重启 WinDockFinder");
+        assert_eq!(tray[tray_exit_idx - 1].label, "重启 WinDock");
         assert!(!tray[tray_exit_idx - 1].danger);
     }
 
@@ -4518,17 +4518,17 @@ mod tests {
         assert_eq!(with_trash[0].kind, FuncKind::Trash);
         assert_eq!(with_trash[0].label, "回收站");
         assert_eq!(with_trash[1].kind, FuncKind::Settings);
-        assert_eq!(with_trash[1].label, "WinDockFinder 设置");
+        assert_eq!(with_trash[1].label, "WinDock 设置");
 
         let mut without_trash = Vec::new();
         App::append_builtin_right_entries(&mut without_trash, false);
         assert_eq!(without_trash.len(), 1);
         assert_eq!(without_trash[0].kind, FuncKind::Settings);
-        assert_eq!(without_trash[0].label, "WinDockFinder 设置");
+        assert_eq!(without_trash[0].label, "WinDock 设置");
     }
 
     #[test]
-    fn finder_right_click_suppresses_only_source_icon_tooltip_and_allows_other_icons() {
+    fn topbar_right_click_suppresses_only_source_icon_tooltip_and_allows_other_icons() {
         use crate::config::Appearance;
         let mon = crate::win32::primary_monitor().unwrap_or(MonitorInfo {
             hmonitor: windows::Win32::Graphics::Gdi::HMONITOR::default(),

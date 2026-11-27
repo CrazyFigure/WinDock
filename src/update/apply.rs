@@ -50,7 +50,7 @@ fn notify(text: &str, error: bool) {
         MessageBoxW(
             windows::Win32::Foundation::HWND::default(),
             PCWSTR(m.as_ptr()),
-            windows::core::w!("WinDockFinder 更新"),
+            windows::core::w!("WinDock 更新"),
             MB_OK | MB_SETFOREGROUND | MB_TOPMOST | if error { MB_ICONERROR } else { MB_ICONINFORMATION },
         );
     }
@@ -98,7 +98,7 @@ pub fn run(parent_pid: u32, setup: &Path, target: &Path) -> i32 {
 
     // 1. 等待旧主进程退出（其退出前已撤销 AppBar、恢复任务栏并清除恢复记录）
     if !crate::win32::wait_process(parent_pid, Duration::from_secs(30)) {
-        notify("WinDockFinder 旧版本未能退出，更新已取消。", true);
+        notify("WinDock 旧版本未能退出，更新已取消。", true);
         launch(target, &["--settings"]);
         return 1;
     }

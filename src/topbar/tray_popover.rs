@@ -19,7 +19,7 @@ use crate::topbar::tray_mirror::TrayItem;
 use crate::ui::*;
 use crate::win32::{dp, get_wheel_delta, get_x_lparam, get_y_lparam, wide_static};
 
-pub const CLASS_POPOVER: &str = "WinDockFinderPopover";
+pub const CLASS_POPOVER: &str = "WinDockPopover";
 
 const COLS: usize = 6;
 const MAX_VISIBLE_ROWS: usize = 4;

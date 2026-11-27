@@ -13,7 +13,7 @@ const hash = createHash('sha256');
 for await (const chunk of createReadStream(asset)) {
   hash.update(chunk);
 }
-const data = Buffer.concat([Buffer.from(`WinDockFinder update v2\0${basename(asset)}\0`), hash.digest()]);
+const data = Buffer.concat([Buffer.from(`WinDock update v2\0${basename(asset)}\0`), hash.digest()]);
 const expected = (await readFile(publicKeyPath, 'utf8')).trim().toLowerCase();
 if (!/^[0-9a-f]{64}$/.test(expected)) throw new Error('更新公钥不是有效的 Ed25519 公钥');
 
@@ -23,8 +23,8 @@ if (mode === '--verify') {
   const key = createPublicKey({ key: { kty: 'OKP', crv: 'Ed25519', x }, format: 'jwk' });
   if (!verify(null, data, key, await readFile(`${asset}.sig`))) throw new Error('安装包签名无效');
 } else {
-  const privateKey = process.env.WINDOCKFINDER_UPDATE_PRIVATE_KEY;
-  if (!privateKey) throw new Error('缺少 WINDOCKFINDER_UPDATE_PRIVATE_KEY');
+  const privateKey = process.env.WINDOCK_UPDATE_PRIVATE_KEY;
+  if (!privateKey) throw new Error('缺少 WINDOCK_UPDATE_PRIVATE_KEY');
   const key = createPrivateKey({ key: Buffer.from(privateKey.trim(), 'base64'), format: 'der', type: 'pkcs8' });
   const actual = Buffer.from(createPublicKey(key).export({ format: 'jwk' }).x, 'base64url').toString('hex');
   if (key.asymmetricKeyType !== 'ed25519' || actual !== expected) {

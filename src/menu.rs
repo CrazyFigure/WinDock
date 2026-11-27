@@ -21,7 +21,7 @@ use crate::config::Appearance;
 use crate::ui::*;
 use crate::win32::{dp, get_x_lparam, get_y_lparam, wide_static};
 
-pub const CLASS_MENU: &str = "WinDockFinderContextMenu";
+pub const CLASS_MENU: &str = "WinDockContextMenu";
 
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 

@@ -51,7 +51,7 @@ fn main() {
         .status();
     match status {
         Ok(s) if s.success() => {
-            println!("cargo:rustc-link-arg-bin=WinDockFinder={}", out.display());
+            println!("cargo:rustc-link-arg-bin=WinDock={}", out.display());
         }
         _ => println!("cargo:warning=rc.exe failed, embedding no resources"),
     }

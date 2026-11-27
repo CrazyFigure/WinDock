@@ -31,7 +31,7 @@ use crate::topbar::tray_popover::Popover;
 use crate::ui::{make_font, DibTarget};
 use crate::win32::{dp, MonitorInfo};
 
-pub const CLASS_TOPBAR: &str = "WinDockFinderTopBar";
+pub const CLASS_TOPBAR: &str = "WinDockTopBar";
 pub const WM_APP_APPBAR: u32 = WM_APP + 40;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -223,7 +223,7 @@ impl TopBar {
             let hwnd = CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
                 crate::win32::wide_static(CLASS_TOPBAR),
-                w!("WinDockFinder 顶部栏"),
+                w!("WinDock 顶部栏"),
                 WS_POPUP,
                 monitor.rect.left,
                 monitor.rect.top,

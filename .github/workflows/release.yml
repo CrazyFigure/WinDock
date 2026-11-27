@@ -16,13 +16,13 @@ permissions:
   contents: read
 
 env:
-  CNB_REMOTE: https://cnb.cool/crazy-figure/WinDockFinder.git
+  CNB_REMOTE: https://cnb.cool/crazy-figure/WinDock.git
   RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
 
 jobs:
   mirror:
     name: Mirror Git refs to CNB
-    if: github.repository == 'CrazyFigure/WinDockFinder'
+    if: github.repository == 'CrazyFigure/WinDock'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # 每次拉取当前引用并串行推送，避免旧的执行覆盖新镜像。
@@ -53,7 +53,7 @@ jobs:
   build:
     name: Build and publish Windows installer
     if: >-
-      github.repository == 'CrazyFigure/WinDockFinder' &&
+      github.repository == 'CrazyFigure/WinDock' &&
       ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
        (github.event_name == 'workflow_dispatch' && inputs.release_tag != ''))
     runs-on: windows-latest
@@ -128,7 +128,7 @@ jobs:
           if (-not $compiler) { throw 'NSIS 安装包编译器不存在' }
 
           # 只有安装包会发布。打包工具检查 EXE 的数字和文本版本资源。
-          $exe = 'source/target/x86_64-pc-windows-msvc/release/WinDockFinder.exe'
+          $exe = 'source/target/x86_64-pc-windows-msvc/release/WinDock.exe'
           $version = $env:RELEASE_TAG.Substring(1)
           if ((Get-Item -LiteralPath $exe).VersionInfo.FileVersion -cne $version) {
             throw "EXE 内嵌版本与标签 $env:RELEASE_TAG 不一致"
@@ -143,16 +143,16 @@ jobs:
         run: |
           # 在干净的 Windows runner 上覆盖含空格路径、静默升级和卸载入口。
           $setup = Join-Path $env:RUNNER_TEMP $env:SETUP_ASSET
-          $install = Join-Path $env:RUNNER_TEMP 'WinDockFinder smoke test'
-          $startup = Join-Path ([Environment]::GetFolderPath('Startup')) 'WinDockFinder.lnk'
-          $registry = 'HKCU:/Software/Microsoft/Windows/CurrentVersion/Uninstall/WinDockFinder'
+          $install = Join-Path $env:RUNNER_TEMP 'WinDock smoke test'
+          $startup = Join-Path ([Environment]::GetFolderPath('Startup')) 'WinDock.lnk'
+          $registry = 'HKCU:/Software/Microsoft/Windows/CurrentVersion/Uninstall/WinDock'
           $process = Start-Process -FilePath $setup -ArgumentList "/S /D=$install" -Wait -PassThru
-          $exe = Join-Path $install 'WinDockFinder.exe'
+          $exe = Join-Path $install 'WinDock.exe'
           if ($process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $exe) -or
               -not (Test-Path -LiteralPath $startup) -or (Get-ItemProperty $registry).InstallLocation -ne $install) {
             throw '静默安装验证失败'
           }
-          $source = 'source/target/x86_64-pc-windows-msvc/release/WinDockFinder.exe'
+          $source = 'source/target/x86_64-pc-windows-msvc/release/WinDock.exe'
           if ((Get-FileHash -LiteralPath $exe).Hash -cne (Get-FileHash -LiteralPath $source).Hash) {
             throw '安装后的应用与构建产物不一致'
           }
@@ -172,7 +172,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SETUP_ASSET: ${{ steps.package.outputs.setup }}
           SOURCE_COMMIT: ${{ steps.build.outputs.commit }}
-          WINDOCKFINDER_UPDATE_PRIVATE_KEY: ${{ secrets.WINDOCKFINDER_UPDATE_PRIVATE_KEY }}
+          WINDOCK_UPDATE_PRIVATE_KEY: ${{ secrets.WINDOCK_UPDATE_PRIVATE_KEY }}
         shell: pwsh
         run: |
           $releaseRef = "refs/tags/$env:RELEASE_TAG"
@@ -208,7 +208,7 @@ jobs:
           }
           if (-not $release) {
             $notesPath = Join-Path $env:RUNNER_TEMP 'release-notes.md'
-            gh release create $env:RELEASE_TAG @upload --repo $env:GITHUB_REPOSITORY --verify-tag --notes-file $notesPath --title "WinDockFinder $env:RELEASE_TAG"
+            gh release create $env:RELEASE_TAG @upload --repo $env:GITHUB_REPOSITORY --verify-tag --notes-file $notesPath --title "WinDock $env:RELEASE_TAG"
             if ($LASTEXITCODE -ne 0) { throw '创建 GitHub Release 失败' }
           } else {
             if ($upload.Count -gt 0) {

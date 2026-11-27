@@ -123,7 +123,7 @@ fn read_body(resp: &Response, limit: u64, mut on_chunk: impl FnMut(&[u8], u64, O
 
 /// 读取完整响应（用于小型 JSON / 签名文件）。
 pub fn get(host: &str, path: &str, accept: PCWSTR, limit: usize) -> Result<Vec<u8>, String> {
-    let resp = open_get("WinDockFinder", host, path, accept)?;
+    let resp = open_get("WinDock", host, path, accept)?;
     if resp.status != 200 {
         return Err(format!("HTTP {}", resp.status));
     }
@@ -137,7 +137,7 @@ pub fn get(host: &str, path: &str, accept: PCWSTR, limit: usize) -> Result<Vec<u
 
 /// 流式下载：每个 64 KB 块回调一次（累计字节、总长度），调用方边写盘边计算 SHA-256。
 pub fn stream(host: &str, path: &str, limit: u64, on_chunk: impl FnMut(&[u8], u64, Option<u64>) -> Result<(), String>) -> Result<(), String> {
-    let resp = open_get("WinDockFinder", host, path, w!("application/octet-stream"))?;
+    let resp = open_get("WinDock", host, path, w!("application/octet-stream"))?;
     if resp.status != 200 {
         return Err(format!("HTTP {}", resp.status));
     }

@@ -1,5 +1,5 @@
 [package]
-name = "windockfinder"
+name = "windock"
 version = "0.0.2"
 edition = "2021"
 authors = ["CrazyFigure"]
@@ -7,7 +7,7 @@ description = "macOS 风格 Dock 与顶部菜单栏 for Windows 11"
 build = "build.rs"
 
 [[bin]]
-name = "WinDockFinder"
+name = "WinDock"
 path = "src/main.rs"
 
 [dependencies]
@@ -69,8 +69,8 @@ ed25519-dalek = "2.2"
 sha2 = "0.10"
 tempfile = "3"
 
-# cargo run 下 Dock 和 Finder 仍要逐像素绘制。优化本项目热路径，保留调试信息和断言。
-[profile.dev.package.windockfinder]
+# cargo run 下 Dock 和顶部菜单栏仍要逐像素绘制。优化本项目热路径，保留调试信息和断言。
+[profile.dev.package.windock]
 opt-level = 1
 
 [profile.release]

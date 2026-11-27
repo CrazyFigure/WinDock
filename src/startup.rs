@@ -13,7 +13,7 @@ use windows::Win32::UI::Shell::{IShellLinkW, FOLDERID_Startup, ShellLink, SHGetK
 
 use crate::win32::{take_pwstr, wide};
 
-pub const LNK_NAME: &str = "WinDockFinder.lnk";
+pub const LNK_NAME: &str = "WinDock.lnk";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartupState {
@@ -119,7 +119,7 @@ pub fn set_enabled(enabled: bool) -> Result<(), String> {
         if let Some(dir) = exe.parent() {
             let _ = link.SetWorkingDirectory(PCWSTR(wide(dir).as_ptr()));
         }
-        let _ = link.SetDescription(w!("WinDockFinder（托盘常驻）"));
+        let _ = link.SetDescription(w!("WinDock（托盘常驻）"));
         let _ = link.SetIconLocation(PCWSTR(wide(&exe).as_ptr()), 0);
         let pf: IPersistFile = link.cast().map_err(|e| crate::win32::error_string(e))?;
         pf.Save(PCWSTR(wide(&lnk).as_ptr()), true)

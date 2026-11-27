@@ -1,11 +1,11 @@
-# WinDockFinder 开发计划
+# WinDock 开发计划
 
-> 项目署名：**CrazyFigure** · 目标平台：**Windows 11 x64** · 源仓库：[GitHub](https://github.com/CrazyFigure/WinDockFinder) · 镜像仓库：[CNB](https://cnb.cool/crazy-figure/WinDockFinder)
+> 项目署名：**CrazyFigure** · 目标平台：**Windows 11 x64** · 源仓库：[GitHub](https://github.com/CrazyFigure/WinDock) · 镜像仓库：[CNB](https://cnb.cool/crazy-figure/WinDock)
 
-WinDockFinder 是一款面向 Windows 11 的轻量原生桌面工具，使用 **Rust + Win32 + DWM/GDI** 复刻 macOS 桌面核心体验：
+WinDock 是一款面向 Windows 11 的轻量原生桌面工具，使用 **Rust + Win32 + DWM/GDI** 复刻 macOS 桌面核心体验：
 
 - **底部 Dock**：紧贴图标宽度的紧凑悬浮毛玻璃胶囊（两侧完全穿透展示桌面与其他应用），默认「最大化智能避让」，悬停触发波浪放大与平滑浮出。
-- **顶部菜单栏（Finder）**：沿屏幕顶部铺满的轻量状态栏，接管并收纳隐藏任务栏后的系统托盘图标，支持**随最大化窗口自动取色融合**以获得视觉一体感。
+- **顶部菜单栏（TopBar）**：沿屏幕顶部铺满的轻量状态栏，接管并收纳隐藏任务栏后的系统托盘图标，支持**随最大化窗口自动取色融合**以获得视觉一体感。
 - **桌面接管与安全兜底**：安装后默认随当前用户登录启动并隐藏 Windows 任务栏，退出或异常崩溃时由极简守护进程可靠恢复任务栏。
 
 本文档面向下游开发 Agent 编写，包含产品范围、核心技术方案、模块边界、数据与 CLI 契约、实施阶段与发布门禁。
@@ -16,7 +16,7 @@ WinDockFinder 是一款面向 Windows 11 的轻量原生桌面工具，使用 **
 
 | 指标 | 硬性要求 | 统计与验证口径 |
 | --- | --- | --- |
-| 内存占用 | **绝对不超过 100 MB**（`100,000,000` 字节，约 `95.37 MiB`） | 同一时刻 WinDockFinder 主进程、守护进程、短时辅助进程及更新/安装进程求和，`WorkingSetSize` 与 `PrivateUsage` **分别** ≤ 100 MB；**85 MB 触发内部主动降载**。 |
+| 内存占用 | **绝对不超过 100 MB**（`100,000,000` 字节，约 `95.37 MiB`） | 同一时刻 WinDock 主进程、守护进程、短时辅助进程及更新/安装进程求和，`WorkingSetSize` 与 `PrivateUsage` **分别** ≤ 100 MB；**85 MB 触发内部主动降载**。 |
 | 稳定性 | **零崩溃、零不可恢复卡死、零任务栏永久失踪** | 禁止任何 panic 跨越 Win32/COM/Hook FFI 边界；禁止对主 UI 进程套用会触发 `STATUS_NO_MEMORY` 的 OS 强制内存硬杀限额。 |
 | 桌面任务栏生命周期 | 启动默认隐藏，退出/关闭必恢复 | 默认开启登录启动与隐藏任务栏（均可在设置/托盘中关闭）；异常强杀、卡死、Explorer 重启均有闭环恢复。 |
 | 视觉与流畅度 | 仿照 macOS、流畅美观、自定义丰富 | 默认 DWM 原生毛玻璃、VSync/高精度动画驱动（静止 0 唤醒）、抗锯齿图标与圆角、100ms 延迟自定义 Tooltip、兼容 100%–200% 混合 DPI 及浅/深色主题。 |
@@ -26,7 +26,7 @@ WinDockFinder 是一款面向 Windows 11 的轻量原生桌面工具，使用 **
 
 ## 1. 产品范围与交互设计
 
-> 本文中 **Finder** 指 macOS 风格的顶部菜单栏及桌面快捷控制入口（不包含重写整个 Windows 文件资源管理器）；文件夹与磁盘入口调用 Windows 默认方式打开，Dock 内提供「文件管理器」与「回收站」图标。
+> 本文中 **顶部菜单栏（TopBar）** 指 macOS 风格的桌面顶部状态栏与快捷控制入口（不包含重写整个 Windows 文件资源管理器）；文件夹与磁盘入口调用 Windows 默认方式打开，Dock 内提供「文件管理器」与「回收站」图标。
 
 ### 1.1 底部 Dock
 
@@ -50,16 +50,16 @@ WinDockFinder 是一款面向 Windows 11 的轻量原生桌面工具，使用 **
    - **完整交互**：
      - 左键单击启动或激活窗口；同应用多窗口时弹出轻量窗口标题选择菜单（支持关闭单个窗口）；
      - 拖拽重排固定项顺序，拖出 Dock 区域一段距离释放可取消固定；拖入 `.exe`、`.lnk`、文件、文件夹添加快捷项；
-     - 右键菜单：打开/新建窗口、固定/取消固定、修改显示名称与自定义图标、以管理员身份运行、打开所在位置、退出应用；空白/产品入口右键提供「设置」「显示/隐藏 Windows 任务栏」「退出 WinDockFinder」；
+     - 右键菜单：打开/新建窗口、固定/取消固定、修改显示名称与自定义图标、以管理员身份运行、打开所在位置、退出应用；空白/产品入口右键提供「设置」「显示/隐藏 Windows 任务栏」「退出 WinDock」；
      - 项目超出屏幕可用宽度时自动缩放图标尺寸，达到最小阈值后启用溢出菜单；
      - 悬停 100ms 显示自定义胶囊 Tooltip（应用名），减少动态效果时切换瞬时过渡；完整支持键盘导航。
 
-### 1.2 顶部菜单栏（Finder）
+### 1.2 顶部菜单栏（TopBar）
 
 1. **布局与常驻功能**：
    - 沿屏幕顶部横向铺满（默认高 28–32dp，可配置），默认通过 AppBar 预留顶部工作区使最大化窗口紧贴顶部栏下沿、绝不遮挡软件标题栏。
    - **左侧**：
-     - 原创产品图标与**产品菜单**（关于 WinDockFinder、系统偏好设置、显示/隐藏 Windows 任务栏、显示/隐藏桌面图标、快速锁屏/睡眠/重启/关机、任务管理器、退出 WinDockFinder）；
+     - 原创产品图标与**产品菜单**（关于 WinDock、系统偏好设置、显示/隐藏 Windows 任务栏、显示/隐藏桌面图标、快速锁屏/睡眠/重启/关机、任务管理器、退出 WinDock）；
      - **当前前台活动应用名称**（桌面空闲时显示「桌面」），点击展开常用上下文快捷动作（最小化/最大化/居中/关闭窗口，桌面态下提供快速打开此电脑/桌面/下载/文档）。
    - **右侧**：
      - **系统托盘接管区**（见下文 1.3）；
@@ -88,7 +88,7 @@ WinDockFinder 是一款面向 Windows 11 的轻量原生桌面工具，使用 **
      - 在顶部栏已展示的托盘图标上，支持**左键单击/双击**激活对应应用、**右键单击**弹出该应用的原生托盘菜单；
      - 在展开面板的每一行中，同样提供直接操作（如右键或行尾操作打开原应用窗口/菜单），无需先固定到顶部即可使用。
 3. **本应用托盘与恢复入口兜底**：
-   - WinDockFinder 自身同时注册标准 Windows 托盘图标（`Shell_NotifyIconW`，含完整右键菜单：显示/隐藏 Dock、显示/隐藏顶部栏、暂时显示/隐藏 Windows 任务栏、设置、随 Windows 登录启动、退出）。
+   - WinDock 自身同时注册标准 Windows 托盘图标（`Shell_NotifyIconW`，含完整右键菜单：显示/隐藏 Dock、显示/隐藏顶部栏、暂时显示/隐藏 Windows 任务栏、设置、随 Windows 登录启动、退出）。
    - 当 Windows 任务栏隐藏时，上述全部控制入口在顶部栏产品菜单、展开面板顶部与 Dock 产品入口中 100% 可达；当任务栏显示时，原生托盘右键菜单立即可用。
 
 ### 1.4 设置窗口（仿 macOS 风格与丰富自定义）
@@ -99,7 +99,7 @@ WinDockFinder 是一款面向 Windows 11 的轻量原生桌面工具，使用 **
 | --- | --- |
 | **通用** | 随 Windows 登录启动（同步检测任务管理器 `StartupApproved` 禁用态）、启动时隐藏 Windows 任务栏、双栏显隐全局快捷键、任务栏紧急恢复快捷键、启动台联动路径（可选接入 WinLaunchpad）。 |
 | **Dock** | 显示位置（仅主屏 / 跟随鼠标屏 / 所有屏）、显隐模式（默认**智能避让最大化窗口** / 始终显示 / 始终自动隐藏）、触发边缘高度与弹出/隐藏延迟、底部悬浮间距、基础图标尺寸、图标间距、悬停放大开关与放大倍率、波浪影响范围、动画流畅度/减少动态效果、显示运行中未固定应用、显示运行指示点、显示回收站、显示文件夹堆栈、固定项排序与自定义名称/图标。 |
-| **顶部栏 (Finder)** | 启用开关、多屏策略（主屏 / 所有屏）、栏高（24–38dp）、**最大化窗口自动取色适配开关与排除名单**、前台应用名称显示、时钟格式（24h/12h、星期、秒数）、系统状态项（输入法/网络/音量/电量）显隐与排序、托盘应用固定/收纳管理列表、全屏让位开关。 |
+| **顶部菜单栏** | 启用开关、多屏策略（主屏 / 所有屏）、栏高（24–38dp）、**最大化窗口自动取色适配开关与排除名单**、前台应用名称显示、时钟格式（24h/12h、星期、秒数）、系统状态项（输入法/网络/音量/电量）显隐与排序、托盘应用固定/收纳管理列表、全屏让位开关。 |
 | **外观** | 主题模式（跟随系统 / 浅色 / 深色）、材质模式（默认 **Win11 毛玻璃 Acrylic** / 轻量半透明）、背景不透明度、毛玻璃叠加色调、Dock 胶囊圆角与微光边框、强调色、图标统一圆角裁切（可复用 WinLaunchpad 圆角算法）。 |
 | **关于与更新** | 当前版本、检查更新（手动检测 + 可选低频自动检测）、更新渠道状态（GitHub / CNB）、一键更新按钮与进度条、按版本可展开的更新日志（源自内置 `assets/release-notes.json`）。 |
 
@@ -117,14 +117,14 @@ WinDockFinder 是一款面向 Windows 11 的轻量原生桌面工具，使用 **
 
 ### 2.2 精简进程模型（单 EXE 多模式）
 
-为了在 **100 MB 整组内存红线**下兼顾极高稳定性，只编译**单一可执行文件 `WinDockFinder.exe`**，通过 CLI 子命令切换运行模式：
+为了在 **100 MB 整组内存红线**下兼顾极高稳定性，只编译**单一可执行文件 `WinDock.exe`**，通过 CLI 子命令切换运行模式：
 
 | 进程角色 | 启动参数 | 生命周期与职责 | 内存预算 |
 | --- | --- | --- | --- |
 | **主进程（UI）** | 无参 / `--background` | 单实例主进程。负责消息循环、Dock 与顶部栏渲染、窗口事件监听、正常任务栏显隐、托盘与设置窗口、配置持久化。 | 常驻空闲 ≤ 35 MB，活跃交互 ≤ 60 MB |
 | **守护进程（保险丝 Watchdog）** | `--guard --parent-pid <pid> --hotkey <spec>` | **极简低底噪常驻进程**：只链接最小 `kernel32`+`user32`（不初始化 COM/GDI/WIC/Shell）。持有主进程句柄 `WaitForSingleObject`，并监听 UI 心跳（Named Event/共享时间戳）与紧急恢复快捷键（默认 `Ctrl+Alt+Shift+F12`）。**正常路径零 IPC 干预**；仅当主进程崩溃、强杀、卡死超时或触发紧急快捷键时，立即读取恢复记录还原 Windows 任务栏与工作区。 | 常驻 ≤ 6 MB |
 | **短时工作模式（可选隔离）** | `--worker-icons` / `--worker-scan` | 仅在执行高风险第三方 Shell 扩展（如批量解析不明 `.lnk`/UWP 清单）时按需拉起，单并发、带超时强杀、任务完成立即退出释放内存，防止劣质 Shell 扩展拖垮或泄漏主进程。 | 峰值 ≤ 18 MB（用完即退） |
-| **原生更新协调模式** | `--apply-update --parent-pid <pid> --setup <path> --target <exe>` | **取代 PowerShell 更新脚本**：将当前 `WinDockFinder.exe` 复制一份到临时目录执行，避免拉起 PowerShell 5.1 带来 40–60 MB 瞬时峰值。等待旧主进程与守护进程退出并确认任务栏恢复 → 备份旧 EXE → 静默执行已验签 NSIS 安装包 → 校验版本并拉起新版（失败自动回滚）。 | 峰值 ≤ 10 MB |
+| **原生更新协调模式** | `--apply-update --parent-pid <pid> --setup <path> --target <exe>` | **取代 PowerShell 更新脚本**：将当前 `WinDock.exe` 复制一份到临时目录执行，避免拉起 PowerShell 5.1 带来 40–60 MB 瞬时峰值。等待旧主进程与守护进程退出并确认任务栏恢复 → 备份旧 EXE → 静默执行已验签 NSIS 安装包 → 校验版本并拉起新版（失败自动回滚）。 | 峰值 ≤ 10 MB |
 | **命令转发 / 紧急修复** | `--settings` / `--toggle-dock` / `--toggle-topbar` / `--restore-taskbar` / `--installer-refresh-startup` / `--installer-remove-startup` | 瞬时短命调用。转发命令至当前会话已有主实例后立刻退出；`--restore-taskbar` 直接独立执行任务栏恢复并清理残留状态文件，作为开始菜单及用户自助兜底入口。 | < 8 MB（毫秒级退出） |
 
 ### 2.3 五大核心技术难点与工程方案
@@ -191,7 +191,7 @@ WinDockFinder 是一款面向 Windows 11 的轻量原生桌面工具，使用 **
 沿用 [WinLaunchpad](file:///c:/Software/WorkSpace/WinLaunchpad) 的清晰扁平单 crate 结构，避免过度拆分：
 
 ```text
-WinDockFinder/
+WinDock/
 ├── .github/workflows/
 │   ├── ci.yml                     # PR / 分支：fmt、clippy、单元测试、Windows release 编译检查
 │   └── release.yml                # 标签 vX.Y.Z：版本核对、构建、NSIS打包、Ed25519签名、GitHub Release、CNB 镜像与同步
@@ -253,7 +253,7 @@ WinDockFinder/
 
 ### 3.2 数据目录与核心配置文件契约
 
-所有用户数据统一保存在 `%LOCALAPPDATA%\WinDockFinder\`，写入统一采用**同目录临时文件 + `FlushFileBuffers` + `ReplaceFileW` 原子替换 + `.bak` 可读备份**。
+所有用户数据统一保存在 `%LOCALAPPDATA%\WinDock\`，写入统一采用**同目录临时文件 + `FlushFileBuffers` + `ReplaceFileW` 原子替换 + `.bak` 可读备份**。
 
 1. **`config.json`**（主配置，带 `schema_version: 1`）：
    ```json
@@ -315,15 +315,15 @@ WinDockFinder/
 
 | 命令 | 行为 | 退出码 |
 | --- | --- | --- |
-| `WinDockFinder.exe` | 若已有实例则拉起设置或提示；否则启动主实例并按配置加载双栏与隐藏任务栏 | `0` 正常，非 `0` 失败 |
-| `WinDockFinder.exe --background` | 开机静默启动，进入桌面双栏与托盘常驻 | `0` |
-| `WinDockFinder.exe --settings` | 转发至主实例打开设置窗口（未运行时先启动并打开设置） | `0` |
-| `WinDockFinder.exe --toggle-dock` / `--toggle-topbar` | 切换 Dock / 顶部栏显示状态 | `0` |
-| `WinDockFinder.exe --guard --parent-pid <pid>` | 内部启动极简任务栏守护保险丝 | `0` |
-| `WinDockFinder.exe --restore-taskbar` | 独立紧急恢复 Windows 任务栏与原始自动隐藏状态（开始菜单快捷方式指向此命令） | `0` 成功，非 `0` 重试提示 |
-| `WinDockFinder.exe --apply-update ...` | 原生更新协调器，完成旧进程等待、备份、静默安装、版本校验与回滚 | `0` 成功 |
-| `WinDockFinder.exe --installer-refresh-startup` | NSIS 安装/升级阶段调用：仅在已开启启动项时更新快捷方式路径，尊重用户关闭及 `StartupApproved` 状态 | `0` |
-| `WinDockFinder.exe --installer-remove-startup` | NSIS 卸载阶段调用：仅清理指向当前被卸载 EXE 的开机启动快捷方式 | `0` |
+| `WinDock.exe` | 若已有实例则拉起设置或提示；否则启动主实例并按配置加载双栏与隐藏任务栏 | `0` 正常，非 `0` 失败 |
+| `WinDock.exe --background` | 开机静默启动，进入桌面双栏与托盘常驻 | `0` |
+| `WinDock.exe --settings` | 转发至主实例打开设置窗口（未运行时先启动并打开设置） | `0` |
+| `WinDock.exe --toggle-dock` / `--toggle-topbar` | 切换 Dock / 顶部栏显示状态 | `0` |
+| `WinDock.exe --guard --parent-pid <pid>` | 内部启动极简任务栏守护保险丝 | `0` |
+| `WinDock.exe --restore-taskbar` | 独立紧急恢复 Windows 任务栏与原始自动隐藏状态（开始菜单快捷方式指向此命令） | `0` 成功，非 `0` 重试提示 |
+| `WinDock.exe --apply-update ...` | 原生更新协调器，完成旧进程等待、备份、静默安装、版本校验与回滚 | `0` 成功 |
+| `WinDock.exe --installer-refresh-startup` | NSIS 安装/升级阶段调用：仅在已开启启动项时更新快捷方式路径，尊重用户关闭及 `StartupApproved` 状态 | `0` |
+| `WinDock.exe --installer-remove-startup` | NSIS 卸载阶段调用：仅清理指向当前被卸载 EXE 的开机启动快捷方式 | `0` |
 
 ---
 
@@ -348,7 +348,7 @@ WinDockFinder/
    - 定期（每 10 秒及窗口关闭/资源分配后）采样自身与守护进程 `GetProcessMemoryInfo`；
    - 超过 85 MB 时依序：① 停止非可见图标预取 → ② 清理不可见/隐藏面板的 DIB 与 LRU 图标缓存至 50% → ③ 临时降级复杂动画与高频采样 → ④ 拒绝新大内存缓存分配并在日志中记录水位事件。
 3. **CI / 压测专用门禁**：
-   - 使用 `tools/mem-probe.ps1` 以 ≤ 100ms 间隔归集全部 `WinDockFinder` 相关 PID 的 `WorkingSetSize`、`PrivateUsage`、`PeakWorkingSetSize` 及 GDI/USER 句柄数；Job Object 内存限制仅用于压测环境与短时隔离工作进程，绝不施加到生产主 UI 进程。
+   - 使用 `tools/mem-probe.ps1` 以 ≤ 100ms 间隔归集全部 `WinDock` 相关 PID 的 `WorkingSetSize`、`PrivateUsage`、`PeakWorkingSetSize` 及 GDI/USER 句柄数；Job Object 内存限制仅用于压测环境与短时隔离工作进程，绝不施加到生产主 UI 进程。
 
 ---
 
@@ -356,28 +356,28 @@ WinDockFinder/
 
 ### 5.1 NSIS 安装与卸载
 
-- 安装路径：`%LOCALAPPDATA%\Programs\WinDockFinder`（`RequestExecutionLevel user`，无需管理员权限）。
-- 创建开始菜单项：**WinDockFinder** 与 **恢复 Windows 任务栏**（`--restore-taskbar`）。
+- 安装路径：`%LOCALAPPDATA%\Programs\WinDock`（`RequestExecutionLevel user`，无需管理员权限）。
+- 创建开始菜单项：**WinDock** 与 **恢复 Windows 任务栏**（`--restore-taskbar`）。
 - 安装向导默认勾选「随 Windows 登录启动」；升级时通过 `--installer-refresh-startup` 尊重用户此前在应用或任务管理器中关闭的选择。
-- 安装/卸载前检测主进程窗口类 `WinDockFinderMain`，通知优雅退出并**等待任务栏恢复确认**后再覆盖或删除文件；卸载默认保留 `%LOCALAPPDATA%\WinDockFinder` 用户配置。
+- 安装/卸载前检测主进程窗口类 `WinDockMain`，通知优雅退出并**等待任务栏恢复确认**后再覆盖或删除文件；卸载默认保留 `%LOCALAPPDATA%\WinDock` 用户配置。
 
 ### 5.2 流式 Ed25519 签名更新（零 PowerShell 峰值）
 
 沿用 [WinLaunchpad](file:///c:/Software/WorkSpace/WinLaunchpad) 的**极简双附件签名体系**，同时升级为**流式 SHA-256 验签 + 原生自拷贝更新协调器**：
 
 - **发布附件**（每个正式标签 `vX.Y.Z` 必须与 `Cargo.toml`、EXE 版本资源、`assets/release-notes.json` 完全一致）：
-  1. `WinDockFinder_<version>_windows_x64_setup.exe`
-  2. `WinDockFinder_<version>_windows_x64_setup.exe.sig`
+  1. `WinDock_<version>_windows_x64_setup.exe`
+  2. `WinDock_<version>_windows_x64_setup.exe.sig`
 - **签名算法升级为流式安全格式**：
-  - CI 计算安装包 SHA-256（32 字节），对 `b"WinDockFinder update v2\0" || filename || b"\0" || sha256_bytes` 执行 Ed25519 签名（64 字节 `.sig`）；
+  - CI 计算安装包 SHA-256（32 字节），对 `b"WinDock update v2\0" || filename || b"\0" || sha256_bytes` 执行 Ed25519 签名（64 字节 `.sig`）；
   - 客户端内置 `assets/update-public-key.hex`，下载安装包时使用 **64 KB 有限缓冲**流式写入当前用户私有暂存目录并同步计算 SHA-256，**整个下载与验签阶段内存增加 < 1 MB**，彻底消除整包读入内存的问题。
-- **固定官方双渠道**：默认查询并下载 GitHub（`api.github.com` / `github.com`），网络失败自动回退腾讯云 CNB（`cnb.cool/crazy-figure/WinDockFinder`）；客户端始终拼装固定官方路径，忽略元数据中的外部跳转 URL；仅展示比当前版本更高的正式版本且安装包与 `.sig` 同时就绪的 Release。
+- **固定官方双渠道**：默认查询并下载 GitHub（`api.github.com` / `github.com`），网络失败自动回退腾讯云 CNB（`cnb.cool/crazy-figure/WinDock`）；客户端始终拼装固定官方路径，忽略元数据中的外部跳转 URL；仅展示比当前版本更高的正式版本且安装包与 `.sig` 同时就绪的 Release。
 - **一键更新原子流程**：用户点击更新 → 流式下载并 Ed25519 验签 → 刷盘未落盘配置 → 拷贝自身到临时目录并以 `--apply-update` 启动 → 主进程撤销顶部 AppBar、恢复 Windows 任务栏并退出 → 原生更新器等待旧进程退出 → 备份旧 EXE → 执行 `setup.exe /S /D=<InstallDir>` → 校验新版本并拉起新主程序 → 清理临时文件（任一步失败自动还原旧 EXE、保持任务栏可见并弹窗提示）。
 
 ### 5.3 CI 与 CNB 镜像流水线
 
-- **源仓库**：`CrazyFigure/WinDockFinder`（GitHub）。
-- **镜像仓库**：`crazy-figure/WinDockFinder`（CNB）。
+- **源仓库**：`CrazyFigure/WinDock`（GitHub）。
+- **镜像仓库**：`crazy-figure/WinDock`（CNB）。
 - **工作流分工**：
   1. `ci.yml`：所有 PR 与普通 push 执行 `cargo fmt --check`、`cargo clippy -- -D warnings`、`cargo test` 与 Windows release 编译验证。
   2. `release.yml`：
@@ -386,7 +386,7 @@ WinDockFinder/
      - `sync` 任务：核对 CNB 标签 commit 与当前构建一致后，调用 `scripts/sync-cnb-release.mjs` 同步 Release 文案及两份附件（按 SHA-256 幂等跳过未变附件）。
 - **GitHub Secrets 规范**：
   - `CNB_TOKEN`：CNB 最小权限访问令牌（Git 推送 + Release/附件读写）；
-  - `WINDOCKFINDER_UPDATE_PRIVATE_KEY`：本项目专用 Ed25519 PKCS#8 DER Base64 私钥（对应公钥入库至 `assets/update-public-key.hex`）。
+  - `WINDOCK_UPDATE_PRIVATE_KEY`：本项目专用 Ed25519 PKCS#8 DER Base64 私钥（对应公钥入库至 `assets/update-public-key.hex`）。
 
 ---
 
@@ -394,10 +394,10 @@ WinDockFinder/
 
 ### 前置基建（P0-Prep，已完成）
 
-- [x] 初始化本地 Git 仓库并关联 `https://github.com/CrazyFigure/WinDockFinder`。
-- [x] 在 CNB 组织 `crazy-figure` 下创建公开空镜像仓库 `WinDockFinder`（`https://cnb.cool/crazy-figure/WinDockFinder`）。
-- [x] 生成本项目专用 Ed25519 密钥对：公钥已写入 `assets/update-public-key.hex`，私钥已写入 GitHub Secret `WINDOCKFINDER_UPDATE_PRIVATE_KEY`。
-- [x] 创建仅限 `crazy-figure/WinDockFinder` 仓库的最小权限 `CNB_TOKEN`（`repo-code` 读写 + `repo-release` 读写）并写入 GitHub Secret `CNB_TOKEN`，已完成 CNB OpenAPI 验权（HTTP 200）。
+- [x] 初始化本地 Git 仓库并关联 `https://github.com/CrazyFigure/WinDock`。
+- [x] 在 CNB 组织 `crazy-figure` 下创建公开镜像仓库 `WinDock`（`https://cnb.cool/crazy-figure/WinDock`）。
+- [x] 生成本项目专用 Ed25519 密钥对：公钥已写入 `assets/update-public-key.hex`，私钥已写入 GitHub Secret `WINDOCK_UPDATE_PRIVATE_KEY`。
+- [x] 创建仅限 `crazy-figure/WinDock` 仓库的最小权限 `CNB_TOKEN`（`repo-code` 读写 + `repo-release` 读写）并写入 GitHub Secret `CNB_TOKEN`，已完成 CNB OpenAPI 验权（HTTP 200）。
 
 ### 开发阶段划分
 
@@ -405,7 +405,7 @@ WinDockFinder/
 | --- | --- | --- |
 | **P0 技术原型与实测** | Win11 任务栏隐藏 + 防回弹 Hook + 极简 Watchdog 守护原型；双层毛玻璃 Dock 原型；顶部栏 AppBar + 最大化取色原型；`tools/mem-probe.ps1` 内存采样脚本。 | 在两个不同 Win11 Build（含 23H2/24H2）与单/双屏混合 DPI 实测通过：强杀主进程 ≤ 5s 恢复任务栏、卡死 ≤ 15s 恢复、Explorer 重启后正常自愈、最大化窗口无底部 48px 死区、双栏原型内存 ≤ 45 MB。 |
 | **P1 桌面接管与 Dock** | 单实例与 CLI 转发、登录启动（含 `StartupApproved` 检测）、原生托盘、完整 Dock（紧凑毛玻璃胶囊、智能避让最大化、波浪放大、固定/运行项归并、拖放排序、回收站、文件夹堆栈、多窗口菜单）。 | 重登自启生效；最大化软件时 Dock 自动隐藏、鼠标触底平滑呼出、还原后常驻；拖放文件到回收站及清空正常；交互帧间隔 P95 ≤ 20ms，常驻内存 ≤ 50 MB。 |
-| **P2 顶部栏 Finder 与托盘收纳** | 多屏顶部菜单栏、产品菜单、前景应用名称、系统状态项、**最大化窗口自动取色融合**、**系统托盘 UIA 接管 + 展开按钮垂直面板（逐行点击固定顶部/取消收纳 + 原生点击/右键透传）**、全屏让位。 | 深/浅色应用最大化时顶部栏 150ms 内平滑融合且文字高对比可读；展开面板可自由勾选/取消应用固定到顶部且重启保留；第三方托盘应用左/右键交互可用；全屏游戏/视频零遮挡零抖动。 |
+| **P2 顶部菜单栏与托盘收纳** | 多屏顶部菜单栏、产品菜单、前景应用名称、系统状态项、**最大化窗口自动取色融合**、**系统托盘 UIA 接管 + 展开按钮垂直面板（逐行点击固定顶部/取消收纳 + 原生点击/右键透传）**、全屏让位。 | 深/浅色应用最大化时顶部栏 150ms 内平滑融合且文字高对比可读；展开面板可自由勾选/取消应用固定到顶部且重启保留；第三方托盘应用左/右键交互可用；全屏游戏/视频零遮挡零抖动。 |
 | **P3 macOS 风格设置页** | 基于 `ui.rs` 实现 5 页 macOS 风格设置窗口（通用、Dock、顶部栏、外观、关于）、实时预览、100ms Tooltip、快捷键冲突校验、键盘无障碍操作、配置原子保存与损坏回滚。 | 全部自定义项生效且重启保留；关闭设置窗后内存回落；深浅主题、100%/150%/200% 混合 DPI 下文字与图标清晰无锯齿、无热区错位。 |
 | **P4 安装包、一键更新与 CI/CNB** | `build.rs` 资源嵌入、`installer/windows.nsi`、原生自拷贝更新协调器、流式 Ed25519 验签、`assets/release-notes.json`、`ci.yml` + `release.yml` + `sync-cnb-release.mjs`。 | 真机验证干净安装、卸载保留配置、用户关闭开机启动后升级不强行开启、GitHub 不可用自动回退 CNB、篡改包验签拦截、实际跨版本一键更新（全程峰值 ≤ 100 MB 且任务栏正常过渡）、CNB 镜像附件哈希与 GitHub 一致。 |
 | **P5 发布候选（RC）压测** | 24 小时连续运行压测报告、异常故障注入记录、真机录屏/截图与已验证 Win11 Build 清单。 | 连续运行 24h、200 次 Dock 显隐 + 100 次顶部栏/托盘展开开关 + 反复最大化取色与 DPI 切换后，内存与 GDI/USER 句柄无持续泄漏，峰值严格 ≤ 100 MB，零崩溃。 |

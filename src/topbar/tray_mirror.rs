@@ -2,7 +2,7 @@
 //!
 //! 零注入方案：不向 Explorer 注入 DLL，通过 UI Automation 枚举本会话
 //! `Shell_TrayWnd`（TrayNotifyWnd）与溢出窗口中的托盘按钮；遍历在受控工作线程
-//! 执行。任务栏由 Finder 隐藏时，后台在遮罩后短暂读取原生托盘。
+//! 执行。任务栏由 WinDock 隐藏时，后台在遮罩后短暂读取原生托盘。
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -293,7 +293,7 @@ pub fn spawn_seed(target: HWND, cache: Arc<TrayIconCache>) -> bool {
     }).is_ok()
 }
 
-/// 采集原生图标。Finder 持有隐藏任务栏时，在遮罩后用无焦点提示完成采样。
+/// 采集原生图标。WinDock 持有隐藏任务栏时，在遮罩后用无焦点提示完成采样。
 pub fn spawn_refresh(target: HWND, cache: Arc<TrayIconCache>, request: TrayRefreshRequest) -> bool {
     if IN_FLIGHT.swap(true, Ordering::SeqCst) {
         return false;
@@ -353,7 +353,7 @@ pub fn spawn_refresh(target: HWND, cache: Arc<TrayIconCache>, request: TrayRefre
     spawn.is_ok()
 }
 
-/// 按刚刚扫描到的原生按钮执行点击，并把临时显示期间看到的图标同步给 Finder。
+/// 按刚刚扫描到的原生按钮执行点击，并把临时显示期间看到的图标同步给顶部栏。
 pub fn spawn_invocation(
     target: HWND, item: TrayItem, anchor: Option<RECT>, peek: Option<TrayPeek>, cache: Arc<TrayIconCache>,
 ) -> bool {
@@ -498,7 +498,8 @@ fn enumerate_surface(
         for i in 0..buttons.Length().ok()? {
             let Ok(element) = buttons.GetElement(i) else { continue };
             let name = element.CurrentName().unwrap_or_default().to_string();
-            if name.trim().is_empty() || name.to_lowercase().contains("windockfinder")
+            let lower_name = name.to_lowercase();
+            if name.trim().is_empty() || lower_name.contains("windock")
                 || element.CurrentIsOffscreen().map_or(true, |hidden| hidden.as_bool())
             {
                 continue;
@@ -1027,7 +1028,7 @@ fn invoke(
                         })))))
             });
             if let Some(display) = reveal.as_mut() {
-                // 只隐藏 Finder 为当前交互打开的面板，遮罩在窗口隐藏前持续覆盖。
+                // 只隐藏 WinDock 为当前交互打开的面板，遮罩在窗口隐藏前持续覆盖。
                 display.opened_overflow = overflow_window(tray, true);
             }
             if let Some(registered) = registered.as_deref() {
@@ -1070,7 +1071,7 @@ fn invoke(
         )
         .open_at(
             cache.menu_uses_mouse(&button.item.key),
-            // 让 Explorer 对这个通知图标发出原生上下文动作，光标可留在 Finder。
+            // 让 Explorer 对这个通知图标发出原生上下文动作，光标可留在顶部栏。
             || unsafe { button.element.cast::<IUIAutomationElement3>().and_then(|el| el.ShowContextMenu()).is_ok() },
             || click_button(button, true),
         );

@@ -56,7 +56,7 @@ impl Tray {
 
     fn data(&self) -> NOTIFYICONDATAW {
         let mut tip = [0u16; 128];
-        for (i, c) in wide("WinDockFinder").into_iter().take(127).enumerate() {
+        for (i, c) in wide("WinDock").into_iter().take(127).enumerate() {
             tip[i] = c;
         }
         NOTIFYICONDATAW {
@@ -95,7 +95,7 @@ impl Tray {
         unsafe {
             let Ok(menu) = CreatePopupMenu() else { return 0 };
             let t = |s: String| -> Vec<u16> { wide(s) };
-            let _ = AppendMenuW(menu, MF_STRING, CMD_SETTINGS, PCWSTR(t("WinDockFinder设置".into()).as_ptr()));
+            let _ = AppendMenuW(menu, MF_STRING, CMD_SETTINGS, PCWSTR(t("WinDock 设置".into()).as_ptr()));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, CMD_TOGGLE_DOCK, PCWSTR(t(if dock_visible { "隐藏 Dock".into() } else { "显示 Dock".into() }).as_ptr()));
             let _ = AppendMenuW(menu, MF_STRING, CMD_TOGGLE_TOPBAR, PCWSTR(t(if topbar_visible { "隐藏顶部栏".into() } else { "显示顶部栏".into() }).as_ptr()));
@@ -108,7 +108,7 @@ impl Tray {
             };
             let _ = AppendMenuW(menu, MF_STRING, CMD_STARTUP, PCWSTR(t(startup_label).as_ptr()));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-            let _ = AppendMenuW(menu, MF_STRING, CMD_EXIT, PCWSTR(t("退出 WinDockFinder".into()).as_ptr()));
+            let _ = AppendMenuW(menu, MF_STRING, CMD_EXIT, PCWSTR(t("退出 WinDock".into()).as_ptr()));
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
             let _ = SetForegroundWindow(self.hwnd);

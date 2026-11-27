@@ -126,9 +126,55 @@ pub fn local_app_data() -> PathBuf {
     }
 }
 
-/// 应用数据目录：%LOCALAPPDATA%\WinDockFinder
+/// 将旧版 `%LOCALAPPDATA%\WinDockFinder` 的用户配置与图标缓存一次性迁移到 `%LOCALAPPDATA%\WinDock`。
+/// 仅在目标目录尚无配置文件时复制配置与图标缓存，跳过日志、恢复锁及临时更新目录，并保留原目录作为备份。
+pub fn migrate_legacy_data_dir_in(base: &Path) {
+    let legacy = base.join("WinDockFinder");
+    let target = base.join("WinDock");
+    if !legacy.is_dir() {
+        return;
+    }
+    if target.join("config.json").is_file() || target.join("dock_items.json").is_file() {
+        return;
+    }
+    if std::fs::create_dir_all(&target).is_err() {
+        return;
+    }
+    for file in ["config.json", "config.json.bak", "dock_items.json", "dock_items.json.bak"] {
+        let src = legacy.join(file);
+        let dst = target.join(file);
+        if src.is_file() && !dst.exists() {
+            let _ = std::fs::copy(&src, &dst);
+        }
+    }
+    let legacy_icons = legacy.join("icons");
+    if legacy_icons.is_dir() {
+        let target_icons = target.join("icons");
+        if std::fs::create_dir_all(&target_icons).is_ok() {
+            if let Ok(entries) = std::fs::read_dir(&legacy_icons) {
+                for ent in entries.flatten() {
+                    let src = ent.path();
+                    if src.is_file() {
+                        let dst = target_icons.join(ent.file_name());
+                        if !dst.exists() {
+                            let _ = std::fs::copy(&src, &dst);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 应用数据目录：%LOCALAPPDATA%\WinDock
 pub fn data_dir() -> PathBuf {
-    local_app_data().join("WinDockFinder")
+    let base = local_app_data();
+    #[cfg(not(test))]
+    {
+        static MIGRATED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        MIGRATED.get_or_init(|| migrate_legacy_data_dir_in(&base));
+    }
+    base.join("WinDock")
 }
 
 /// 读取窗口类名。
@@ -597,5 +643,44 @@ mod tests {
     #[test]
     fn wait_process_zero_pid_returns_immediately() {
         assert!(wait_process(0, std::time::Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn migrates_legacy_windockfinder_data_when_target_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("WinDockFinder");
+        let legacy_icons = legacy.join("icons");
+        std::fs::create_dir_all(&legacy_icons).unwrap();
+        std::fs::write(legacy.join("config.json"), b"{\"schema_version\":1}").unwrap();
+        std::fs::write(legacy.join("config.json.bak"), b"{\"bak\":true}").unwrap();
+        std::fs::write(legacy.join("dock_items.json"), b"{\"items\":[]}").unwrap();
+        std::fs::write(legacy.join("log.txt"), b"old log").unwrap();
+        std::fs::write(legacy.join("taskbar_recovery.json"), b"stale").unwrap();
+        std::fs::write(legacy_icons.join("app.bin"), b"icon-bytes").unwrap();
+
+        migrate_legacy_data_dir_in(dir.path());
+
+        let target = dir.path().join("WinDock");
+        assert_eq!(std::fs::read(target.join("config.json")).unwrap(), b"{\"schema_version\":1}");
+        assert_eq!(std::fs::read(target.join("config.json.bak")).unwrap(), b"{\"bak\":true}");
+        assert_eq!(std::fs::read(target.join("dock_items.json")).unwrap(), b"{\"items\":[]}");
+        assert_eq!(std::fs::read(target.join("icons").join("app.bin")).unwrap(), b"icon-bytes");
+        assert!(!target.join("log.txt").exists());
+        assert!(!target.join("taskbar_recovery.json").exists());
+    }
+
+    #[test]
+    fn migration_does_not_overwrite_existing_windock_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("WinDockFinder");
+        let target = dir.path().join("WinDock");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(legacy.join("config.json"), b"legacy").unwrap();
+        std::fs::write(target.join("config.json"), b"current").unwrap();
+
+        migrate_legacy_data_dir_in(dir.path());
+
+        assert_eq!(std::fs::read(target.join("config.json")).unwrap(), b"current");
     }
 }

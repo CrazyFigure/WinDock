@@ -27,7 +27,7 @@ pub const HEARTBEAT_TIMEOUT_MS: u32 = 10_000;
 const HOTKEY_ID: i32 = 7101;
 
 pub fn heartbeat_event_name(pid: u32) -> String {
-    format!("Local\\WinDockFinder-Heartbeat-{pid}")
+    format!("Local\\WinDock-Heartbeat-{pid}")
 }
 
 pub struct Heartbeat {
@@ -119,14 +119,14 @@ pub fn run(parent_pid: u32, hotkey: Option<HotkeySpec>) -> i32 {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(guard_wnd_proc),
             hInstance: hinst,
-            lpszClassName: w!("WinDockFinderGuard"),
+            lpszClassName: w!("WinDockGuard"),
             ..Default::default()
         };
         let _ = RegisterClassExW(&wc);
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
-            w!("WinDockFinderGuard"),
-            w!("WinDockFinderGuard"),
+            w!("WinDockGuard"),
+            w!("WinDockGuard"),
             WS_OVERLAPPED,
             0,
             0,
@@ -196,7 +196,7 @@ pub fn run(parent_pid: u32, hotkey: Option<HotkeySpec>) -> i32 {
                         rec.restore();
                         crate::log::log(&format!("guard: 触发任务栏恢复 ({reason:?})"));
                         if reason == Reason::Hang {
-                            notify("WinDockFinder 无响应，已自动恢复 Windows 任务栏。");
+                            notify("WinDock 无响应，已自动恢复 Windows 任务栏。");
                         } else if reason == Reason::Hotkey {
                             notify("已按紧急恢复快捷键恢复 Windows 任务栏。");
                         }
@@ -218,7 +218,7 @@ fn notify(text: &str) {
         let _ = MessageBoxW(
             None,
             windows::core::PCWSTR(m.as_ptr()),
-            w!("WinDockFinder 守护进程"),
+            w!("WinDock 守护进程"),
             MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST,
         );
     }

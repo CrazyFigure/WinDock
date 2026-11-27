@@ -48,7 +48,7 @@ use crate::win32::{
 use fields::Field;
 use pages::Row;
 
-pub const CLASS_SETTINGS: &str = "WinDockFinderSettings";
+pub const CLASS_SETTINGS: &str = "WinDockSettings";
 const TIMER_TIP: usize = 301;
 const TIMER_DOCK_DRAG_SCROLL: usize = 302;
 const TIMER_SMOOTH_SCROLL: usize = 303;
@@ -489,7 +489,7 @@ impl Settings {
             let hwnd = match CreateWindowExW(
                 WS_EX_APPWINDOW,
                 wide_static(CLASS_SETTINGS),
-                w!("WinDockFinder 设置"),
+                w!("WinDock 设置"),
                 WS_POPUP | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU,
                 x,
                 y,
@@ -1942,8 +1942,8 @@ impl Dlg {
             }
             Hit::Link(k) => {
                 let target = match k {
-                    0 => "https://github.com/CrazyFigure/WinDockFinder".to_string(),
-                    1 => "https://cnb.cool/crazy-figure/WinDockFinder".to_string(),
+                    0 => "https://github.com/CrazyFigure/WinDock".to_string(),
+                    1 => "https://cnb.cool/crazy-figure/WinDock".to_string(),
                     _ => crate::win32::data_dir().to_string_lossy().to_string(),
                 };
                 let _ = open_shell_path("open", &target, None);
@@ -2258,7 +2258,7 @@ fn paint_frame(dlg: &Dlg, l: &Layout, sf: &mut Surface, dc: HDC) {
     sf.clear(p.window);
     sf.fill_rect(&rc(0, 0, l.sidebar_w, l.h), p.sidebar);
     sf.fill_rect(&rc(l.sidebar_w, 0, l.sidebar_w + 1, l.h), p.separator);
-    draw_text(dc, "WinDockFinder", dlg.font_title, &rc(dlg.px(16.0), 0, l.sidebar_w - dlg.px(8.0), l.header_h), p.text, TextAlign::Left, true, false);
+    draw_text(dc, "WinDock", dlg.font_title, &rc(dlg.px(16.0), 0, l.sidebar_w - dlg.px(8.0), l.header_h), p.text, TextAlign::Left, true, false);
     draw_text(dc, dlg.page.title(), dlg.font_page, &rc(l.sidebar_w + dlg.px(20.0), 0, l.close.left - dlg.px(12.0), l.header_h), p.text, TextAlign::Left, true, false);
     sf.fill_rect(&rc(l.sidebar_w + 1, l.header_h, l.w, l.header_h + 1), p.separator);
 
@@ -2788,7 +2788,7 @@ fn paint_about(dlg: &mut Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: HDC) 
     sf.fill_rrect(&a.hero, 14.0 * s, accent_alpha(p, dlg.dark, 0.10));
     draw_app_badge(sf, (a.hero.left + px(56.0)) as f32, (a.hero.top + px(48.0)) as f32, 64.0 * s, s);
     let tx = a.hero.left + px(104.0);
-    draw_text(dc, "WinDockFinder", dlg.font_page, &rc(tx, a.hero.top + px(14.0), a.hero.right - px(16.0), a.hero.top + px(50.0)), p.text, TextAlign::Left, true, false);
+    draw_text(dc, "WinDock", dlg.font_page, &rc(tx, a.hero.top + px(14.0), a.hero.right - px(16.0), a.hero.top + px(50.0)), p.text, TextAlign::Left, true, false);
     draw_text(dc, &format!("v{}  ·  CrazyFigure", update::VERSION), dlg.font_section, &rc(tx, a.hero.top + px(50.0), a.hero.right - px(16.0), a.hero.top + px(70.0)), p.accent, TextAlign::Left, true, false);
     draw_text(dc, "macOS 风格 Dock 与顶部菜单栏 for Windows 11", dlg.font_body, &rc(tx, a.hero.top + px(70.0), a.hero.right - px(16.0), a.hero.top + px(88.0)), p.text_secondary, TextAlign::Left, true, false);
     let _ = left;
