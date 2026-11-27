@@ -27,10 +27,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY, VK_B, VK_F10, VK_LWIN, VK_RBUTTON, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CopyIcon, FindWindowExW, GetAncestor, GetClassLongPtrW, GetCursorPos,
-    GetForegroundWindow, GetWindowRect, IsHungAppWindow, IsWindow, IsWindowVisible, PostMessageW, SendMessageTimeoutW,
-    SetCursorPos, SetForegroundWindow, WindowFromPoint, GA_ROOT, GCLP_HICON, GCLP_HICONSM, HICON,
-    ICON_BIG, ICON_SMALL, ICON_SMALL2, PW_RENDERFULLCONTENT, SMTO_ABORTIFHUNG, WM_GETICON,
+    AllowSetForegroundWindow, CopyIcon, FindWindowExW, GetAncestor, GetClassLongPtrW, GetCursorPos,
+    GetForegroundWindow, GetWindowRect, IsHungAppWindow, IsWindow, IsWindowVisible, PostMessageW,
+    SendMessageTimeoutW, SetCursorPos, SetForegroundWindow, WindowFromPoint, GA_ROOT, GCLP_HICON,
+    GCLP_HICONSM, HICON, ICON_BIG, ICON_SMALL, ICON_SMALL2, PW_RENDERFULLCONTENT, SMTO_ABORTIFHUNG,
+    WM_GETICON,
 };
 
 use crate::ui::{DibTarget, IconPixels};
@@ -893,32 +894,57 @@ fn find_target<'a>(
     unique_best(buttons.filter_map(|button| name_match(&button.item.name, &item.name).map(|rank| (button, rank))))
 }
 
+/// 等待原生托盘按钮在任务栏/溢出面板动画完成后稳定下来再移动光标。
+fn settle_live_point(button: &NativeButton) -> Option<POINT> {
+    let live_point = || unsafe { button.element.CurrentBoundingRectangle().ok() }
+        .filter(|rect| rect.right > rect.left && rect.bottom > rect.top)
+        .map(center);
+    let deadline = Instant::now() + Duration::from_millis(200);
+    let mut last = None;
+    loop {
+        if let Some(point) = live_point().filter(|point| belongs_to(button.root, *point)) {
+            if last == Some(point) || Instant::now() >= deadline {
+                return Some(point);
+            }
+            last = Some(point);
+        } else if Instant::now() >= deadline {
+            return None;
+        } else {
+            last = None;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// 原生按钮能命中时透传同一鼠标动作。被遮住的按钮可用焦点键盘菜单。
 fn click_button(button: &NativeButton, right: bool) -> (bool, Option<POINT>) {
     if !right && invoke_element(&button.element) {
         return (true, None);
     }
-    // 旧实现可能没有 UIA 上下文动作，再向确认过落点的原生按钮发送鼠标动作。
+    // 旧实现可能没有 UIA 上下文动作，先等原生按钮位置稳定后再发送鼠标动作。
     let live_point = || unsafe { button.element.CurrentBoundingRectangle().ok() }
         .filter(|rect| rect.right > rect.left && rect.bottom > rect.top).map(center);
-    if let Some(mut point) = live_point().filter(|point| belongs_to(button.root, *point)) {
+    if let Some(mut point) = settle_live_point(button) {
         unsafe {
             let mut old = POINT::default();
             if GetCursorPos(&mut old).is_ok() && SetCursorPos(point.x, point.y).is_ok() {
-                thread::sleep(Duration::from_millis(35));
-                // Explorer 展开期间坐标会移动，发送输入前再次读取同一个按钮。
+                thread::sleep(Duration::from_millis(20));
+                // 发送输入前再次校验坐标，若刚刚微移则跟进一次。
                 let latest = live_point();
                 if let Some(latest) = latest.filter(|latest| *latest != point && belongs_to(button.root, *latest)) {
                     if SetCursorPos(latest.x, latest.y).is_ok() {
                         point = latest;
-                        thread::sleep(Duration::from_millis(35));
+                        thread::sleep(Duration::from_millis(20));
                     }
                 }
                 if live_point() == Some(point) && belongs_to(button.root, point) {
+                    if right {
+                        MenuPlacement::set_live_source(point);
+                    }
                     let (down, up) = if right { (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP) }
                         else { (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP) };
                     mouse_event(down, 0, 0, 0, 0);
-                    thread::sleep(Duration::from_millis(30));
+                    thread::sleep(Duration::from_millis(25));
                     mouse_event(up, 0, 0, 0, 0);
                     if !right {
                         thread::sleep(Duration::from_millis(35));
@@ -949,11 +975,12 @@ fn invoke(
     let pid = crate::taskbar::window_pid(tray);
     let registered = cache.registrations.lock().unwrap_or_else(|error| error.into_inner()).as_ref()
         .filter(|(owner, _, _)| *owner == pid).map(|(_, _, entries)| entries.clone());
-    let registered = registered.filter(|entries| item.registration.is_none_or(|id| {
+    let registered = registered.filter(|entries| item.registration.is_some_and(|id| {
         entries.iter().find(|entry| entry.id == id).is_some_and(|entry| {
-            entry.current_placement().is_some_and(|(rect, overflow)| {
-                overflow == entry.overflow && (overflow || same_slot(entry.rect, rect, horizontal_tray(tray)))
-            })
+            entry.pids.iter().any(|&p| crate::taskbar::process_image(p).eq_ignore_ascii_case(&entry.exe))
+                && entry.current_placement().is_some_and(|(rect, overflow)| {
+                    overflow == entry.overflow && (overflow || same_slot(entry.rect, rect, horizontal_tray(tray)))
+                })
         })
     })).or_else(|| read_registrations(tray, cache, generation, || false));
     if right {
@@ -1018,32 +1045,38 @@ fn invoke(
     };
     let target = find_target(item, main.iter().flatten().chain(overflow.iter().flatten()));
     let mut cursor = POINT::default();
-    let have_cursor = right && unsafe { GetCursorPos(&mut cursor).is_ok() };
+    let click_cursor = right && unsafe { GetCursorPos(&mut cursor).is_ok() };
     let mut menu = None;
     let invoked = target.is_some_and(|button| {
         let Some(anchor) = anchor else { return click_button(button, false).0 };
+        let fallback_pids = if button.owner_pids.is_empty() && item.app_hwnds.is_empty() {
+            item.app_exe.as_deref().map(tray_registry::exe_pids).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let owner_pids = if button.owner_pids.is_empty() { &fallback_pids } else { &button.owner_pids };
+        for &owner_pid in owner_pids {
+            unsafe {
+                let _ = AllowSetForegroundWindow(owner_pid);
+            }
+        }
         let source = center(button.button_rect);
-        let mut mouse_point = None;
-        let opened = MenuPlacement::new(anchor, source, &item.app_hwnds, &button.owner_pids).open_at(
+        let opened = MenuPlacement::new(
+            anchor,
+            source,
+            click_cursor.then_some(cursor),
+            &item.app_hwnds,
+            owner_pids,
+        )
+        .open_at(
             cache.menu_uses_mouse(&button.item.key),
             // 让 Explorer 对这个通知图标发出原生上下文动作，光标可留在 Finder。
             || unsafe { button.element.cast::<IUIAutomationElement3>().and_then(|el| el.ShowContextMenu()).is_ok() },
-            || {
-                let (sent, point) = click_button(button, true);
-                mouse_point = point;
-                sent
-            },
+            || click_button(button, true),
         );
         if let Some(window) = opened.window {
             menu = Some(window.0 as isize);
             cache.remember_menu_input(&button.item.key, opened.used_mouse);
-        }
-        // 只有鼠标兜底确实移动了光标，且用户尚未挪动时，才还原到点击位置。
-        let mut current = POINT::default();
-        if have_cursor && unsafe { GetCursorPos(&mut current).is_ok() }
-            && mouse_point == Some(current) && current != cursor
-        {
-            unsafe { let _ = SetCursorPos(cursor.x, cursor.y); }
         }
         opened.dispatched
     });

@@ -222,6 +222,21 @@ fn windows_by_exe() -> HashMap<String, Vec<HWND>> {
     paths
 }
 
+/// 按可执行文件路径收集当前拥有窗口的进程 ID，供未绑定注册项的托盘回退识别归属。
+pub(super) fn exe_pids(exe: &str) -> Vec<u32> {
+    let key = exe.to_lowercase();
+    let mut pids: Vec<u32> = windows_by_exe()
+        .get(&key)
+        .into_iter()
+        .flatten()
+        .map(|&hwnd| window_pid(hwnd))
+        .filter(|&pid| pid != 0)
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
 fn active_rect(hwnd: HWND, uid: u32, guid: GUID) -> Option<RECT> {
     let id = NOTIFYICONIDENTIFIER {
         cbSize: std::mem::size_of::<NOTIFYICONIDENTIFIER>() as u32,

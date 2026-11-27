@@ -350,6 +350,25 @@ fn popup_windows() -> Vec<HWND> {
     windows
 }
 
+/// 判断光标在等待菜单期间是否仅发生轻微抖动（未被用户主动大幅移走）。
+fn within_cursor_jitter(current: POINT, target: POINT, tolerance: i32) -> bool {
+    (current.x - target.x).abs() <= tolerance && (current.y - target.y).abs() <= tolerance
+}
+
+/// 若光标仍在临时点击位置附近，将其还原到用户原先在顶部栏点击的位置。
+fn restore_cursor_near(original: POINT, moved_to: POINT, tolerance: i32) -> bool {
+    let mut current = POINT::default();
+    unsafe {
+        if GetCursorPos(&mut current).is_ok()
+            && current != original
+            && within_cursor_jitter(current, moved_to, tolerance)
+        {
+            return SetCursorPos(original.x, original.y).is_ok();
+        }
+    }
+    false
+}
+
 /// 未知进程的托盘项只接受紧邻真实托盘按钮的新菜单。
 fn touches_source(rect: RECT, source: POINT, tolerance: i32) -> bool {
     let within_x = (rect.left - tolerance..=rect.right + tolerance).contains(&source.x);
@@ -362,6 +381,8 @@ pub(super) struct MenuPlacement {
     owner_pids: HashSet<u32>,
     anchor: RECT,
     source: POINT,
+    live_source: Option<POINT>,
+    cursor: Option<POINT>,
     placed: bool,
     observed: Option<HWND>,
 }
@@ -396,7 +417,13 @@ unsafe extern "system" fn on_popup(
 }
 
 impl MenuPlacement {
-    pub fn new(anchor: RECT, source: POINT, app_windows: &[isize], tray_owners: &[u32]) -> Self {
+    pub fn new(
+        anchor: RECT,
+        source: POINT,
+        cursor: Option<POINT>,
+        app_windows: &[isize],
+        tray_owners: &[u32],
+    ) -> Self {
         Self {
             old_windows: popup_windows(),
             owner_pids: tray_owners
@@ -411,18 +438,39 @@ impl MenuPlacement {
                 .collect(),
             anchor,
             source,
+            live_source: None,
+            cursor,
             placed: false,
             observed: None,
         }
     }
 
+    /// 鼠标兜底在等待 Explorer 动画稳定后更新真实落点，供自绘菜单位置校验使用。
+    pub fn set_live_source(point: POINT) {
+        PENDING_MENU.with(|slot| {
+            if let Ok(mut pending) = slot.try_borrow_mut() {
+                if let Some(placement) = pending.as_mut() {
+                    placement.live_source = Some(point);
+                }
+            }
+        });
+    }
+
     /// 先监听应用菜单的出现事件再发送输入，尽早搬移窗口。旧版菜单缺少事件时短时补查。
-    pub fn open_at(self, mouse_first: bool, uia: impl FnOnce() -> bool, mouse: impl FnOnce() -> bool) -> OpenedMenu {
+    pub fn open_at(
+        self,
+        mouse_first: bool,
+        uia: impl FnOnce() -> bool,
+        mouse: impl FnOnce() -> (bool, Option<POINT>),
+    ) -> OpenedMenu {
         let pid = if self.owner_pids.len() == 1 {
             *self.owner_pids.iter().next().unwrap_or(&0)
         } else {
             0
         };
+        let original_cursor = self.cursor;
+        let dpi = unsafe { MonitorFromRect(&self.anchor, MONITOR_DEFAULTTONEAREST) };
+        let jitter = monitor_info(dpi).map_or(24, |m| crate::win32::dp(24, m.dpi));
         PENDING_MENU.with(|slot| slot.replace(Some(self)));
         let hooks = unsafe {
             [EVENT_SYSTEM_MENUPOPUPSTART, EVENT_OBJECT_SHOW].map(|event| {
@@ -438,11 +486,30 @@ impl MenuPlacement {
             })
         };
         // 先走该图标最近成功的方式。收到真实菜单窗口后立即结束等待。
-        let (first, second) = if mouse_first {
-            Self::try_routes(mouse, uia)
+        let (first, second, moved_to) = if mouse_first {
+            let (sent, moved) = mouse();
+            let observed = sent && Self::wait_for_menu(Duration::from_millis(370), original_cursor, moved, jitter);
+            let retried = !observed && uia();
+            if retried {
+                Self::wait_for_menu(Duration::from_millis(180), None, None, jitter);
+            }
+            (sent, retried, moved)
         } else {
-            Self::try_routes(uia, mouse)
+            let sent = uia();
+            let observed = sent && Self::wait_for_menu(Duration::from_millis(180), None, None, jitter);
+            let (retried, moved) = if observed {
+                (false, None)
+            } else {
+                mouse()
+            };
+            if retried {
+                Self::wait_for_menu(Duration::from_millis(370), original_cursor, moved, jitter);
+            }
+            (sent, retried, moved)
         };
+        if let (Some(cursor), Some(moved)) = (original_cursor, moved_to) {
+            restore_cursor_near(cursor, moved, jitter);
+        }
         for hook in hooks.into_iter().filter(|hook| !hook.is_invalid()) {
             unsafe {
                 let _ = UnhookWinEvent(hook);
@@ -456,20 +523,15 @@ impl MenuPlacement {
         }
     }
 
-    fn try_routes(first: impl FnOnce() -> bool, second: impl FnOnce() -> bool) -> (bool, bool) {
-        let dispatched = first();
-        if dispatched && Self::wait_for_menu(Duration::from_millis(180)) {
-            return (true, false);
-        }
-        let retried = second();
-        if retried {
-            Self::wait_for_menu(Duration::from_millis(370));
-        }
-        (dispatched, retried)
-    }
-
-    fn wait_for_menu(timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
+    fn wait_for_menu(
+        timeout: Duration,
+        original_cursor: Option<POINT>,
+        moved_to: Option<POINT>,
+        jitter: i32,
+    ) -> bool {
+        let start = Instant::now();
+        let deadline = start + timeout;
+        let mut cursor_restored = false;
         let mut msg = MSG::default();
         loop {
             // 消息检查也会分发排队的进程外 WinEvent。
@@ -492,6 +554,13 @@ impl MenuPlacement {
                 }
                 (placement.placed, placement.observed.is_some())
             });
+            // 菜单已定位或短暂宽限期已过时立刻归还光标，避免鼠标长期停留在底部任务栏或溢出区。
+            if !cursor_restored && (placed || start.elapsed() >= Duration::from_millis(65)) {
+                if let (Some(cursor), Some(moved)) = (original_cursor, moved_to) {
+                    restore_cursor_near(cursor, moved, jitter);
+                }
+                cursor_restored = true;
+            }
             if placed || Instant::now() >= deadline {
                 return observed;
             }
@@ -521,13 +590,19 @@ impl MenuPlacement {
             return false;
         };
         let gap = crate::win32::dp(4, monitor.dpi);
-        let tolerance = crate::win32::dp(32, monitor.dpi);
+        let tolerance = crate::win32::dp(48, monitor.dpi);
         let anchor = POINT {
             x: self.anchor.left,
             y: self.anchor.bottom,
         };
-        let nearby =
-            touches_source(rect, self.source, tolerance) || touches_source(rect, anchor, tolerance);
+        let nearby = self
+            .live_source
+            .is_some_and(|point| touches_source(rect, point, tolerance))
+            || touches_source(rect, self.source, tolerance)
+            || touches_source(rect, anchor, tolerance)
+            || self
+                .cursor
+                .is_some_and(|cursor| touches_source(rect, cursor, tolerance));
         let owned = self.owner_pids.contains(&window_pid(hwnd));
         // 通用工具窗同时需要进程归属和相关落点，避免误移动同进程的通知。
         let matches = match kind {
@@ -629,5 +704,159 @@ mod tests {
             popup_kind("Application", WS_POPUP, WS_EX_TOOLWINDOW | WS_EX_APPWINDOW),
             None
         );
+    }
+
+    #[test]
+    fn cursor_jitter_tolerance_allows_small_hand_tremor_and_rejects_intentional_move() {
+        let moved = POINT { x: 495, y: 1621 };
+        assert!(within_cursor_jitter(moved, moved, 48));
+        assert!(within_cursor_jitter(POINT { x: 503, y: 1615 }, moved, 48));
+        assert!(!within_cursor_jitter(POINT { x: 600, y: 1621 }, moved, 48));
+    }
+
+    #[test]
+    fn tool_window_menu_moves_to_topbar_when_overflow_button_shifts_before_click() {
+        unsafe {
+            let stale_source = POINT { x: 495, y: 1740 };
+            let settled_click = POINT { x: 495, y: 1621 };
+            let anchor = RECT {
+                left: 641,
+                top: 13,
+                right: 701,
+                bottom: 59,
+            };
+            let menu_w = 268;
+            let menu_h = 312;
+
+            // 先创建同进程不相关位置的通知工具窗，再创建点击位置处的自定义托盘菜单。
+            let unrelated = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                w!("Static"),
+                w!(""),
+                WS_POPUP | WS_VISIBLE,
+                2500,
+                1600,
+                200,
+                80,
+                None,
+                None,
+                crate::win32::hinstance(),
+                None,
+            )
+            .unwrap();
+            let custom_menu = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                w!("Static"),
+                w!(""),
+                WS_POPUP | WS_VISIBLE,
+                settled_click.x,
+                settled_click.y - menu_h,
+                menu_w,
+                menu_h,
+                None,
+                None,
+                crate::win32::hinstance(),
+                None,
+            )
+            .unwrap();
+
+            let mut placement = MenuPlacement::new(
+                anchor,
+                stale_source,
+                Some(POINT { x: 670, y: 30 }),
+                &[custom_menu.0 as isize],
+                &[],
+            );
+            // 仅将与按钮在动画前创建并存在于 old_windows 之外的窗口纳入测试。
+            placement.old_windows.retain(|&h| h != unrelated && h != custom_menu);
+            placement.live_source = Some(settled_click);
+
+            assert!(!placement.try_move(unrelated));
+            assert!(placement.try_move(custom_menu));
+
+            let mut moved = RECT::default();
+            GetWindowRect(custom_menu, &mut moved).unwrap();
+            let monitor = monitor_info(MonitorFromRect(&anchor, MONITOR_DEFAULTTONEAREST)).unwrap();
+            let expected = menu_position(
+                anchor,
+                monitor.work,
+                menu_w,
+                menu_h,
+                crate::win32::dp(4, monitor.dpi),
+            );
+            assert_eq!((moved.left, moved.top), (expected.x, expected.y));
+
+            let _ = DestroyWindow(unrelated);
+            let _ = DestroyWindow(custom_menu);
+        }
+    }
+
+    #[test]
+    fn open_at_falls_back_to_mouse_and_captures_shifted_tool_window() {
+        unsafe {
+            let stale_source = POINT { x: 495, y: 1740 };
+            let settled_click = POINT { x: 495, y: 1621 };
+            let anchor = RECT {
+                left: 641,
+                top: 13,
+                right: 701,
+                bottom: 59,
+            };
+            let menu_w = 268;
+            let menu_h = 312;
+
+            let custom_menu = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                w!("Static"),
+                w!(""),
+                WS_POPUP,
+                settled_click.x,
+                settled_click.y - menu_h,
+                menu_w,
+                menu_h,
+                None,
+                None,
+                crate::win32::hinstance(),
+                None,
+            )
+            .unwrap();
+
+            let mut placement = MenuPlacement::new(
+                anchor,
+                stale_source,
+                Some(POINT { x: 670, y: 30 }),
+                &[custom_menu.0 as isize],
+                &[],
+            );
+            placement.old_windows.retain(|&h| h != custom_menu);
+
+            let opened = placement.open_at(
+                false,
+                || false,
+                || {
+                    MenuPlacement::set_live_source(settled_click);
+                    let _ = ShowWindow(custom_menu, SW_SHOWNA);
+                    (true, Some(settled_click))
+                },
+            );
+
+            assert!(opened.dispatched);
+            assert!(opened.used_mouse);
+            assert_eq!(opened.window, Some(custom_menu));
+
+            let mut moved = RECT::default();
+            GetWindowRect(custom_menu, &mut moved).unwrap();
+            let monitor = monitor_info(MonitorFromRect(&anchor, MONITOR_DEFAULTTONEAREST)).unwrap();
+            let expected = menu_position(
+                anchor,
+                monitor.work,
+                menu_w,
+                menu_h,
+                crate::win32::dp(4, monitor.dpi),
+            );
+            assert_eq!((moved.left, moved.top), (expected.x, expected.y));
+
+            let _ = DestroyWindow(custom_menu);
+        }
     }
 }
