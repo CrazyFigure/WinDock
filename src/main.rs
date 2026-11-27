@@ -3,8 +3,8 @@
 //! 单一可执行文件通过子命令切换运行模式（见 DEVELOPMENT_PLAN.md 2.2 / 3.3）。
 
 #![cfg(windows)]
-// Release 构建使用 Windows GUI 子系统，避免双击启动时弹出控制台黑框
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// 非测试构建统一使用 Windows GUI 子系统，避免 Debug/Release 启动时弹出控制台或终端窗口
+#![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod app;
 mod config;
