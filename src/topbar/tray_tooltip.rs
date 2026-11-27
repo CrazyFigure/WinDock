@@ -44,6 +44,11 @@ impl TrayTooltip {
         self.visible
     }
 
+    /// 返回当前正在跟踪或显示的提示目标 `(宿主窗口, 图标键)`。
+    pub fn target_id(&self) -> Option<(HWND, &str)> {
+        self.target.as_ref().map(|target| (target.owner, target.key.as_str()))
+    }
+
     pub fn tracks(&self, target: &TipTarget) -> bool {
         self.target
             .as_ref()

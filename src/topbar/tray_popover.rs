@@ -522,6 +522,10 @@ unsafe extern "system" fn popover_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             crate::app::with_app(hwnd, |app| app.popover_lbutton_up(hwnd, x, y));
             return LRESULT(0);
         }
+        WM_RBUTTONDOWN => {
+            crate::app::with_app(hwnd, |app| app.popover_rbutton_down());
+            return LRESULT(0);
+        }
         WM_RBUTTONUP => {
             let x = get_x_lparam(lparam.0);
             let y = get_y_lparam(lparam.0);
