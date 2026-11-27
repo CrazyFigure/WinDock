@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="0.0.3.0" processorArchitecture="amd64" name="CrazyFigure.WinDock" type="win32"/>
+  <assemblyIdentity version="0.0.4.0" processorArchitecture="amd64" name="CrazyFigure.WinDock" type="win32"/>
   <description>WinDock - macOS 风格 Dock 与顶部菜单栏</description>
   <dependency>
     <dependentAssembly>
