@@ -174,6 +174,7 @@ pub struct TopBar {
     pub scratch: DibTarget,
     pub hits: Vec<(RECT, Hit)>,
     pub hover: Option<Hit>,
+    pub mouse_in: bool,
     pub active_hit: Option<Hit>,
     pub press_icon: Option<(String, i32, i32)>,
     pub drag: Option<TopbarDrag>,
@@ -259,6 +260,7 @@ impl TopBar {
                 scratch: DibTarget::default(),
                 hits: Vec::new(),
                 hover: None,
+                mouse_in: false,
                 active_hit: None,
                 press_icon: None,
                 drag: None,
@@ -414,6 +416,8 @@ impl TopBar {
     }
 
     pub fn hide(&mut self) {
+        self.mouse_in = false;
+        self.hover = None;
         if self.visible {
             self.visible = false;
             unsafe {
@@ -429,6 +433,10 @@ impl TopBar {
             return;
         }
         self.hidden_by_fullscreen = hidden;
+        if hidden {
+            self.mouse_in = false;
+            self.hover = None;
+        }
         if !self.wanted_visible {
             return;
         }
@@ -799,6 +807,7 @@ impl TopBar {
 
 unsafe extern "system" fn topbar_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        WM_NCHITTEST => return LRESULT(HTCLIENT as isize),
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         WM_ERASEBKGND => return LRESULT(1),
         WM_PAINT => {
@@ -871,6 +880,106 @@ unsafe extern "system" fn topbar_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         _ => {}
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// 判断窗口类名是否属于不应补发离焦消息的内部壳层、桌面底层或瞬态系统浮窗。
+pub(crate) fn is_ignored_leave_class(class: &str) -> bool {
+    crate::monitor::is_our_window(class)
+        || crate::monitor::is_transient_tray_or_popup_class(class)
+        || matches!(class, "Progman" | "WorkerW" | "Shell_IconView")
+}
+
+/// 判断目标窗口矩形是否与顶部栏水平相交且顶边紧贴/重叠于顶部栏下沿（覆盖最大化窗口隐形上边框）。
+pub(crate) fn rect_borders_topbar(win_rect: RECT, bar_rect: RECT) -> bool {
+    win_rect.right > bar_rect.left
+        && win_rect.left < bar_rect.right
+        && win_rect.top <= bar_rect.bottom + 32
+        && win_rect.bottom > bar_rect.bottom
+}
+
+/// 计算顶部栏下方用于探测紧邻外部窗口的屏幕采样点。
+pub(crate) fn probe_points_below_topbar(bar_rect: RECT, screen_x: i32) -> [POINT; 2] {
+    let max_x = (bar_rect.right - 1).max(bar_rect.left);
+    let x = screen_x.clamp(bar_rect.left, max_x);
+    [
+        POINT { x, y: bar_rect.bottom + 2 },
+        POINT { x, y: bar_rect.bottom + 12 },
+    ]
+}
+
+/// 判断当前是否有鼠标按键处于按下状态（拖拽窗口或浏览器标签期间不主动补发离焦消息）。
+pub(crate) fn any_mouse_button_down() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON};
+    unsafe {
+        (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0
+            || (GetAsyncKeyState(VK_RBUTTON.0 as i32) as u16 & 0x8000) != 0
+            || (GetAsyncKeyState(VK_MBUTTON.0 as i32) as u16 & 0x8000) != 0
+    }
+}
+
+/// 判断指定窗口句柄是否为需要同步悬停离焦的外部可见应用窗口。
+pub(crate) fn is_external_hover_leave_target(hwnd: HWND) -> bool {
+    if hwnd.0.is_null() {
+        return false;
+    }
+    unsafe {
+        if !IsWindow(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+            return false;
+        }
+    }
+    if crate::taskbar::window_pid(hwnd) == std::process::id() {
+        return false;
+    }
+    !is_ignored_leave_class(&crate::win32::class_name(hwnd))
+}
+
+/// 收集光标从下方应用上移进入顶部栏时可能残留悬停态的外部窗口句柄（去重）。
+pub(crate) fn collect_topbar_below_targets(bar_rect: RECT, screen_x: i32, bar_hwnd: HWND) -> Vec<HWND> {
+    let mut targets: Vec<HWND> = Vec::new();
+    let mut push_unique = |hwnd: HWND| {
+        if hwnd != bar_hwnd && is_external_hover_leave_target(hwnd) && !targets.contains(&hwnd) {
+            targets.push(hwnd);
+        }
+    };
+    unsafe {
+        for pt in probe_points_below_topbar(bar_rect, screen_x) {
+            let hit = WindowFromPoint(pt);
+            if !hit.0.is_null() {
+                push_unique(hit);
+                let root = GetAncestor(hit, GA_ROOT);
+                if !root.0.is_null() && root != hit {
+                    push_unique(root);
+                }
+            }
+        }
+        // 同步检查贴近顶部栏的前台外部窗口，覆盖斜向快速滑入顶部栏的场景
+        let fg = GetForegroundWindow();
+        if !fg.0.is_null() && fg != bar_hwnd && is_external_hover_leave_target(fg) {
+            let mut fr = RECT::default();
+            if GetWindowRect(fg, &mut fr).is_ok() && rect_borders_topbar(fr, bar_rect) {
+                push_unique(fg);
+            }
+        }
+    }
+    targets
+}
+
+/// 异步向目标窗口补发非客户区与客户区鼠标离开消息，解除最大化浏览器等应用残留的标签悬停态。
+pub(crate) fn post_mouse_leave_to_targets(targets: &[HWND]) {
+    unsafe {
+        for &hwnd in targets {
+            if hwnd.0.is_null()
+                || !IsWindow(hwnd).as_bool()
+                || !IsWindowVisible(hwnd).as_bool()
+                || IsIconic(hwnd).as_bool()
+            {
+                continue;
+            }
+            // 先清非客户区（标题栏按钮）悬停，再投递客户区 WM_MOUSELEAVE 触发 Chromium kMouseExited
+            let _ = PostMessageW(hwnd, WM_NCMOUSELEAVE, WPARAM(0), LPARAM(0));
+            let _ = PostMessageW(hwnd, WM_MOUSELEAVE, WPARAM(0), LPARAM(0));
+        }
+    }
 }
 
 /// 判断 WM_SETTINGCHANGE 是否为系统浅/深主题或配色变化（而非工作区/任务栏尺寸变更）。
@@ -1100,5 +1209,132 @@ mod tests {
         assert_ne!(open_px, closed_px);
 
         bar.destroy();
+    }
+
+    #[test]
+    fn topbar_nchittest_returns_htclient_and_mouse_in_resets_on_hide() {
+        let mon = crate::win32::primary_monitor().unwrap_or(MonitorInfo {
+            hmonitor: windows::Win32::Graphics::Gdi::HMONITOR::default(),
+            rect: RECT { left: 0, top: 0, right: 1920, bottom: 1080 },
+            work: RECT { left: 0, top: 0, right: 1920, bottom: 1080 },
+            dpi: 96,
+            primary: true,
+        });
+        let cfg = TopbarCfg::default();
+        let app_cfg = Appearance::default();
+        let mut bar = TopBar::new(std::ptr::null_mut(), mon, &cfg, &app_cfg)
+            .expect("TopBar test window should create");
+        assert!(!bar.mouse_in);
+        unsafe {
+            let ht = SendMessageW(bar.hwnd, WM_NCHITTEST, WPARAM(0), LPARAM(0)).0;
+            assert_eq!(ht, HTCLIENT as isize, "顶部栏整条区域应明确返回 HTCLIENT");
+        }
+        bar.mouse_in = true;
+        bar.set_hover(Some(Hit::TrayToggle));
+        bar.set_fullscreen_hidden(true);
+        assert!(!bar.mouse_in);
+        assert!(bar.hover.is_none());
+
+        bar.mouse_in = true;
+        bar.set_hover(Some(Hit::Clock));
+        bar.hide();
+        assert!(!bar.mouse_in);
+        assert!(bar.hover.is_none());
+
+        bar.destroy();
+    }
+
+    #[test]
+    fn topbar_external_leave_helpers_filter_classes_and_geometry() {
+        // 内部窗口、桌面与瞬态系统浮窗必须被过滤，外部浏览器与普通应用窗应保留
+        for ignored in [
+            "WinDockTopBar",
+            "WinDockPopover",
+            "WinDockContextMenu",
+            "Progman",
+            "WorkerW",
+            "Shell_TrayWnd",
+            "#32768",
+            "tooltips_class32",
+            "NotifyIconOverflowWindow",
+        ] {
+            assert!(is_ignored_leave_class(ignored), "应忽略窗口类: {ignored}");
+        }
+        for allowed in ["Chrome_WidgetWin_1", "MozillaWindowClass", "CabinetWClass", "ApplicationFrameWindow"] {
+            assert!(!is_ignored_leave_class(allowed), "不应忽略外部应用窗口类: {allowed}");
+        }
+
+        // 支持副屏负坐标的边界夹紧与贴边判定
+        let bar = RECT { left: -1920, top: 0, right: 0, bottom: 38 };
+        let pts = probe_points_below_topbar(bar, 50);
+        assert_eq!(pts[0], POINT { x: -1, y: 40 });
+        assert_eq!(pts[1], POINT { x: -1, y: 50 });
+        let pts_left = probe_points_below_topbar(bar, -2500);
+        assert_eq!(pts_left[0], POINT { x: -1920, y: 40 });
+
+        // 最大化窗口上边框渗入顶部栏下沿、紧贴下沿、略低于下沿均命中；远离或跨屏不命中
+        assert!(rect_borders_topbar(RECT { left: -1928, top: 30, right: 8, bottom: 1088 }, bar));
+        assert!(rect_borders_topbar(RECT { left: -1920, top: 38, right: 0, bottom: 1080 }, bar));
+        assert!(rect_borders_topbar(RECT { left: -1000, top: 60, right: -200, bottom: 700 }, bar));
+        assert!(!rect_borders_topbar(RECT { left: -1000, top: 120, right: -200, bottom: 700 }, bar));
+        assert!(!rect_borders_topbar(RECT { left: 0, top: 38, right: 1920, bottom: 1080 }, bar));
+    }
+
+    #[test]
+    fn post_mouse_leave_to_targets_delivers_nc_and_client_leave_messages() {
+        use std::sync::Mutex;
+        static RECEIVED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        unsafe extern "system" fn sink_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+            if msg == WM_NCMOUSELEAVE || msg == WM_MOUSELEAVE {
+                if let Ok(mut list) = RECEIVED.lock() {
+                    list.push(msg);
+                }
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        if let Ok(mut list) = RECEIVED.lock() {
+            list.clear();
+        }
+        unsafe {
+            let cls = w!("WinDockLeaveSinkTest");
+            let wc = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(sink_proc),
+                hInstance: crate::win32::hinstance(),
+                lpszClassName: cls,
+                ..Default::default()
+            };
+            let _ = RegisterClassExW(&wc);
+            let hwnd = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                cls,
+                w!(""),
+                WS_POPUP | WS_VISIBLE,
+                10,
+                50,
+                200,
+                100,
+                None,
+                None,
+                crate::win32::hinstance(),
+                None,
+            )
+            .expect("sink test window should create");
+
+            // 本进程测试窗必须被 is_external_hover_leave_target 过滤
+            assert!(!is_external_hover_leave_target(hwnd));
+
+            // 直接验证投递顺序：先非客户区 WM_NCMOUSELEAVE，再客户区 WM_MOUSELEAVE
+            post_mouse_leave_to_targets(&[hwnd]);
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            let _ = DestroyWindow(hwnd);
+        }
+        let got = RECEIVED.lock().unwrap().clone();
+        assert_eq!(got, vec![WM_NCMOUSELEAVE, WM_MOUSELEAVE]);
     }
 }

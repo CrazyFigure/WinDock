@@ -72,6 +72,8 @@ const TIMER_TRAY_FLASH: usize = 6;
 const TIMER_MONITOR_SETTLE: usize = 7;
 /// 最大化窗口取色二次校验定时器（覆盖还原动画滞后导致首次采到壁纸残影的场景）。
 const TIMER_COLOR_RECHECK: usize = 8;
+/// 光标进入顶部栏后二次确认外部窗口离焦的防竞态定时器（规避 Win32 投递消息优先于输入队列的竞争）。
+const TIMER_TOPBAR_LEAVE_SYNC: usize = 9;
 const HK_DOCK: i32 = 7001;
 const HK_TOPBAR: i32 = 7002;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -680,6 +682,8 @@ pub struct App {
     tray_seed: TraySeed,
     tray_gate: TrayTipGate,
     tray_tip: TrayTooltip,
+    /// 光标刚移入顶部栏时待 60ms 二次确认离焦的 `(顶部栏句柄, 外部目标窗口句柄列表)`
+    topbar_leave_sync: Option<(HWND, Vec<isize>)>,
     pub temp_show_until: Option<Instant>,
     pub display_dirty_at: Option<Instant>,
     pub cursor_monitor: isize,
@@ -821,6 +825,7 @@ pub fn run(open_settings: bool) -> i32 {
         tray_seed: TraySeed::Ready,
         tray_gate: TrayTipGate::default(),
         tray_tip: TrayTooltip::default(),
+        topbar_leave_sync: None,
         temp_show_until: None,
         display_dirty_at: None,
         cursor_monitor: 0,
@@ -986,7 +991,9 @@ impl App {
             let _ = KillTimer(self.hwnd, TIMER_EDGE);
             let _ = KillTimer(self.hwnd, TIMER_MONITOR_SETTLE);
             let _ = KillTimer(self.hwnd, TIMER_COLOR_RECHECK);
+            let _ = KillTimer(self.hwnd, TIMER_TOPBAR_LEAVE_SYNC);
         }
+        self.topbar_leave_sync = None;
         self.frame_on = false;
         self.edge_timer_on = false;
         uninstall_overlay_hooks();
@@ -1107,6 +1114,7 @@ impl App {
     }
 
     fn rebuild_bars(&mut self) {
+        self.clear_topbar_leave_sync(None);
         self.close_popover_immediate();
         self.clear_tray_context();
         self.tray_gate.clear_suppressed();
@@ -2274,6 +2282,23 @@ impl App {
 
     fn on_slow(&mut self) {
         self.slow_ticks += 1;
+        // 1Hz 校对顶部栏自身 mouse_in 状态，防止系统偶发漏发顶部栏 WM_MOUSELEAVE 导致悬停高亮或重入同步失效
+        let cur_pt = cursor_pos();
+        let cur_over = unsafe { WindowFromPoint(cur_pt) };
+        let mut stale_bars = Vec::new();
+        for bar in &mut self.topbars {
+            if bar.mouse_in && bar.drag.is_none() && bar.press_icon.is_none() && cur_over != bar.hwnd {
+                bar.mouse_in = false;
+                bar.set_hover(None);
+                stale_bars.push(bar.hwnd);
+            }
+        }
+        for hwnd in stale_bars {
+            self.clear_topbar_leave_sync(Some(hwnd));
+            if self.tray_tip.owner() == Some(hwnd) {
+                self.tray_tip.clear(self.hwnd);
+            }
+        }
         // 1Hz 轻量状态校对：兜底 Win+D 等系统级切换偶发漏掉 WinEvent 的场景
         if monitor::refresh() {
             self.snap = monitor::snapshot();
@@ -2694,6 +2719,9 @@ impl App {
                     let _ = KillTimer(self.hwnd, TIMER_COLOR_RECHECK);
                 }
                 self.schedule_fused_color_recheck();
+            }
+            TIMER_TOPBAR_LEAVE_SYNC => {
+                self.confirm_external_mouse_leave_for_topbar();
             }
             _ => {}
         }
@@ -3541,6 +3569,8 @@ impl App {
 
     pub fn topbar_mouse_move(&mut self, hwnd: HWND, x: i32, y: i32) {
         let Some(i) = self.topbar_index(hwnd) else { return };
+        let just_entered = !self.topbars[i].mouse_in;
+        self.topbars[i].mouse_in = true;
         let mut start_drag = false;
         let mut paint_now = false;
         {
@@ -3577,9 +3607,95 @@ impl App {
             self.ensure_frame();
             return;
         }
+        if just_entered && self.topbars[i].press_icon.is_none() {
+            self.sync_external_mouse_leave_for_topbar(hwnd, x);
+        }
         let hit = self.topbars[i].hit_test(x, y);
         self.topbars[i].set_hover(hit);
         self.update_tray_tip(hwnd, x, y);
+    }
+
+    /// 清除顶部栏外部窗口离焦确认定时器；`only_bar` 为 `Some` 时仅清理匹配该顶部栏的待确认任务。
+    fn clear_topbar_leave_sync(&mut self, only_bar: Option<HWND>) {
+        if only_bar.is_some_and(|h| self.topbar_leave_sync.as_ref().is_none_or(|(bh, _)| *bh != h)) {
+            return;
+        }
+        self.topbar_leave_sync = None;
+        if !self.hwnd.0.is_null() {
+            unsafe {
+                let _ = KillTimer(self.hwnd, TIMER_TOPBAR_LEAVE_SYNC);
+            }
+        }
+    }
+
+    /// 光标从下方浏览器等应用滑入无焦点顶部栏时，向紧邻外部窗口补发鼠标离焦消息，
+    /// 避免 Chromium 等应用因非客户区切换或 AppBar 边界漏收 `WM_MOUSELEAVE` 而残留标签预览弹窗。
+    fn sync_external_mouse_leave_for_topbar(&mut self, hwnd: HWND, client_x: i32) {
+        if crate::topbar::any_mouse_button_down() {
+            return;
+        }
+        let pt = cursor_pos();
+        if unsafe { WindowFromPoint(pt) } != hwnd {
+            return;
+        }
+        let mut bar_rect = RECT::default();
+        if unsafe { GetWindowRect(hwnd, &mut bar_rect) }.is_err() {
+            return;
+        }
+        let screen_x = bar_rect.left + client_x;
+        let targets = crate::topbar::collect_topbar_below_targets(bar_rect, screen_x, hwnd);
+        if targets.is_empty() {
+            self.clear_topbar_leave_sync(Some(hwnd));
+            return;
+        }
+        crate::topbar::post_mouse_leave_to_targets(&targets);
+        // 延迟 60ms 二次确认：规避 Win32 PostMessage 优先于外部窗口硬件输入队列中末帧 WM_MOUSEMOVE 的竞态
+        self.topbar_leave_sync = Some((hwnd, targets.iter().map(|h| h.0 as isize).collect()));
+        unsafe {
+            let _ = SetTimer(self.hwnd, TIMER_TOPBAR_LEAVE_SYNC, 60, None);
+        }
+    }
+
+    /// 60ms 后复核光标仍停留在顶部栏内，再补发一次外部窗口离焦消息确保彻底取消延迟预览计时器。
+    fn confirm_external_mouse_leave_for_topbar(&mut self) {
+        unsafe {
+            let _ = KillTimer(self.hwnd, TIMER_TOPBAR_LEAVE_SYNC);
+        }
+        let Some((bar_hwnd, recorded)) = self.topbar_leave_sync.take() else { return };
+        if crate::topbar::any_mouse_button_down() {
+            return;
+        }
+        let Some(i) = self.topbar_index(bar_hwnd) else { return };
+        let bar = &self.topbars[i];
+        if !bar.mouse_in
+            || !bar.visible
+            || bar.hidden_by_fullscreen
+            || bar.drag.is_some()
+            || bar.press_icon.is_some()
+        {
+            return;
+        }
+        let pt = cursor_pos();
+        if unsafe { WindowFromPoint(pt) } != bar_hwnd {
+            return;
+        }
+        let mut bar_rect = RECT::default();
+        if unsafe { GetWindowRect(bar_hwnd, &mut bar_rect) }.is_err() {
+            return;
+        }
+        let mut targets: Vec<HWND> = recorded
+            .into_iter()
+            .map(|raw| HWND(raw as *mut _))
+            .filter(|&h| h != bar_hwnd && crate::topbar::is_external_hover_leave_target(h))
+            .collect();
+        for h in crate::topbar::collect_topbar_below_targets(bar_rect, pt.x, bar_hwnd) {
+            if !targets.contains(&h) {
+                targets.push(h);
+            }
+        }
+        if !targets.is_empty() {
+            crate::topbar::post_mouse_leave_to_targets(&targets);
+        }
     }
 
     /// 根据当前命中的格子提取实际托盘提示，而非替换成窗口的显示名称。
@@ -3741,6 +3857,7 @@ impl App {
     }
 
     pub fn topbar_mouse_leave(&mut self, hwnd: HWND) {
+        self.clear_topbar_leave_sync(Some(hwnd));
         if self.tray_tip.owner() == Some(hwnd) {
             self.tray_tip.clear(self.hwnd);
         }
@@ -3754,6 +3871,7 @@ impl App {
             self.tray_gate.clear_suppressed();
         }
         let Some(i) = self.topbar_index(hwnd) else { return };
+        self.topbars[i].mouse_in = false;
         if self.topbars[i].drag.is_none() {
             self.topbars[i].set_hover(None);
         }
