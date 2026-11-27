@@ -14,6 +14,8 @@ use crate::log;
 use crate::win32::{data_dir, wide};
 
 pub const SCHEMA_VERSION: u32 = 1;
+/// 默认弹出延迟（ms）：对应设置页「默认」档位。
+pub const DEFAULT_SHOW_DELAY_MS: u32 = 80;
 /// 默认底部间距（dp）：对应设置页「紧凑」档位。
 pub const DEFAULT_BOTTOM_OFFSET_DP: i32 = 6;
 
@@ -98,7 +100,7 @@ impl Default for DockCfg {
             display_mode: "primary".into(),
             hide_mode: "smart_maximized".into(),
             trigger_edge_px: 3,
-            show_delay_ms: 120,
+            show_delay_ms: DEFAULT_SHOW_DELAY_MS,
             hide_delay_ms: 250,
             bottom_offset_dp: DEFAULT_BOTTOM_OFFSET_DP,
             icon_size_dp: 48,
@@ -596,6 +598,7 @@ mod tests {
         assert!(c.topbar.has_status("brightness"));
         assert!(!c.general.startup_initialized);
         assert_eq!(c.appearance.dock_material, "liquid_glass");
+        assert_eq!(c.dock.show_delay_ms, DEFAULT_SHOW_DELAY_MS);
         assert_eq!(c.dock.bottom_offset_dp, DEFAULT_BOTTOM_OFFSET_DP);
         assert_eq!(c.schema_version, SCHEMA_VERSION);
 

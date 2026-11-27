@@ -76,7 +76,8 @@ const CLOCK: Options = &[
     ("12h:mm", "12小时"),
 ];
 const TRIGGER_EDGE_OPTS: Options = &[("2", "2 px"), ("4", "4 px"), ("6", "6 px"), ("8", "8 px"), ("10", "10 px")];
-const SHOW_DELAY_OPTS: Options = &[("0", "立即"), ("80", "快"), ("120", "默认"), ("250", "慢")];
+// 弹出延迟：默认 80ms，按 40ms 等差递增保留「立即 / 快 / 默认 / 慢」四档
+const SHOW_DELAY_OPTS: Options = &[("0", "立即"), ("40", "快"), ("80", "默认"), ("120", "慢")];
 const HIDE_DELAY_OPTS: Options = &[("150", "快"), ("250", "默认"), ("500", "较慢"), ("800", "慢")];
 // 底部间距：0dp 为真正贴底，其余四档按 6dp 等差递增，默认使用 6dp（紧凑）
 const BOTTOM_OFFSET_OPTS: Options = &[
@@ -463,6 +464,24 @@ mod tests {
             Field::BottomOffset.set_choice(&mut cfg, idx);
             assert_eq!(cfg.dock.bottom_offset_dp, dp_val);
             let (got_idx, opts) = Field::BottomOffset.get_choice(&cfg).unwrap();
+            assert_eq!(got_idx, idx);
+            assert_eq!(opts[got_idx].1, label);
+        }
+
+        // 弹出延迟：默认值 80ms 对应「默认」（索引 2），四档按 0/40/80/120 双向映射无偏差
+        assert_eq!(Field::ShowDelay.get_choice(&def).map(|(i, _)| i), Some(2));
+        for (idx, (ms_val, label)) in [
+            (0, "立即"),
+            (40, "快"),
+            (80, "默认"),
+            (120, "慢"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            Field::ShowDelay.set_choice(&mut cfg, idx);
+            assert_eq!(cfg.dock.show_delay_ms, ms_val);
+            let (got_idx, opts) = Field::ShowDelay.get_choice(&cfg).unwrap();
             assert_eq!(got_idx, idx);
             assert_eq!(opts[got_idx].1, label);
         }
