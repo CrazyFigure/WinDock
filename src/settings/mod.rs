@@ -330,20 +330,8 @@ fn dock_kind_label(item: &crate::config::DockItem) -> &'static str {
 }
 
 fn dock_label(item: &crate::config::DockItem) -> String {
-    // 设置页也可能显示尚未保存的旧标签，按 Dock 的规则显示。
-    if crate::win32::is_legacy_file_manager_label(&item.target, &item.label) {
-        return crate::win32::FILE_MANAGER_NAME.into();
-    }
-    if !item.label.is_empty() {
-        return item.label.clone();
-    }
-    if item.kind == "folder" || item.kind == "file" {
-        return std::path::Path::new(&item.target)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "文件夹".into());
-    }
-    crate::monitor::exe_display_name(&items::resolve_item_exe(item).to_lowercase())
+    // 统一复用 Dock 固定项标签解析逻辑，保证设置页与 Dock 显示名称一致。
+    items::resolve_dock_item_label(item, None)
 }
 
 /// 固定项图标键（与 Dock 渲染保持一致）。

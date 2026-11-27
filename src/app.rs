@@ -2766,9 +2766,18 @@ impl App {
                 }
             }
             M_APP_PIN => {
-                let target = item.as_ref().map(|it| it.target.clone()).or(e.running_exe.clone());
+                // 优先读取运行态保留的真实大小写 exe 路径，避免固定项存入全小写路径与名称。
+                let target = item.as_ref().map(|it| it.target.clone()).or_else(|| {
+                    e.running_exe.as_ref().map(|key| {
+                        crate::monitor::running_apps()
+                            .into_iter()
+                            .find(|a| a.key == *key)
+                            .map(|a| a.exe)
+                            .unwrap_or_else(|| crate::win32::real_path_case(key))
+                    })
+                });
                 if let Some(t) = target {
-                    if let Some(it) = items::item_from_path(&t) {
+                    if let Some(it) = items::item_from_path_with_hint(&t, Some(&e.label)) {
                         items::add_pinned(&mut self.dock_items, it);
                         self.after_items_change();
                     }

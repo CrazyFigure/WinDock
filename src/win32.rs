@@ -2,7 +2,7 @@
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use windows::core::{w, HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::*;
@@ -429,6 +429,157 @@ pub fn wait_process(pid: u32, timeout: std::time::Duration) -> bool {
         let _ = CloseHandle(h);
         ok
     }
+}
+
+/// 确保当前线程已初始化 COM，并在离开作用域时按需释放。
+pub struct ComGuard(bool);
+
+impl ComGuard {
+    pub fn enter() -> Self {
+        use windows::Win32::System::Com::{
+            CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+        };
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+        Self(hr.is_ok())
+    }
+}
+
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
+        }
+    }
+}
+
+/// 快捷方式解析结果（目标路径与参数）。
+#[derive(Clone, Debug, Default)]
+pub struct LnkInfo {
+    pub target: String,
+    pub args: String,
+}
+
+/// 展开 `%ProgramFiles%` 等环境变量。
+pub fn expand_env(s: &str) -> String {
+    use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
+    if !s.contains('%') {
+        return s.to_string();
+    }
+    unsafe {
+        let w = wide(s);
+        let mut buf = vec![0u16; 1024];
+        let n = ExpandEnvironmentStringsW(PCWSTR(w.as_ptr()), Some(&mut buf));
+        if n == 0 || n as usize > buf.len() {
+            return s.to_string();
+        }
+        from_wide(&buf)
+    }
+}
+
+/// 读取 `.lnk` 快捷方式的目标路径与参数（不解析网络路径）。
+pub fn read_lnk(path: &Path) -> Option<LnkInfo> {
+    use windows::core::Interface;
+    use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER, STGM_READ};
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink, SLGP_RAWPATH};
+    let _com = ComGuard::enter();
+    unsafe {
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        let pf: IPersistFile = link.cast().ok()?;
+        if pf.Load(PCWSTR(wide(path).as_ptr()), STGM_READ).is_err() {
+            return None;
+        }
+        let mut buf = [0u16; 1024];
+        let target = if link
+            .GetPath(&mut buf, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32)
+            .is_ok()
+        {
+            expand_env(from_wide(&buf).trim())
+        } else {
+            String::new()
+        };
+        let mut abuf = [0u16; 1024];
+        let args = if link.GetArguments(&mut abuf).is_ok() {
+            from_wide(&abuf).trim().to_string()
+        } else {
+            String::new()
+        };
+        Some(LnkInfo { target, args })
+    }
+}
+
+/// 通过 Win32 目录项读取文件/目录在磁盘上的真实大小写名称。
+pub fn real_file_name(path: &Path) -> Option<String> {
+    use windows::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
+    let s = path.as_os_str();
+    if s.is_empty() {
+        return None;
+    }
+    let w = wide(s);
+    let mut data = WIN32_FIND_DATAW::default();
+    let handle = unsafe { FindFirstFileW(PCWSTR(w.as_ptr()), &mut data) }.ok()?;
+    unsafe {
+        let _ = FindClose(handle);
+    }
+    let name = from_wide(&data.cFileName);
+    if name.is_empty() || name == "." || name == ".." {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// 逐级还原本地路径在磁盘上的真实大小写（保留目录连接点前缀，不引入 `\\?\`）。
+pub fn real_path_case(path: &str) -> String {
+    use std::path::Component;
+    let p = Path::new(path);
+    if !p.exists() {
+        return path.to_string();
+    }
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::Prefix(pre) => {
+                if matches!(pre.kind(), std::path::Prefix::Disk(_)) {
+                    let s = pre.as_os_str().to_string_lossy();
+                    out.push(s.to_ascii_uppercase());
+                } else {
+                    out.push(pre.as_os_str());
+                }
+            }
+            Component::RootDir => {
+                out.push(comp.as_os_str());
+            }
+            Component::Normal(part) => {
+                let next = out.join(part);
+                if let Some(real) = real_file_name(&next) {
+                    out.push(real);
+                } else {
+                    out.push(part);
+                }
+            }
+            _ => out.push(comp.as_os_str()),
+        }
+    }
+    let s = out.to_string_lossy().to_string();
+    if s.is_empty() { path.to_string() } else { s }
+}
+
+/// 判断文本中是否包含中文（CJK 统一汉字）字符。
+pub fn has_cjk(s: &str) -> bool {
+    s.chars().any(|c| {
+        ('\u{4E00}'..='\u{9FFF}').contains(&c)
+            || ('\u{3400}'..='\u{4DBF}').contains(&c)
+            || ('\u{F900}'..='\u{FAFF}').contains(&c)
+    })
+}
+
+/// 判断文本是否为纯 ASCII 且所有英文字母均是小写（如 `t3 code (nightly)`、`openidea`）。
+pub fn is_all_lowercase_ascii(s: &str) -> bool {
+    let trimmed = s.trim();
+    !trimmed.is_empty()
+        && trimmed.is_ascii()
+        && trimmed.chars().any(|c| c.is_ascii_lowercase())
+        && !trimmed.chars().any(|c| c.is_ascii_uppercase())
 }
 
 #[cfg(test)]

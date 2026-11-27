@@ -560,11 +560,10 @@ impl Store {
         let mut items = read_json::<DockItems>(&p, "Dock 固定项")
             .or_else(|| read_json::<DockItems>(&bak_of(&p), "Dock 固定项备份"))
             .unwrap_or_default();
-        // 迁移旧版本保存的 Explorer 默认名称，保留用户自定义的标签。
+        // 迁移旧版本保存的默认名称以及全小写/裸文件名固定项标签，同时保留用户自定义的标签。
         let mut migrated = false;
         for it in &mut items.items {
-            if crate::win32::is_legacy_file_manager_label(&it.target, &it.label) {
-                it.label = crate::win32::FILE_MANAGER_NAME.into();
+            if crate::dock::items::migrate_dock_item_label(it) {
                 migrated = true;
             }
         }
@@ -665,6 +664,22 @@ mod tests {
         assert_eq!(labels, ["文件管理器", "文件管理器", "我的文件", "应用管理器"]);
         let saved: DockItems = read_json(&store.dock_items_path(), "Dock 固定项").unwrap();
         assert_eq!(saved.items[0].label, "文件管理器");
+    }
+
+    #[test]
+    fn load_dock_items_upgrades_lowercase_and_stem_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf());
+        let items: DockItems = serde_json::from_str(r#"{"items":[
+            {"id":"1","kind":"app","target":"c:/fake/weixin.exe","label":"weixin"},
+            {"id":"2","kind":"app","target":"c:/windows/system32/notepad.exe","label":"notepad"},
+            {"id":"3","kind":"app","target":"c:/fake/cc-switch.exe","label":"cc-switch"},
+            {"id":"4","kind":"app","target":"c:/fake/custom.exe","label":"我的专属工具"}
+        ]}"#).unwrap();
+        assert!(store.save_dock_items(&items));
+        let migrated = store.load_dock_items();
+        let labels: Vec<_> = migrated.items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(labels, ["微信", "记事本", "Cc-Switch", "我的专属工具"]);
     }
 
     #[test]

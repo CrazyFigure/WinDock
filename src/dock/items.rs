@@ -150,14 +150,7 @@ pub fn build_entries(items: &DockItems, apps: &[RuntimeApp], show_running: bool)
             "folder" | "file" => {
                 list.right.push(FuncEntry {
                     kind: FuncKind::Folder(idx),
-                    label: if item.label.is_empty() {
-                        Path::new(&item.target)
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "文件夹".into())
-                    } else {
-                        item.label.clone()
-                    },
+                    label: resolve_dock_item_label(item, None),
                     icon_key: if item.custom_icon.is_empty() {
                         item.target.clone()
                     } else {
@@ -172,7 +165,7 @@ pub fn build_entries(items: &DockItems, apps: &[RuntimeApp], show_running: bool)
                         id: item.id.clone(),
                         pinned: Some(idx),
                         running_exe: None,
-                        label: "启动台".into(),
+                        label: resolve_dock_item_label(item, None),
                         icon_key: launchpad_icon_key().into(),
                         windows: Vec::new(),
                     },
@@ -182,14 +175,7 @@ pub fn build_entries(items: &DockItems, apps: &[RuntimeApp], show_running: bool)
                 let exe = resolve_item_exe(item);
                 let key = exe.to_lowercase();
                 let app = apps.iter().find(|a| a.key == key);
-                let label = if crate::win32::is_legacy_file_manager_label(&exe, &item.label) {
-                    crate::win32::FILE_MANAGER_NAME.into()
-                } else if item.label.is_empty() {
-                    app.map(|a| a.label.clone())
-                        .unwrap_or_else(|| crate::monitor::exe_display_name(&key))
-                } else {
-                    item.label.clone()
-                };
+                let label = resolve_dock_item_label(item, app.map(|a| a.label.as_str()));
                 list.apps.push(Entry {
                     id: item.id.clone(),
                     pinned: Some(idx),
@@ -237,6 +223,114 @@ pub fn resolve_item_exe(item: &DockItem) -> String {
         }
     }
     item.target.clone()
+}
+
+/// 判断已有固定项的 `label` 是否属于可自动优化的旧默认名称或全小写/裸文件名，而非用户手动重命名。
+fn should_upgrade_dock_label(item: &DockItem, exe: &str) -> bool {
+    if crate::win32::is_legacy_file_manager_label(exe, &item.label)
+        || crate::win32::is_legacy_file_manager_label(&item.target, &item.label)
+    {
+        return true;
+    }
+    let label = item.label.trim();
+    if label.is_empty() || crate::win32::is_all_lowercase_ascii(label) {
+        return true;
+    }
+    let target_stem = Path::new(&item.target)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let exe_stem = Path::new(exe)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    (!target_stem.is_empty() && label.eq_ignore_ascii_case(&target_stem))
+        || (!exe_stem.is_empty() && label.eq_ignore_ascii_case(&exe_stem))
+}
+
+/// 在自动解析名称与运行态提示名之间择优（中文优先，规避回退成纯 exe 裸名或全小写）。
+fn pick_best_resolved_label(resolved: &str, hint: Option<&str>, reference_path: &str) -> String {
+    let resolved_trim = resolved.trim();
+    let stem = Path::new(reference_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if let Some(h) = hint.map(str::trim).filter(|s| !s.is_empty()) {
+        let resolved_has_cjk = crate::win32::has_cjk(resolved_trim);
+        let hint_has_cjk = crate::win32::has_cjk(h);
+        let resolved_is_plain_stem = !stem.is_empty() && resolved_trim.eq_ignore_ascii_case(&stem);
+        if resolved_trim.is_empty()
+            || (!resolved_has_cjk && hint_has_cjk)
+            || (resolved_is_plain_stem
+                && !crate::win32::is_all_lowercase_ascii(h)
+                && !h.eq_ignore_ascii_case(&stem))
+        {
+            return h.to_string();
+        }
+    }
+    resolved_trim.to_string()
+}
+
+/// 解析固定项面向 Dock 与设置页的最终展示名称（优先中文名并修正全小写名称，同时保留用户自定义标签）。
+pub fn resolve_dock_item_label(item: &DockItem, running_label: Option<&str>) -> String {
+    match item.kind.as_str() {
+        "folder" | "file" => {
+            if item.label.is_empty() {
+                Path::new(&item.target)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "文件夹".into())
+            } else {
+                item.label.clone()
+            }
+        }
+        "winlaunchpad" => "启动台".into(),
+        _ => {
+            let exe = resolve_item_exe(item);
+            if crate::win32::is_legacy_file_manager_label(&exe, &item.label)
+                || crate::win32::is_legacy_file_manager_label(&item.target, &item.label)
+            {
+                return crate::win32::FILE_MANAGER_NAME.into();
+            }
+            if !should_upgrade_dock_label(item, &exe) {
+                return item.label.clone();
+            }
+            let target_p = Path::new(&item.target);
+            let raw_resolved = if item.target.to_lowercase().ends_with(".lnk") && target_p.is_file() {
+                crate::monitor::shortcut_display_name(target_p)
+            } else {
+                let real_exe = crate::win32::real_path_case(&exe);
+                crate::monitor::exe_display_name(&real_exe)
+            };
+            let best = pick_best_resolved_label(&raw_resolved, running_label, &exe);
+            if best.is_empty() {
+                item.label.clone()
+            } else {
+                best
+            }
+        }
+    }
+}
+
+/// 启动加载时自动迁移旧版或全小写/裸文件名固定项标签，返回是否发生变更。
+pub fn migrate_dock_item_label(item: &mut DockItem) -> bool {
+    if matches!(item.kind.as_str(), "folder" | "file" | "winlaunchpad") {
+        return false;
+    }
+    let exe = resolve_item_exe(item);
+    if !should_upgrade_dock_label(item, &exe) {
+        return false;
+    }
+    let next = resolve_dock_item_label(item, None);
+    if next.is_empty() || next == item.label {
+        return false;
+    }
+    // 非全小写旧标签仅在解析出更佳的非全小写/中文名称时覆盖，避免误降级。
+    if !crate::win32::is_all_lowercase_ascii(&item.label) && crate::win32::is_all_lowercase_ascii(&next) {
+        return false;
+    }
+    item.label = next;
+    true
 }
 
 /// 是否有运行窗口。
@@ -310,22 +404,58 @@ pub fn open_file_location(item: &DockItem) {
     let _ = open_shell_path("open", "explorer.exe", Some(&format!("/select,\"{exe}\"")));
 }
 
-/// 从拖入的路径创建固定项。
-pub fn item_from_path(path: &str) -> Option<DockItem> {
+/// 从路径创建固定项，并允许传入运行态展示名称作为辅助兜底。
+pub fn item_from_path_with_hint(path: &str, label_hint: Option<&str>) -> Option<DockItem> {
     let p = Path::new(path);
     if !p.exists() {
         return None;
     }
-    let lower = path.to_lowercase();
+    // 尽量还原磁盘上的真实大小写，避免从运行态小写路径固定后保存全小写 target。
+    let normalized = crate::win32::real_path_case(path);
+    let norm_path = Path::new(&normalized);
+    let lower = normalized.to_lowercase();
     if p.is_dir() {
-        let label = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        return Some(new_item("folder", path, &label));
+        let label = norm_path
+            .file_name()
+            .or_else(|| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        return Some(new_item("folder", &normalized, &label));
     }
-    if lower.ends_with(".exe") || lower.ends_with(".lnk") || lower.ends_with(".bat") || lower.ends_with(".cmd") {
-        let label = p.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        return Some(new_item("app", path, &label));
+    if lower.ends_with(".lnk") {
+        // 快捷方式优先取本地化展示名与目标程序中文名。
+        let resolved = crate::monitor::shortcut_display_name(norm_path);
+        let picked = pick_best_resolved_label(&resolved, label_hint, &normalized);
+        let label = if picked.is_empty() {
+            norm_path
+                .file_stem()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        } else {
+            picked
+        };
+        return Some(new_item("app", &normalized, &label));
     }
-    Some(new_item("file", path, ""))
+    if lower.ends_with(".exe") || lower.ends_with(".bat") || lower.ends_with(".cmd") {
+        // 可执行文件优先走内置中文名/开始菜单/PE 版本描述，避免退化为全小写文件名。
+        let resolved = crate::monitor::exe_display_name(&normalized);
+        let picked = pick_best_resolved_label(&resolved, label_hint, &normalized);
+        let label = if picked.is_empty() {
+            norm_path
+                .file_stem()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        } else {
+            picked
+        };
+        return Some(new_item("app", &normalized, &label));
+    }
+    Some(new_item("file", &normalized, ""))
+}
+
+/// 从拖入的路径创建固定项。
+pub fn item_from_path(path: &str) -> Option<DockItem> {
+    item_from_path_with_hint(path, None)
 }
 
 /// 按 `order` 对固定项就地归一化排序并重写连续序号，保证 Vec 顺序与 `sorted()` 始终一致。
@@ -602,6 +732,55 @@ mod tests {
         let first = seeded.items.first().expect("seeded items should not be empty");
         assert!(first.target.to_lowercase().ends_with("explorer.exe"));
         assert_eq!(first.label, "文件管理器");
+    }
+
+    #[test]
+    fn resolve_and_migrate_upgrade_lowercase_and_stem_labels() {
+        let mut explorer_low = new_item("app", r"c:\windows\explorer.exe", "explorer");
+        assert_eq!(resolve_dock_item_label(&explorer_low, None), "文件管理器");
+        assert!(migrate_dock_item_label(&mut explorer_low));
+        assert_eq!(explorer_low.label, "文件管理器");
+
+        let mut notepad_stem = new_item("app", r"C:\Windows\System32\notepad.exe", "Notepad");
+        assert_eq!(resolve_dock_item_label(&notepad_stem, None), "记事本");
+        assert!(migrate_dock_item_label(&mut notepad_stem));
+        assert_eq!(notepad_stem.label, "记事本");
+
+        let mut edge_low = new_item("app", r"c:\fake\msedge.exe", "msedge");
+        assert_eq!(resolve_dock_item_label(&edge_low, None), "Microsoft Edge");
+        assert!(migrate_dock_item_label(&mut edge_low));
+        assert_eq!(edge_low.label, "Microsoft Edge");
+
+        let mut custom = new_item("app", r"c:\windows\explorer.exe", "我的文件");
+        assert_eq!(resolve_dock_item_label(&custom, None), "我的文件");
+        assert!(!migrate_dock_item_label(&mut custom));
+
+        let mut mixed_custom = new_item("app", r"c:\fake\customtool.exe", "My Custom App");
+        assert_eq!(resolve_dock_item_label(&mixed_custom, None), "My Custom App");
+        assert!(!migrate_dock_item_label(&mut mixed_custom));
+
+        let mut low_fallback = new_item("app", r"c:\fake\cc-switch.exe", "cc-switch");
+        assert_eq!(resolve_dock_item_label(&low_fallback, None), "Cc-Switch");
+        assert!(migrate_dock_item_label(&mut low_fallback));
+        assert_eq!(low_fallback.label, "Cc-Switch");
+    }
+
+    #[test]
+    fn item_from_path_resolves_real_system_chinese_name_and_case() {
+        let win_dir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
+        let explorer_lower = format!(r"{}\explorer.exe", win_dir.to_lowercase());
+        if Path::new(&explorer_lower).is_file() {
+            let item = item_from_path(&explorer_lower).expect("explorer item");
+            assert_eq!(item.label, "文件管理器");
+            assert!(item.target.ends_with("explorer.exe"));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bat = dir.path().join("MyTestTool.bat");
+        std::fs::write(&bat, b"@echo off\n").unwrap();
+        let lower_bat = bat.to_string_lossy().to_lowercase();
+        let bat_item = item_from_path(&lower_bat).expect("bat item");
+        assert_eq!(bat_item.label, "MyTestTool");
+        assert!(bat_item.target.ends_with("MyTestTool.bat"));
     }
 
     #[test]

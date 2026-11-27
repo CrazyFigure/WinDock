@@ -18,12 +18,11 @@ use windows::Win32::Graphics::Gdi::{
     DIB_RGB_COLORS, HBITMAP, HGDIOBJ,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
-    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, STGM_READ,
+    CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
 };
 use windows::Win32::UI::Shell::{
-    IShellItem, IShellItemImageFactory, IShellLinkW, ShellLink, SHCreateItemFromParsingName,
-    SHDefExtractIconW, SIIGBF_ICONONLY, SIIGBF_RESIZETOFIT,
+    IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SHDefExtractIconW,
+    SIIGBF_ICONONLY, SIIGBF_RESIZETOFIT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{HICON, PostMessageW};
 
@@ -292,23 +291,9 @@ pub fn worker_extract_from_file(req_path: &Path) {
 
 /// 读取 .lnk 的目标路径（不解析网络路径）。
 pub fn read_lnk_target(path: &Path) -> Option<String> {
-    unsafe {
-        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
-        let pf: IPersistFile = link.cast().ok()?;
-        if pf.Load(PCWSTR(wide(path).as_ptr()), STGM_READ).is_err() {
-            return None;
-        }
-        let mut buf = [0u16; 1024];
-        if link
-            .GetPath(&mut buf, std::ptr::null_mut(), windows::Win32::UI::Shell::SLGP_RAWPATH.0 as u32)
-            .is_ok()
-        {
-            let s = crate::win32::from_wide(&buf);
-            if s.is_empty() { None } else { Some(s) }
-        } else {
-            None
-        }
-    }
+    crate::win32::read_lnk(path)
+        .map(|info| info.target)
+        .filter(|target| !target.is_empty())
 }
 
 /// 非 .exe 的运行映像优先读取内嵌资源，使用独立缓存键避开旧的文件类型图标。
