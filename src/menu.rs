@@ -13,7 +13,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP,
+    TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -154,8 +154,9 @@ impl ContextMenu {
         self.dpi = dpi;
         self.rebuild_font();
         unsafe {
+            // 使用非激活悬浮窗样式，弹出自绘菜单时不抢夺前台应用焦点（防止 Win11 Mica 窗口失焦变色）
             let Ok(hwnd) = CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
                 wide_static(CLASS_MENU),
                 w!(""),
                 WS_POPUP,
@@ -193,6 +194,20 @@ impl ContextMenu {
     /// 是否仍有展开或收起动画需要逐帧推进。
     pub fn is_animating(&self) -> bool {
         self.drawer.is_animating(self.visible)
+    }
+
+    /// 当前是否有键盘或鼠标悬停高亮的菜单项。
+    pub fn has_hover(&self) -> bool {
+        self.hover.is_some()
+    }
+
+    /// 返回菜单卡片在屏幕坐标系中的当前可见区域（不含顶部透明间距）。
+    pub fn visible_screen_rect(&self) -> Option<RECT> {
+        if !self.visible {
+            return None;
+        }
+        let wr = crate::win32::window_rect(self.hwnd)?;
+        self.drawer.visible_screen_rect(wr, self.w, self.h)
     }
 
     fn card_rect(&self) -> RECT {
@@ -385,10 +400,9 @@ impl ContextMenu {
             let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, left, win_top, self.w, self.h, SWP_NOACTIVATE | SWP_NOSENDCHANGING);
             self.render();
             if !was_visible {
-                let _ = ShowWindow(self.hwnd, SW_SHOW);
+                // 保持原前台窗口激活状态，避免破坏背后窗口的 Mica/亚克力材质
+                let _ = ShowWindow(self.hwnd, SW_SHOWNA);
             }
-            let _ = SetForegroundWindow(self.hwnd);
-            let _ = SetFocus(self.hwnd);
         }
     }
 
@@ -693,6 +707,7 @@ impl ContextMenu {
 
 unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         WM_MOUSEMOVE => {
             let x = get_x_lparam(lparam.0);
             let y = get_y_lparam(lparam.0);
@@ -762,11 +777,21 @@ mod tests {
         let anchor = RECT { left: 120, top: 0, right: 170, bottom: 30 };
         let app = Appearance::default();
 
-        // 1. 顶部栏锚定菜单：首帧即探出部分轮廓并贴紧顶部栏下沿裁切
+        // 1. 顶部栏锚定菜单：首帧即探出部分轮廓并贴紧顶部栏下沿裁切，且保持非激活悬浮窗样式
         menu.open_anchored(std::ptr::null_mut(), items.clone(), anchor, 96, false, HWND::default(), &app);
         assert!(menu.is_open());
         assert!(menu.anchored);
         assert!(menu.is_animating());
+        unsafe {
+            let ex = GetWindowLongPtrW(menu.hwnd, GWL_EXSTYLE) as u32;
+            assert_ne!(ex & WS_EX_NOACTIVATE.0, 0, "自绘菜单必须具备 WS_EX_NOACTIVATE 防止抢夺前景焦点");
+            assert_eq!(
+                SendMessageW(menu.hwnd, WM_MOUSEACTIVATE, WPARAM(0), LPARAM(0)).0,
+                MA_NOACTIVATE as isize
+            );
+            assert_ne!(GetForegroundWindow(), menu.hwnd, "打开自绘菜单不应改变前台激活窗口");
+        }
+        assert!(menu.visible_screen_rect().is_some());
         assert!(menu.drawer.card_top < menu.drawer.resting_card_top);
         assert!(menu.drawer.card_top + menu.drawer.card_h > 0);
         let mut wr = RECT::default();

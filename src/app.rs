@@ -3,7 +3,7 @@
 //! 生命周期顺序（安全前置门禁）：创建双栏窗口 → 守护进程握手 → 落盘恢复记录 → 隐藏任务栏。
 //! 退出顺序：撤销 AppBar → 恢复任务栏 → 通知守护进程 → 清除恢复标记。
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::os::windows::io::IntoRawHandle;
 use std::os::windows::process::CommandExt;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
@@ -16,7 +16,9 @@ use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::System::Threading::{
     CreateMutexW, GetCurrentProcess, TerminateProcess, WaitForSingleObject,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, MOD_SHIFT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    MOD_ALT, MOD_CONTROL, MOD_SHIFT, VK_DOWN, VK_ESCAPE, VK_LWIN, VK_RETURN, VK_RWIN, VK_UP,
+};
 use windows::Win32::UI::Shell::{Shell_NotifyIconW, NIIF_INFO, NIF_INFO, NIM_MODIFY, NOTIFYICONDATAW};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -49,6 +51,11 @@ pub const WM_APP_TRAY: u32 = WM_APP + 2;
 pub const WM_APP_COLOR: u32 = WM_APP + 32;
 pub const WM_APP_DOCK_COLOR: u32 = WM_APP + 33;
 pub const WM_APP_UPDATE: u32 = WM_APP + 50;
+pub const WM_APP_OVERLAY_DISMISS: u32 = WM_APP + 60;
+pub const WM_APP_OVERLAY_WHEEL: u32 = WM_APP + 61;
+pub const WM_APP_OVERLAY_KEY: u32 = WM_APP + 62;
+pub const WM_APP_PANEL_DRAG_MOVE: u32 = WM_APP + 63;
+pub const WM_APP_PANEL_DRAG_UP: u32 = WM_APP + 64;
 
 pub const IPC_SETTINGS: usize = 1;
 pub const IPC_TOGGLE_DOCK: usize = 2;
@@ -375,6 +382,246 @@ fn foreground_has_menu() -> bool {
     found && (info.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE)).0 != 0
 }
 
+/// 非激活顶部栏浮层（菜单/收纳格/状态面板）的底层输入钩子共享快照。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct OverlayHookState {
+    main_hwnd: isize,
+    generation: usize,
+    overlay_rects: Vec<RECT>,
+    topbar_toggle_rects: Vec<RECT>,
+    popover_rect: Option<RECT>,
+    context_menu_open: bool,
+    context_menu_has_hover: bool,
+    panel_dragging_slider: bool,
+    panel_win_rect: Option<RECT>,
+    tray_menu_active: bool,
+}
+
+impl OverlayHookState {
+    fn has_active_overlay(&self) -> bool {
+        self.context_menu_open
+            || self.popover_rect.is_some()
+            || self.panel_dragging_slider
+            || !self.overlay_rects.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MouseHookDecision {
+    PassThrough,
+    DismissOverlay,
+    ForwardPanelDragMove,
+    ForwardPanelDragUp,
+    ConsumePopoverWheel(i16),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyHookDecision {
+    PassThrough,
+    ConsumeAndDispatch(u32),
+    PassAndDismiss,
+}
+
+/// 判断顶部栏命中区域是否为展开/切换浮层或下拉菜单的按钮（点击时交由 TopBar 自身切换逻辑）。
+fn is_topbar_overlay_toggle_hit(hit: &Hit) -> bool {
+    matches!(
+        hit,
+        Hit::ProductMenu
+            | Hit::AppMenu
+            | Hit::MenuFile
+            | Hit::MenuWindow
+            | Hit::MenuGo
+            | Hit::TrayToggle
+            | Hit::Ime
+            | Hit::Network
+            | Hit::Brightness
+            | Hit::Volume
+            | Hit::Battery
+            | Hit::Control
+            | Hit::Clock
+    )
+}
+
+/// 将屏幕坐标 `(x, y)` 打包为 `LPARAM`（支持多屏负坐标）。
+#[inline]
+fn pack_point_lparam(x: i32, y: i32) -> isize {
+    let lx = (x.clamp(i16::MIN as i32, i16::MAX as i32) as i16 as u16) as usize;
+    let ly = (y.clamp(i16::MIN as i32, i16::MAX as i32) as i16 as u16) as usize;
+    (lx | (ly << 16)) as isize
+}
+
+/// 评估底层鼠标事件在非激活浮层开启时的路由决策（纯逻辑，便于单测覆盖全部边界）。
+fn eval_mouse_ll(state: &OverlayHookState, msg: u32, pt: POINT, wheel_delta: i16) -> MouseHookDecision {
+    if !state.has_active_overlay() {
+        return MouseHookDecision::PassThrough;
+    }
+    // 拖拽亮度/音量滑块期间：非激活窗口的 SetCapture 无法接收窗外事件，通过钩子补传移动与抬起
+    if state.panel_dragging_slider {
+        match msg {
+            WM_MOUSEMOVE => {
+                if state.panel_win_rect.is_none_or(|r| !crate::win32::rect_contains(r, pt.x, pt.y)) {
+                    return MouseHookDecision::ForwardPanelDragMove;
+                }
+                return MouseHookDecision::PassThrough;
+            }
+            WM_LBUTTONUP => return MouseHookDecision::ForwardPanelDragUp,
+            WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => return MouseHookDecision::PassThrough,
+            _ => {}
+        }
+    }
+    if msg == WM_MOUSEWHEEL {
+        if !state.tray_menu_active
+            && state.popover_rect.is_some_and(|r| crate::win32::rect_contains(r, pt.x, pt.y))
+        {
+            return MouseHookDecision::ConsumePopoverWheel(wheel_delta);
+        }
+        return MouseHookDecision::PassThrough;
+    }
+    if matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN) {
+        if state.tray_menu_active {
+            return MouseHookDecision::PassThrough;
+        }
+        if state.overlay_rects.iter().any(|&r| crate::win32::rect_contains(r, pt.x, pt.y)) {
+            return MouseHookDecision::PassThrough;
+        }
+        if state.topbar_toggle_rects.iter().any(|&r| crate::win32::rect_contains(r, pt.x, pt.y)) {
+            return MouseHookDecision::PassThrough;
+        }
+        return MouseHookDecision::DismissOverlay;
+    }
+    MouseHookDecision::PassThrough
+}
+
+/// 评估底层键盘事件在非激活浮层开启时的路由决策（Esc 关闭、菜单方向/回车导航、Win 键自动收起）。
+fn eval_keyboard_ll(state: &OverlayHookState, msg: u32, vk: u32, alt_down: bool) -> KeyHookDecision {
+    if !state.has_active_overlay() || state.tray_menu_active {
+        return KeyHookDecision::PassThrough;
+    }
+    if msg != WM_KEYDOWN && msg != WM_SYSKEYDOWN {
+        return KeyHookDecision::PassThrough;
+    }
+    if vk == VK_LWIN.0 as u32 || vk == VK_RWIN.0 as u32 {
+        return KeyHookDecision::PassAndDismiss;
+    }
+    if msg != WM_KEYDOWN || alt_down {
+        return KeyHookDecision::PassThrough;
+    }
+    if vk == VK_ESCAPE.0 as u32 {
+        return KeyHookDecision::ConsumeAndDispatch(vk);
+    }
+    if state.context_menu_open
+        && (vk == VK_UP.0 as u32 || vk == VK_DOWN.0 as u32 || vk == VK_RETURN.0 as u32)
+    {
+        return KeyHookDecision::ConsumeAndDispatch(vk);
+    }
+    KeyHookDecision::PassThrough
+}
+
+#[derive(Default)]
+struct OverlayHooks {
+    mouse: HHOOK,
+    keyboard: HHOOK,
+    state: OverlayHookState,
+}
+
+thread_local! {
+    // 底层钩子在主消息线程安装并回调，使用线程局部存储避免跨线程锁竞争
+    static OVERLAY_HOOKS: RefCell<OverlayHooks> = RefCell::new(OverlayHooks::default());
+}
+
+/// 卸载当前线程安装的非激活浮层输入钩子并清空共享状态。
+fn uninstall_overlay_hooks() {
+    OVERLAY_HOOKS.with(|slot| {
+        if let Ok(mut hooks) = slot.try_borrow_mut() {
+            unsafe {
+                if !hooks.mouse.is_invalid() {
+                    let _ = UnhookWindowsHookEx(hooks.mouse);
+                    hooks.mouse = HHOOK::default();
+                }
+                if !hooks.keyboard.is_invalid() {
+                    let _ = UnhookWindowsHookEx(hooks.keyboard);
+                    hooks.keyboard = HHOOK::default();
+                }
+            }
+            hooks.state = OverlayHookState::default();
+        }
+    });
+}
+
+unsafe extern "system" fn overlay_mouse_ll_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0 && lparam.0 != 0 {
+        let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+        let msg = wparam.0 as u32;
+        let wheel_delta = crate::win32::hiword(info.mouseData as usize) as i16;
+        let picked = OVERLAY_HOOKS.with(|slot| {
+            slot.try_borrow().ok().map(|hooks| {
+                (
+                    hooks.state.main_hwnd,
+                    hooks.state.generation,
+                    eval_mouse_ll(&hooks.state, msg, info.pt, wheel_delta),
+                )
+            })
+        });
+        if let Some((main_hwnd, generation, decision)) = picked {
+            if main_hwnd != 0 {
+                let target = HWND(main_hwnd as *mut _);
+                match decision {
+                    MouseHookDecision::PassThrough => {}
+                    MouseHookDecision::DismissOverlay => {
+                        let _ = PostMessageW(target, WM_APP_OVERLAY_DISMISS, WPARAM(generation), LPARAM(0));
+                    }
+                    MouseHookDecision::ForwardPanelDragMove => {
+                        let lp = pack_point_lparam(info.pt.x, info.pt.y);
+                        let _ = PostMessageW(target, WM_APP_PANEL_DRAG_MOVE, WPARAM(generation), LPARAM(lp));
+                    }
+                    MouseHookDecision::ForwardPanelDragUp => {
+                        let lp = pack_point_lparam(info.pt.x, info.pt.y);
+                        let _ = PostMessageW(target, WM_APP_PANEL_DRAG_UP, WPARAM(generation), LPARAM(lp));
+                    }
+                    MouseHookDecision::ConsumePopoverWheel(delta) => {
+                        let _ = PostMessageW(target, WM_APP_OVERLAY_WHEEL, WPARAM(generation), LPARAM(delta as isize));
+                        return LRESULT(1);
+                    }
+                }
+            }
+        }
+    }
+    CallNextHookEx(None, code, wparam, lparam)
+}
+
+unsafe extern "system" fn overlay_keyboard_ll_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0 && lparam.0 != 0 {
+        let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        let msg = wparam.0 as u32;
+        let alt_down = (info.flags.0 & LLKHF_ALTDOWN.0) != 0;
+        let picked = OVERLAY_HOOKS.with(|slot| {
+            slot.try_borrow().ok().map(|hooks| {
+                (
+                    hooks.state.main_hwnd,
+                    hooks.state.generation,
+                    eval_keyboard_ll(&hooks.state, msg, info.vkCode, alt_down),
+                )
+            })
+        });
+        if let Some((main_hwnd, generation, decision)) = picked {
+            if main_hwnd != 0 {
+                let target = HWND(main_hwnd as *mut _);
+                match decision {
+                    KeyHookDecision::PassThrough => {}
+                    KeyHookDecision::PassAndDismiss => {
+                        let _ = PostMessageW(target, WM_APP_OVERLAY_DISMISS, WPARAM(generation), LPARAM(0));
+                    }
+                    KeyHookDecision::ConsumeAndDispatch(vk) => {
+                        let _ = PostMessageW(target, WM_APP_OVERLAY_KEY, WPARAM(generation), LPARAM(vk as isize));
+                        return LRESULT(1);
+                    }
+                }
+            }
+        }
+    }
+    CallNextHookEx(None, code, wparam, lparam)
+}
+
 pub struct App {
     pub hwnd: HWND,
     pub mutex: HANDLE,
@@ -396,6 +643,8 @@ pub struct App {
     pub status_panel: StatusPanel,
     pub topbar_menu: Option<(usize, Hit)>,
     pub status_panel_bar: Option<(usize, Hit)>,
+    pub overlay_generation: usize,
+    pub overlay_fg: Option<isize>,
     pub window_preview: WindowPreview,
     pub preview_leave_at: Option<Instant>,
     pub snap: MonitorState,
@@ -535,6 +784,8 @@ pub fn run(open_settings: bool) -> i32 {
         status_panel: StatusPanel::default(),
         topbar_menu: None,
         status_panel_bar: None,
+        overlay_generation: 0,
+        overlay_fg: None,
         window_preview: WindowPreview::default(),
         preview_leave_at: None,
         snap: monitor::snapshot(),
@@ -728,6 +979,7 @@ impl App {
         }
         self.frame_on = false;
         self.edge_timer_on = false;
+        uninstall_overlay_hooks();
         self.context_menu.destroy();
         self.status_panel.destroy();
         self.window_preview.destroy();
@@ -1506,6 +1758,7 @@ impl App {
             s.invalidate();
         }
         self.refresh_tray_tip();
+        self.sync_overlay_hooks();
     }
 
     // ---------- Dock 显隐状态机 ----------
@@ -1772,6 +2025,7 @@ impl App {
         let reduce = self.config.appearance.reduce_motion;
         let ptr = app_ptr() as isize;
         let mut any_overlay_closed = false;
+        let mut any_overlay_geometry_changed = false;
         for bar in &mut self.topbars {
             animating |= bar.tick_color(dt, transition);
             animating |= bar.tick_tray_anim(dt, reduce);
@@ -1786,6 +2040,7 @@ impl App {
                     }
                     if p_changed {
                         invalidate(bar.hwnd);
+                        any_overlay_geometry_changed = true;
                     }
                     if just_closed {
                         any_overlay_closed = true;
@@ -1802,11 +2057,14 @@ impl App {
                     let _ = SetWindowLongPtrW(sp_hwnd, GWLP_USERDATA, 0);
                 }
             }
-            let (sp_anim, _, just_closed) = self.status_panel.tick(dt, reduce);
+            let (sp_anim, sp_changed, just_closed) = self.status_panel.tick(dt, reduce);
             if !sp_hwnd.0.is_null() {
                 unsafe {
                     let _ = SetWindowLongPtrW(sp_hwnd, GWLP_USERDATA, ptr);
                 }
+            }
+            if sp_changed {
+                any_overlay_geometry_changed = true;
             }
             if just_closed {
                 self.status_panel_bar = None;
@@ -1821,11 +2079,14 @@ impl App {
                     let _ = SetWindowLongPtrW(cm_hwnd, GWLP_USERDATA, 0);
                 }
             }
-            let (cm_anim, _, just_closed) = self.context_menu.tick(dt, reduce);
+            let (cm_anim, cm_changed, just_closed) = self.context_menu.tick(dt, reduce);
             if !cm_hwnd.0.is_null() {
                 unsafe {
                     let _ = SetWindowLongPtrW(cm_hwnd, GWLP_USERDATA, ptr);
                 }
+            }
+            if cm_changed {
+                any_overlay_geometry_changed = true;
             }
             if just_closed {
                 self.topbar_menu = None;
@@ -1836,6 +2097,9 @@ impl App {
         if any_overlay_closed {
             self.sync_topbar_active();
             self.flush_pending_color_samples();
+        }
+        if any_overlay_geometry_changed || any_overlay_closed {
+            self.sync_overlay_hooks();
         }
         if !animating {
             unsafe {
@@ -1911,6 +2175,7 @@ impl App {
             self.refresh_entries();
             self.sync_shelf_items();
             self.on_state_changed();
+            self.dismiss_overlays_on_foreground_change();
             self.ensure_frame();
         }
         // 守护进程意外退出：先恢复任务栏，本会话暂停隐藏
@@ -2073,6 +2338,9 @@ impl App {
     // ---------- 设置 ----------
 
     pub fn open_settings(&mut self, page: Option<crate::settings::Page>) {
+        self.close_popover_immediate();
+        self.close_context_menu_immediate();
+        self.close_panel_immediate();
         if let Some(s) = self.settings.as_mut().filter(|s| s.is_open()) {
             s.activate();
             if let Some(p) = page {
@@ -2314,6 +2582,7 @@ impl App {
                     self.refresh_entries();
                     self.sync_shelf_items();
                     self.on_state_changed();
+                    self.dismiss_overlays_on_foreground_change();
                     self.ensure_frame();
                 }
             }
@@ -2336,7 +2605,7 @@ impl App {
 
     /// 在指定屏幕坐标弹出 macOS 风格自绘菜单。
     fn popup_at(&mut self, items: Vec<MenuItem>, ctx: MenuCtx, x: i32, y: i32) {
-        let prev_fg = HWND(self.snap.foreground as *mut _);
+        let prev_fg = self.live_external_foreground();
         self.tray_tip.clear(self.hwnd);
         self.tray_gate.clear_suppressed();
         self.clear_tray_context();
@@ -2349,6 +2618,7 @@ impl App {
         let ptr = app_ptr();
         let appearance = self.config.appearance.clone();
         self.context_menu.open(ptr, items, x, y, prev_fg, &appearance);
+        self.mark_overlay_opened();
     }
 
     /// 在顶部栏按钮下方弹出带抽屉滑出动效的下拉菜单并点亮对应按钮激活态。
@@ -2362,7 +2632,7 @@ impl App {
         dpi: u32,
         align_right: bool,
     ) {
-        let prev_fg = HWND(self.snap.foreground as *mut _);
+        let prev_fg = self.live_external_foreground();
         self.tray_tip.clear(self.hwnd);
         self.tray_gate.clear_suppressed();
         self.clear_tray_context();
@@ -2376,6 +2646,7 @@ impl App {
         let appearance = self.config.appearance.clone();
         self.context_menu
             .open_anchored(ptr, items, anchor, dpi, align_right, prev_fg, &appearance);
+        self.mark_overlay_opened();
         if self.context_menu.is_animating() {
             self.ensure_frame();
         }
@@ -2400,6 +2671,7 @@ impl App {
             self.topbar_menu = None;
         }
         self.sync_topbar_active();
+        self.sync_overlay_hooks();
         if animating {
             self.ensure_frame();
         } else {
@@ -2424,15 +2696,24 @@ impl App {
         }
         self.topbar_menu = None;
         self.sync_topbar_active();
+        self.sync_overlay_hooks();
         self.flush_pending_color_samples();
     }
 
     pub fn menu_mouse_move(&mut self, x: i32, y: i32) {
+        let had_hover = self.context_menu.has_hover();
         self.context_menu.on_mouse_move(x, y);
+        if self.context_menu.has_hover() != had_hover {
+            self.sync_overlay_hooks();
+        }
     }
 
     pub fn menu_mouse_leave(&mut self) {
+        let had_hover = self.context_menu.has_hover();
         self.context_menu.on_mouse_leave();
+        if self.context_menu.has_hover() != had_hover {
+            self.sync_overlay_hooks();
+        }
     }
 
     pub fn menu_lbutton_down(&mut self, x: i32, y: i32) {
@@ -2443,16 +2724,22 @@ impl App {
         if let Some(id) = self.context_menu.on_lbutton_up(x, y) {
             self.topbar_menu = None;
             self.sync_topbar_active();
+            self.sync_overlay_hooks();
             self.on_menu(id);
         }
         self.flush_pending_color_samples();
     }
 
     pub fn menu_key_down(&mut self, vk: u32) {
+        let had_hover = self.context_menu.has_hover();
+        let was_open = self.context_menu.is_open();
         if let Some(id) = self.context_menu.on_key_down(vk) {
             self.topbar_menu = None;
             self.sync_topbar_active();
+            self.sync_overlay_hooks();
             self.on_menu(id);
+        } else if self.context_menu.is_open() != was_open || self.context_menu.has_hover() != had_hover {
+            self.sync_overlay_hooks();
         }
         self.flush_pending_color_samples();
     }
@@ -2531,6 +2818,7 @@ impl App {
         self.refresh_entries();
         self.sync_shelf_items();
         self.on_state_changed();
+        self.dismiss_overlays_on_foreground_change();
         self.ensure_frame();
         // 安排 200ms 尾随状态复查，确保 Win+D 还原动画结束后前台与最大化态完整同步
         unsafe {
@@ -3297,6 +3585,7 @@ impl App {
             is_popover,
             menu: None,
         });
+        self.sync_overlay_hooks();
     }
 
     fn clear_tray_context(&mut self) {
@@ -3313,6 +3602,7 @@ impl App {
                 }
             }
             self.flush_pending_color_samples();
+            self.sync_overlay_hooks();
         }
     }
 
@@ -3809,6 +4099,189 @@ impl App {
         }
     }
 
+    fn has_open_overlay(&self) -> bool {
+        self.context_menu.is_open()
+            || self.status_panel.is_open()
+            || self.topbars.iter().any(|b| b.popover.as_ref().is_some_and(|p| p.is_open()))
+    }
+
+    /// 读取当前真实的外部前台窗口（过滤 WinDock 浮窗与瞬态壳层弹窗，避免切换失真）。
+    fn live_external_foreground(&self) -> HWND {
+        let fg = unsafe { GetForegroundWindow() };
+        if !fg.0.is_null() {
+            let class = class_name(fg);
+            if !monitor::is_our_window(&class) && !monitor::is_transient_tray_or_popup_class(&class) {
+                return fg;
+            }
+        }
+        HWND(self.snap.foreground as *mut _)
+    }
+
+    /// 记录新一轮非激活浮层开启代数与背景前台窗口，并立即同步底层输入钩子。
+    fn mark_overlay_opened(&mut self) {
+        self.overlay_generation = self.overlay_generation.wrapping_add(1);
+        self.overlay_fg = Some(self.live_external_foreground().0 as isize);
+        self.sync_overlay_hooks();
+    }
+
+    /// 根据当前开启的非激活浮层状态动态安装、更新或卸载 `WH_MOUSE_LL` / `WH_KEYBOARD_LL` 钩子。
+    fn sync_overlay_hooks(&self) {
+        if self.hwnd.0.is_null() || self.exiting || !self.has_open_overlay() {
+            uninstall_overlay_hooks();
+            return;
+        }
+        let mut overlay_rects = Vec::new();
+        if self.context_menu.is_open() {
+            if let Some(r) = self.context_menu.visible_screen_rect() {
+                overlay_rects.push(r);
+            }
+        }
+        let mut panel_win_rect = None;
+        if self.status_panel.is_open() {
+            if let Some(r) = self.status_panel.visible_screen_rect() {
+                overlay_rects.push(r);
+            }
+            panel_win_rect = crate::win32::window_rect(self.status_panel.hwnd);
+        }
+        let mut popover_rect = None;
+        for bar in &self.topbars {
+            if let Some(p) = bar.popover.as_ref().filter(|p| p.is_open()) {
+                if let Some(r) = p.visible_screen_rect() {
+                    overlay_rects.push(r);
+                    popover_rect = Some(r);
+                }
+            }
+        }
+        let mut topbar_toggle_rects = Vec::new();
+        for bar in &self.topbars {
+            if !bar.visible || bar.hidden_by_fullscreen {
+                continue;
+            }
+            let Some(wr) = crate::win32::window_rect(bar.hwnd) else { continue };
+            for (r, hit) in &bar.hits {
+                if is_topbar_overlay_toggle_hit(hit) {
+                    topbar_toggle_rects.push(RECT {
+                        left: wr.left + r.left,
+                        top: wr.top + r.top,
+                        right: wr.left + r.right,
+                        bottom: wr.top + r.bottom,
+                    });
+                }
+            }
+        }
+        let next_state = OverlayHookState {
+            main_hwnd: self.hwnd.0 as isize,
+            generation: self.overlay_generation,
+            overlay_rects,
+            topbar_toggle_rects,
+            popover_rect,
+            context_menu_open: self.context_menu.is_open(),
+            context_menu_has_hover: self.context_menu.has_hover(),
+            panel_dragging_slider: self.status_panel.is_open() && self.status_panel.is_dragging_slider(),
+            panel_win_rect,
+            tray_menu_active: self.tray_gate.has_active_menu(),
+        };
+        OVERLAY_HOOKS.with(|slot| {
+            if let Ok(mut hooks) = slot.try_borrow_mut() {
+                hooks.state = next_state;
+                unsafe {
+                    if hooks.mouse.is_invalid() {
+                        hooks.mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(overlay_mouse_ll_proc), None, 0)
+                            .unwrap_or_default();
+                    }
+                    if hooks.keyboard.is_invalid() {
+                        hooks.keyboard = SetWindowsHookExW(WH_KEYBOARD_LL, Some(overlay_keyboard_ll_proc), None, 0)
+                            .unwrap_or_default();
+                    }
+                }
+            }
+        });
+    }
+
+    /// 当非激活浮层开启期间外部前台应用发生切换（如 Alt+Tab / Win+D）时自动收起浮层。
+    fn dismiss_overlays_on_foreground_change(&mut self) {
+        if !self.has_open_overlay()
+            || self.tray_gate.has_active_menu()
+            || matches!(
+                self.tray_work,
+                Some(TrayWork::Refresh { reading_overflow: true, .. } | TrayWork::Click { .. })
+            )
+        {
+            return;
+        }
+        let cur_fg = self.live_external_foreground().0 as isize;
+        if self.overlay_fg.is_some_and(|prev| prev != cur_fg) {
+            self.close_popover();
+            self.close_context_menu();
+            self.close_panel();
+        }
+    }
+
+    fn on_overlay_dismiss(&mut self, generation: usize) {
+        if generation != self.overlay_generation || self.tray_gate.has_active_menu() {
+            return;
+        }
+        self.close_popover();
+        self.close_context_menu();
+        self.close_panel();
+    }
+
+    fn on_overlay_wheel(&mut self, generation: usize, delta: i16) {
+        if generation != self.overlay_generation || self.tray_gate.has_active_menu() {
+            return;
+        }
+        let open_hwnd = self
+            .topbars
+            .iter()
+            .find_map(|b| b.popover.as_ref().filter(|p| p.is_open()).map(|p| p.hwnd));
+        if let Some(hwnd) = open_hwnd {
+            self.popover_wheel(hwnd, delta);
+        }
+    }
+
+    fn on_overlay_key(&mut self, generation: usize, vk: u32) {
+        if generation != self.overlay_generation || self.tray_gate.has_active_menu() {
+            return;
+        }
+        if vk == VK_ESCAPE.0 as u32 {
+            self.close_popover();
+            self.close_context_menu();
+            self.close_panel();
+            return;
+        }
+        if self.context_menu.is_open() {
+            self.menu_key_down(vk);
+        }
+    }
+
+    fn panel_drag_move_screen(&mut self, generation: usize, sx: i32, sy: i32) {
+        if generation != self.overlay_generation
+            || !self.status_panel.is_open()
+            || !self.status_panel.is_dragging_slider()
+        {
+            return;
+        }
+        let Some(wr) = crate::win32::window_rect(self.status_panel.hwnd) else {
+            return;
+        };
+        self.panel_mouse_move(sx - wr.left, sy - wr.top);
+    }
+
+    fn panel_drag_up_screen(&mut self, generation: usize, sx: i32, sy: i32) {
+        if generation != self.overlay_generation
+            || !self.status_panel.is_open()
+            || !self.status_panel.is_dragging_slider()
+        {
+            return;
+        }
+        let Some(wr) = crate::win32::window_rect(self.status_panel.hwnd) else {
+            self.status_panel.cancel_drag();
+            self.sync_overlay_hooks();
+            return;
+        };
+        self.panel_lbutton_up(sx - wr.left, sy - wr.top);
+    }
+
     fn toggle_status_panel(&mut self, bi: usize, kind: PanelKind, hit: Hit) {
         if self.status_panel.is_open()
             && self.status_panel.kind == kind
@@ -3817,7 +4290,7 @@ impl App {
             self.close_panel();
             return;
         }
-        let prev_fg = HWND(self.snap.foreground as *mut _);
+        let prev_fg = self.live_external_foreground();
         self.tray_tip.clear(self.hwnd);
         self.tray_gate.clear_suppressed();
         self.clear_tray_context();
@@ -3845,6 +4318,7 @@ impl App {
         self.status_panel_bar = Some((bi, hit));
         self.status_panel.open(ptr, main_hwnd, kind, anchor, dpi, prev_fg, &appearance);
         self.sync_topbar_active();
+        self.mark_overlay_opened();
         if self.status_panel.is_animating() {
             self.ensure_frame();
         }
@@ -3870,6 +4344,7 @@ impl App {
             self.status_panel_bar = None;
         }
         self.sync_topbar_active();
+        self.sync_overlay_hooks();
         if animating {
             self.ensure_frame();
         } else {
@@ -3894,6 +4369,7 @@ impl App {
         }
         self.status_panel_bar = None;
         self.sync_topbar_active();
+        self.sync_overlay_hooks();
         self.flush_pending_color_samples();
     }
 
@@ -3909,20 +4385,25 @@ impl App {
     pub fn panel_lbutton_down(&mut self, x: i32, y: i32) {
         let act = self.status_panel.on_lbutton_down(x, y);
         self.handle_panel_action(act);
+        self.sync_overlay_hooks();
     }
 
     pub fn panel_lbutton_up(&mut self, x: i32, y: i32) {
         let act = self.status_panel.on_lbutton_up(self.hwnd, x, y);
         self.handle_panel_action(act);
+        self.sync_overlay_hooks();
     }
 
     pub fn panel_capture_lost(&mut self) {
-        self.close_panel();
+        // 非激活状态面板失捕时仅重置滑块拖拽态，避免误关面板
+        self.status_panel.cancel_drag();
+        self.sync_overlay_hooks();
     }
 
     fn on_panel_data(&mut self, lparam: isize) {
         let (token, data) = *unsafe { Box::from_raw(lparam as *mut (u64, NetworkData)) };
         self.status_panel.on_network_data(token, data);
+        self.sync_overlay_hooks();
     }
 
     fn handle_panel_action(&mut self, act: PanelAction) {
@@ -3952,7 +4433,7 @@ impl App {
                 }
             }
             PanelAction::ImeChanged { close } => {
-                let cur = status::ime_label(HWND(self.snap.foreground as *mut _));
+                let cur = status::ime_label(self.live_external_foreground());
                 self.last_ime = cur.clone();
                 for bar in &mut self.topbars {
                     bar.status.ime = cur.clone();
@@ -3969,7 +4450,7 @@ impl App {
                 let _ = self.store.save_config(&self.config);
                 self.apply_config(false);
                 if self.status_panel.is_open() {
-                    let prev_fg = HWND(self.snap.foreground as *mut _);
+                    let prev_fg = self.live_external_foreground();
                     let bi = self.status_panel_bar.as_ref().map(|(idx, _)| *idx).unwrap_or(0);
                     let (anchor, dpi) = self
                         .topbars
@@ -3993,6 +4474,7 @@ impl App {
                     let main_hwnd = self.hwnd;
                     let appearance = self.config.appearance.clone();
                     self.status_panel.open(ptr, main_hwnd, PanelKind::Control, anchor, dpi, prev_fg, &appearance);
+                    self.mark_overlay_opened();
                 }
             }
             PanelAction::SwitchKind(kind) => {
@@ -4072,7 +4554,7 @@ impl App {
                 bar.pinned.clone(),
             )
         };
-        let prev_fg = HWND(self.snap.foreground as *mut _);
+        let prev_fg = self.live_external_foreground();
         let ptr = app_ptr();
         let appearance = self.config.appearance.clone();
         // 多屏模式下先立即收起其他显示器上的收纳浮层，保持单一活动浮层
@@ -4108,6 +4590,7 @@ impl App {
             false
         };
         self.sync_topbar_active();
+        self.mark_overlay_opened();
         if need_anim {
             self.ensure_frame();
         }
@@ -4163,6 +4646,7 @@ impl App {
             }
         }
         self.sync_topbar_active();
+        self.sync_overlay_hooks();
         if animating {
             self.ensure_frame();
         }
@@ -4195,6 +4679,7 @@ impl App {
             self.sync_topbar_active();
             self.flush_pending_color_samples();
         }
+        self.sync_overlay_hooks();
     }
 
     /// Explorer 或应用菜单接管焦点时收纳格仍然可见，菜单自行关闭后再收起。
@@ -4384,6 +4869,19 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         }
         crate::topbar::tray_mirror::WM_APP_LIVE_ICON_CHANGED => app.redraw_shelf_views(),
         crate::topbar::panel::WM_APP_PANEL_DATA => app.on_panel_data(lparam.0),
+        WM_APP_OVERLAY_DISMISS => app.on_overlay_dismiss(wparam.0),
+        WM_APP_OVERLAY_WHEEL => app.on_overlay_wheel(wparam.0, lparam.0 as i16),
+        WM_APP_OVERLAY_KEY => app.on_overlay_key(wparam.0, lparam.0 as u32),
+        WM_APP_PANEL_DRAG_MOVE => app.panel_drag_move_screen(
+            wparam.0,
+            crate::win32::get_x_lparam(lparam.0),
+            crate::win32::get_y_lparam(lparam.0),
+        ),
+        WM_APP_PANEL_DRAG_UP => app.panel_drag_up_screen(
+            wparam.0,
+            crate::win32::get_x_lparam(lparam.0),
+            crate::win32::get_y_lparam(lparam.0),
+        ),
         crate::topbar::WM_APP_APPBAR => {}
         WM_APP_UPDATE => app.on_update(lparam.0),
         crate::update::WM_APP_UPDATE_PROGRESS => app.on_update_progress(wparam.0),
@@ -4678,6 +5176,113 @@ mod tests {
         }
         for mut b in topbars {
             b.destroy();
+        }
+    }
+
+    #[test]
+    fn non_activating_overlay_mouse_hook_routes_clicks_wheel_and_slider_drag() {
+        let card = RECT { left: 1600, top: 34, right: 1880, bottom: 260 };
+        let toggle = RECT { left: 1700, top: 0, right: 1740, bottom: 30 };
+        let mut st = OverlayHookState {
+            main_hwnd: 100,
+            generation: 7,
+            overlay_rects: vec![card],
+            topbar_toggle_rects: vec![toggle],
+            popover_rect: Some(card),
+            context_menu_open: false,
+            context_menu_has_hover: false,
+            panel_dragging_slider: false,
+            panel_win_rect: Some(RECT { left: 1600, top: 30, right: 1880, bottom: 260 }),
+            tray_menu_active: false,
+        };
+
+        // 点击浮层卡片内部与顶部栏切换按钮本身不提前关闭浮层，点透明间隙或外部应用则关闭
+        assert_eq!(eval_mouse_ll(&st, WM_LBUTTONDOWN, POINT { x: 1700, y: 100 }, 0), MouseHookDecision::PassThrough);
+        assert_eq!(eval_mouse_ll(&st, WM_LBUTTONDOWN, POINT { x: 1720, y: 15 }, 0), MouseHookDecision::PassThrough);
+        assert_eq!(eval_mouse_ll(&st, WM_LBUTTONDOWN, POINT { x: 1700, y: 31 }, 0), MouseHookDecision::DismissOverlay);
+        assert_eq!(eval_mouse_ll(&st, WM_RBUTTONDOWN, POINT { x: 400, y: 500 }, 0), MouseHookDecision::DismissOverlay);
+
+        // 收纳浮层悬停滚轮直接转发并消费，外部滚轮透传
+        assert_eq!(eval_mouse_ll(&st, WM_MOUSEWHEEL, POINT { x: 1700, y: 100 }, -120), MouseHookDecision::ConsumePopoverWheel(-120));
+        assert_eq!(eval_mouse_ll(&st, WM_MOUSEWHEEL, POINT { x: 500, y: 500 }, -120), MouseHookDecision::PassThrough);
+
+        // 原生托盘右键菜单接管期间放行外部点击与滚轮，避免误关收纳格
+        st.tray_menu_active = true;
+        assert_eq!(eval_mouse_ll(&st, WM_LBUTTONDOWN, POINT { x: 400, y: 500 }, 0), MouseHookDecision::PassThrough);
+        assert_eq!(eval_mouse_ll(&st, WM_MOUSEWHEEL, POINT { x: 1700, y: 100 }, 120), MouseHookDecision::PassThrough);
+
+        // 滑块拖拽期间鼠标移出面板范围仍补传移动与抬起，移回面板内部则走窗口原生消息
+        st.tray_menu_active = false;
+        st.panel_dragging_slider = true;
+        assert_eq!(eval_mouse_ll(&st, WM_MOUSEMOVE, POINT { x: 1900, y: 120 }, 0), MouseHookDecision::ForwardPanelDragMove);
+        assert_eq!(eval_mouse_ll(&st, WM_MOUSEMOVE, POINT { x: 1700, y: 120 }, 0), MouseHookDecision::PassThrough);
+        assert_eq!(eval_mouse_ll(&st, WM_LBUTTONUP, POINT { x: 1900, y: 120 }, 0), MouseHookDecision::ForwardPanelDragUp);
+    }
+
+    #[test]
+    fn non_activating_overlay_keyboard_hook_routes_escape_win_and_menu_nav() {
+        let mut st = OverlayHookState {
+            main_hwnd: 100,
+            generation: 3,
+            overlay_rects: vec![RECT { left: 10, top: 34, right: 200, bottom: 200 }],
+            topbar_toggle_rects: Vec::new(),
+            popover_rect: Some(RECT { left: 10, top: 34, right: 200, bottom: 200 }),
+            context_menu_open: false,
+            context_menu_has_hover: false,
+            panel_dragging_slider: false,
+            panel_win_rect: None,
+            tray_menu_active: false,
+        };
+
+        // 非菜单浮层仅拦截 Esc，并允许 Win 键在收起浮层后继续打开系统开始菜单
+        assert_eq!(eval_keyboard_ll(&st, WM_KEYDOWN, VK_ESCAPE.0 as u32, false), KeyHookDecision::ConsumeAndDispatch(VK_ESCAPE.0 as u32));
+        assert_eq!(eval_keyboard_ll(&st, WM_KEYDOWN, VK_DOWN.0 as u32, false), KeyHookDecision::PassThrough);
+        assert_eq!(eval_keyboard_ll(&st, WM_KEYDOWN, VK_LWIN.0 as u32, false), KeyHookDecision::PassAndDismiss);
+        assert_eq!(eval_keyboard_ll(&st, WM_SYSKEYDOWN, VK_RWIN.0 as u32, false), KeyHookDecision::PassAndDismiss);
+        assert_eq!(eval_keyboard_ll(&st, WM_KEYUP, VK_ESCAPE.0 as u32, false), KeyHookDecision::PassThrough);
+
+        // 下拉菜单打开后拦截上下/回车，但保留 Alt 组合键；原生托盘菜单接管期间完全放行
+        st.context_menu_open = true;
+        assert_eq!(eval_keyboard_ll(&st, WM_KEYDOWN, VK_DOWN.0 as u32, false), KeyHookDecision::ConsumeAndDispatch(VK_DOWN.0 as u32));
+        assert_eq!(eval_keyboard_ll(&st, WM_KEYDOWN, VK_UP.0 as u32, false), KeyHookDecision::ConsumeAndDispatch(VK_UP.0 as u32));
+        assert_eq!(eval_keyboard_ll(&st, WM_KEYDOWN, VK_RETURN.0 as u32, false), KeyHookDecision::ConsumeAndDispatch(VK_RETURN.0 as u32));
+        assert_eq!(eval_keyboard_ll(&st, WM_SYSKEYDOWN, VK_RETURN.0 as u32, true), KeyHookDecision::PassThrough);
+        st.tray_menu_active = true;
+        assert_eq!(eval_keyboard_ll(&st, WM_KEYDOWN, VK_ESCAPE.0 as u32, false), KeyHookDecision::PassThrough);
+    }
+
+    #[test]
+    fn topbar_toggle_hits_point_packing_and_ll_hooks_work() {
+        for hit in [
+            Hit::ProductMenu,
+            Hit::AppMenu,
+            Hit::MenuFile,
+            Hit::MenuWindow,
+            Hit::MenuGo,
+            Hit::TrayToggle,
+            Hit::Ime,
+            Hit::Network,
+            Hit::Brightness,
+            Hit::Volume,
+            Hit::Battery,
+            Hit::Control,
+            Hit::Clock,
+        ] {
+            assert!(is_topbar_overlay_toggle_hit(&hit));
+        }
+        assert!(!is_topbar_overlay_toggle_hit(&Hit::TrayIcon("k".into())));
+
+        let packed = pack_point_lparam(-1920, -300);
+        assert_eq!(crate::win32::get_x_lparam(packed), -1920);
+        assert_eq!(crate::win32::get_y_lparam(packed), -300);
+
+        unsafe {
+            let mh = SetWindowsHookExW(WH_MOUSE_LL, Some(overlay_mouse_ll_proc), None, 0)
+                .expect("WH_MOUSE_LL hook should install");
+            let kh = SetWindowsHookExW(WH_KEYBOARD_LL, Some(overlay_keyboard_ll_proc), None, 0)
+                .expect("WH_KEYBOARD_LL hook should install");
+            assert!(UnhookWindowsHookEx(mh).is_ok());
+            assert!(UnhookWindowsHookEx(kh).is_ok());
         }
     }
 }

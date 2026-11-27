@@ -2956,6 +2956,25 @@ impl DrawerAnim {
             eval_drawer_progress(self.anim_t, self.closing)
         }
     }
+
+    /// 根据窗口当前屏幕矩形与尺寸，计算抽屉弹窗正在屏幕上显示的卡片区域（剔除透明间距与未滑出裁切部分）。
+    pub fn visible_screen_rect(&self, win_rect: RECT, w: i32, h: i32) -> Option<RECT> {
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        let ch = if self.card_h > 0 { self.card_h } else { h };
+        let top = self.card_top.max(0);
+        let bottom = (self.card_top + ch).min(h);
+        if bottom <= top {
+            return None;
+        }
+        Some(RECT {
+            left: win_rect.left,
+            top: win_rect.top + top,
+            right: win_rect.left + w,
+            bottom: win_rect.top + bottom,
+        })
+    }
 }
 
 /// 绘制带实时电量填充与充电标识的 macOS 风格电池图标。

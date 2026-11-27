@@ -321,6 +321,22 @@ pub fn get_wheel_delta(w: usize) -> i16 {
     hiword(w) as i16
 }
 
+/// 判断屏幕或客户区坐标点是否落在半开矩形 `[left, right) × [top, bottom)` 内。
+#[inline]
+pub fn rect_contains(r: RECT, x: i32, y: i32) -> bool {
+    x >= r.left && x < r.right && y >= r.top && y < r.bottom
+}
+
+/// 读取窗口在屏幕坐标系中的外框矩形（句柄无效或查询失败时返回 None）。
+pub fn window_rect(hwnd: HWND) -> Option<RECT> {
+    if hwnd.0.is_null() {
+        return None;
+    }
+    let mut r = RECT::default();
+    unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut r).ok()? };
+    Some(r)
+}
+
 /// 把前台窗口切到指定窗口（绕过前台锁定的常见技巧：先按一下 Alt）。
 pub fn bring_to_front(hwnd: HWND) {
     unsafe {

@@ -46,7 +46,7 @@ use windows::Win32::System::Wmi::{
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::Ime::{ImmGetContext, ImmGetConversionStatus, ImmGetDefaultIMEWnd, ImmReleaseContext, IME_CMODE_NATIVE};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyboardLayout, GetKeyboardLayoutList, ReleaseCapture, SendInput, SetCapture, SetFocus,
+    GetKeyboardLayout, GetKeyboardLayoutList, ReleaseCapture, SendInput, SetCapture,
     TrackMouseEvent, HKL, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, TME_LEAVE,
     TRACKMOUSEEVENT, VK_ESCAPE, VK_LWIN, VK_N,
 };
@@ -299,8 +299,9 @@ impl StatusPanel {
         self.dpi = dpi;
         self.rebuild_fonts();
         unsafe {
+            // 使用非激活悬浮窗样式，打开状态面板时不抢占前台焦点
             let Ok(hwnd) = CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
                 wide_static(CLASS_PANEL),
                 w!(""),
                 WS_POPUP,
@@ -351,6 +352,32 @@ impl StatusPanel {
     /// 是否仍有展开或收起动画需要逐帧推进。
     pub fn is_animating(&self) -> bool {
         self.drawer.is_animating(self.visible)
+    }
+
+    /// 当前是否正在拖拽亮度或音量滑块。
+    pub fn is_dragging_slider(&self) -> bool {
+        self.drag_slider || self.drag_bright
+    }
+
+    /// 中断滑块拖拽并重置按压态（捕获丢失时调用，不关闭面板）。
+    pub fn cancel_drag(&mut self) {
+        if self.drag_slider || self.drag_bright || self.pressed != PanelHit::None {
+            self.drag_slider = false;
+            self.drag_bright = false;
+            self.pressed = PanelHit::None;
+            if self.visible {
+                self.render();
+            }
+        }
+    }
+
+    /// 返回状态面板卡片在屏幕坐标系中的当前可见区域（不含顶部透明间距）。
+    pub fn visible_screen_rect(&self) -> Option<RECT> {
+        if !self.visible {
+            return None;
+        }
+        let wr = crate::win32::window_rect(self.hwnd)?;
+        self.drawer.visible_screen_rect(wr, self.w, self.h)
     }
 
     fn card_rect(&self) -> RECT {
@@ -408,10 +435,9 @@ impl StatusPanel {
         unsafe {
             self.render();
             if !was_visible {
-                let _ = ShowWindow(self.hwnd, SW_SHOW);
+                // 不激活状态面板窗口，避免背后的 Win11 Mica 窗口失焦变色
+                let _ = ShowWindow(self.hwnd, SW_SHOWNA);
             }
-            let _ = SetForegroundWindow(self.hwnd);
-            let _ = SetFocus(self.hwnd);
         }
     }
 
@@ -2195,6 +2221,7 @@ fn connect_wifi(guid: GUID, profile: &str) {
 
 unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         WM_MOUSEMOVE => {
             let x = get_x_lparam(lparam.0);
             let y = get_y_lparam(lparam.0);
@@ -2276,10 +2303,25 @@ mod tests {
         let anchor_ctrl = RECT { left: 1710, top: 0, right: 1750, bottom: 30 };
         let app = Appearance::default();
 
-        // 1. 打开日历状态面板：首帧即从顶部栏下沿探出，保持窗口顶边紧贴顶部栏下沿
+        // 1. 打开日历状态面板：首帧即从顶部栏下沿探出，保持窗口顶边紧贴顶部栏下沿，且不抢夺前景焦点
         panel.open(std::ptr::null_mut(), HWND::default(), PanelKind::Clock, anchor_clock, 96, HWND::default(), &app);
         assert!(panel.is_open());
         assert!(panel.is_animating());
+        unsafe {
+            let ex = GetWindowLongPtrW(panel.hwnd, GWL_EXSTYLE) as u32;
+            assert_ne!(ex & WS_EX_NOACTIVATE.0, 0, "状态面板必须具备 WS_EX_NOACTIVATE 防止抢夺前景焦点");
+            assert_eq!(
+                SendMessageW(panel.hwnd, WM_MOUSEACTIVATE, WPARAM(0), LPARAM(0)).0,
+                MA_NOACTIVATE as isize
+            );
+            assert_ne!(GetForegroundWindow(), panel.hwnd, "打开状态面板不应改变前台激活窗口");
+        }
+        assert!(panel.visible_screen_rect().is_some());
+        assert!(!panel.is_dragging_slider());
+        panel.drag_slider = true;
+        assert!(panel.is_dragging_slider());
+        panel.cancel_drag();
+        assert!(!panel.is_dragging_slider());
         assert!(panel.drawer.card_top < panel.drawer.resting_card_top);
         assert!(panel.drawer.card_top + panel.drawer.card_h > 0);
         let mut wr = RECT::default();

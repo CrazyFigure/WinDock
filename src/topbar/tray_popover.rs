@@ -10,7 +10,7 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, S
 use windows::Win32::Globalization::{CompareStringEx, CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN, NORM_IGNORECASE, SORT_DIGITSASNUMBERS};
 use windows::Win32::Graphics::Gdi::{AC_SRC_OVER, BLENDFUNCTION, HFONT};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
-use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::config::Appearance;
@@ -104,10 +104,20 @@ mod tests {
         let anchor = RECT { left: 1600, top: 0, right: 1630, bottom: 30 };
         let app = Appearance::default();
 
-        // 1. 展开首帧即有探出过程，尚未完全到位且处于顶部栏下沿裁切滑出状态
+        // 1. 展开首帧即有探出过程，尚未完全到位且处于顶部栏下沿裁切滑出状态，且保持非激活悬浮窗样式
         p.open(anchor, items.clone(), vec!["k0".into()], HWND::default(), &app);
         assert!(p.is_open());
         assert!(p.is_animating());
+        unsafe {
+            let ex = GetWindowLongPtrW(p.hwnd, GWL_EXSTYLE) as u32;
+            assert_ne!(ex & WS_EX_NOACTIVATE.0, 0, "收纳浮层必须具备 WS_EX_NOACTIVATE 防止抢夺前景焦点");
+            assert_eq!(
+                SendMessageW(p.hwnd, WM_MOUSEACTIVATE, WPARAM(0), LPARAM(0)).0,
+                MA_NOACTIVATE as isize
+            );
+            assert_ne!(GetForegroundWindow(), p.hwnd, "打开收纳浮层不应改变前台激活窗口");
+        }
+        assert!(p.visible_screen_rect().is_some());
         assert!(p.drawer.card_top < p.drawer.resting_card_top, "首帧卡片顶部({})应从顶部栏后方滑出(< {})", p.drawer.card_top, p.drawer.resting_card_top);
         assert!(p.drawer.card_top + p.drawer.card_h > 0, "首帧卡片底边应已探出顶部栏下沿");
         assert!(p.visual_progress() > 0.1 && p.visual_progress() < 0.5);
@@ -230,8 +240,9 @@ impl Popover {
             }
         }
         unsafe {
+            // 使用非激活悬浮窗样式，避免打开收纳格时抢走前台窗口焦点
             let hwnd = CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
                 wide_static(CLASS_POPOVER),
                 w!(""),
                 WS_POPUP,
@@ -310,6 +321,15 @@ impl Popover {
         self.drawer.visual_progress(self.visible)
     }
 
+    /// 返回收纳卡片在屏幕坐标系中的当前可见区域（不含顶部透明间距）。
+    pub fn visible_screen_rect(&self) -> Option<RECT> {
+        if !self.visible {
+            return None;
+        }
+        let wr = crate::win32::window_rect(self.hwnd)?;
+        self.drawer.visible_screen_rect(wr, self.w, self.h)
+    }
+
     /// 打开浮层：锚定在顶部栏 `<` 按钮正下方、右对齐，自动避让屏幕边界并从顶部栏下沿平滑滑出。
     pub fn open(&mut self, anchor: RECT, mut items: Vec<TrayItem>, pinned: Vec<String>, prev_fg: HWND, appearance: &Appearance) {
         sort_items(&mut items);
@@ -335,10 +355,9 @@ impl Popover {
             self.visible = true;
             self.render();
             if !was_visible {
-                let _ = ShowWindow(self.hwnd, SW_SHOW);
+                // 不激活收纳浮层，保持原前台窗口的激活态与 Mica 材质表现
+                let _ = ShowWindow(self.hwnd, SW_SHOWNA);
             }
-            let _ = SetForegroundWindow(self.hwnd);
-            let _ = SetFocus(self.hwnd);
         }
     }
 
@@ -677,6 +696,7 @@ pub fn draw_shelf_item_icon(
 
 unsafe extern "system" fn popover_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
         WM_MOUSEMOVE => {
             let x = get_x_lparam(lparam.0);
             let y = get_y_lparam(lparam.0);

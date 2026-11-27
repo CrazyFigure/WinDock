@@ -126,7 +126,7 @@ static SHORTCUT_INDEX: OnceLock<Mutex<Option<ShortcutNameIndex>>> = OnceLock::ne
 const SHORTCUT_INDEX_TTL: Duration = Duration::from_secs(300);
 
 /// 判断是否为顶部栏、Dock、自绘菜单或浮窗等内部壳层窗口（设置窗口按普通应用窗口参与前景与列表跟踪）。
-fn is_our_window(class: &str) -> bool {
+pub(crate) fn is_our_window(class: &str) -> bool {
     (class.starts_with("WinDock") && class != crate::settings::CLASS_SETTINGS)
         || class == "SysShadow"
 }
@@ -137,7 +137,7 @@ fn is_explicit_desktop_class(class: &str) -> bool {
 }
 
 /// 托盘溢出气泡、原生右键菜单、工具提示等瞬态系统浮窗，不应使顶部栏退出最大化融合态。
-fn is_transient_tray_or_popup_class(class: &str) -> bool {
+pub(crate) fn is_transient_tray_or_popup_class(class: &str) -> bool {
     matches!(
         class,
         "Shell_TrayWnd"
