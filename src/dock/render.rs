@@ -406,8 +406,9 @@ pub fn render(dock: &mut Dock, ctx: &mut RenderCtx) {
     unsafe {
         let _ = UpdateLayeredWindow(dock.hwnd_overlay, HDC::default(), Some(&dst), Some(&size), dc, Some(&src), COLORREF(0), Some(&blend), ULW_ALPHA);
     }
-    if !dock.window_visible {
+    if !dock.window_visible || crate::topbar::tray_popup::cover_active() {
         unsafe {
+            // 首次显身或托盘遮罩活跃期间始终巩固 Dock 顶层 Z 序，避免被任务栏遮罩裁切下半部分。
             let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
                 dock.hwnd_overlay,
                 windows::Win32::UI::WindowsAndMessaging::HWND_TOPMOST,
@@ -419,7 +420,12 @@ pub fn render(dock: &mut Dock, ctx: &mut RenderCtx) {
                     | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
                     | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
             );
-            let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(dock.hwnd_overlay, windows::Win32::UI::WindowsAndMessaging::SW_SHOWNA);
+            if !dock.window_visible {
+                let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+                    dock.hwnd_overlay,
+                    windows::Win32::UI::WindowsAndMessaging::SW_SHOWNA,
+                );
+            }
         }
         dock.window_visible = true;
     }

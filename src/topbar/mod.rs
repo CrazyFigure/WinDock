@@ -7,7 +7,7 @@ pub mod status;
 pub mod tray_mirror;
 pub mod tray_popover;
 pub(crate) mod tray_tooltip;
-mod tray_popup;
+pub(crate) mod tray_popup;
 mod tray_registry;
 
 use std::time::Instant;

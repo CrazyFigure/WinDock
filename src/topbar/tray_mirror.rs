@@ -37,7 +37,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::ui::{DibTarget, IconPixels};
 use crate::win32::fnv1a64;
 use crate::taskbar::{primary_taskbar, TrayPeek};
-use super::tray_popup::{self, DesktopCover, MenuPlacement};
+use super::tray_popup::{self, CancelSignal, CoverContext, DesktopCover, MenuPlacement};
 use super::tray_registry::{self, Registration};
 
 pub const WM_APP_TRAY_ITEMS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 31;
@@ -224,9 +224,10 @@ pub struct TrayInvocation {
 
 pub struct TrayRefreshRequest {
     pub peek: Option<TrayPeek>,
-    pub canceled: Arc<AtomicBool>,
+    pub cancel: Arc<CancelSignal>,
     pub overflow: bool,
     pub pinned: HashSet<String>,
+    pub cover: CoverContext,
 }
 
 struct NativeButton {
@@ -300,8 +301,8 @@ pub fn spawn_refresh(target: HWND, cache: Arc<TrayIconCache>, request: TrayRefre
     }
     let target = target.0 as isize;
     let spawn = thread::Builder::new().name("tray-uia".into()).spawn(move || {
-        let TrayRefreshRequest { peek, canceled, overflow: read_overflow, pinned } = request;
-        let stop = || canceled.load(Ordering::Relaxed);
+        let TrayRefreshRequest { peek, cancel, overflow: read_overflow, pinned, cover: cover_ctx } = request;
+        let stop = || cancel.is_canceled();
         let generation = bump_generation();
         let snapshot = with_uia(|uia| {
             let Some(tray) = primary_taskbar() else { return TraySnapshot::default() };
@@ -310,21 +311,40 @@ pub fn spawn_refresh(target: HWND, cache: Arc<TrayIconCache>, request: TrayRefre
                 return TraySnapshot::default();
             }
             let reveal = if let Some(peek) = peek {
-                let Some(reveal) = TrayReveal::start(peek, true) else { return TraySnapshot::default() };
-                wait_until(|| stop() || unsafe { IsWindowVisible(tray).as_bool() });
+                // 后台采样遮罩不启用鼠标透传，并绑定取消信号以在鼠标移入底部时瞬间退出。
+                let Some(reveal) = TrayReveal::start(peek, true, false, cover_ctx.clone(), Some(cancel.clone())) else {
+                    return TraySnapshot::default();
+                };
+                wait_until_cancel(&cancel, || unsafe { IsWindowVisible(tray).as_bool() });
+                if stop() {
+                    return TraySnapshot::default();
+                }
+                if let Some(cover) = reveal.cover.as_ref() {
+                    cover.sync_zorder();
+                }
                 Some(reveal)
             } else {
                 None
             };
             let (mut main, mut overflow) = scan_buttons(uia, tray);
+            if stop() {
+                return TraySnapshot::default();
+            }
             if main.as_ref().is_none_or(Vec::is_empty) {
                 if let Some(cover) = reveal.as_ref().and_then(|display| display.cover.as_ref()) {
                     if cover.wake_without_focus() {
-                        (main, overflow) = wait_for_buttons(uia, tray, Duration::from_millis(1000), |main, _| {
-                            stop() || main.is_some_and(|buttons| !buttons.is_empty())
-                        });
+                        (main, overflow) = wait_for_buttons(
+                            uia,
+                            tray,
+                            Duration::from_millis(1000),
+                            Some(&cancel),
+                            |main, _| stop() || main.is_some_and(|buttons| !buttons.is_empty()),
+                        );
                     }
                 }
+            }
+            if stop() {
+                return TraySnapshot::default();
             }
             if let Some(registered) = registered.as_deref() {
                 associate_buttons(main.as_deref_mut(), overflow.as_deref_mut(), registered);
@@ -336,11 +356,11 @@ pub fn spawn_refresh(target: HWND, cache: Arc<TrayIconCache>, request: TrayRefre
             let mut snapshot = collect_snapshot(main.as_deref(), overflow.as_deref(), &cache, generation, covered, registered.as_deref());
             if read_overflow && overflow.is_none() && !stop() {
                 // 后台借用原生溢出区只读取 UIA 状态，图像沿用注册缓存。
-                snapshot.overflow = read_hidden_overflow(uia, tray, registered.as_deref(), stop)
+                snapshot.overflow = read_hidden_overflow(uia, tray, registered.as_deref(), cover_ctx.clone(), &cancel)
                     .map(|buttons| buttons.into_iter().map(|button| button.item).collect());
             }
             if !read_overflow && !stop() {
-                sample_flashing(main.as_deref().unwrap_or_default(), &pinned, &cache, stop);
+                sample_flashing(main.as_deref().unwrap_or_default(), &pinned, &cache, &cancel);
             }
             snapshot
         }).unwrap_or_default();
@@ -355,11 +375,16 @@ pub fn spawn_refresh(target: HWND, cache: Arc<TrayIconCache>, request: TrayRefre
 
 /// 按刚刚扫描到的原生按钮执行点击，并把临时显示期间看到的图标同步给顶部栏。
 pub fn spawn_invocation(
-    target: HWND, item: TrayItem, anchor: Option<RECT>, peek: Option<TrayPeek>, cache: Arc<TrayIconCache>,
+    target: HWND,
+    item: TrayItem,
+    anchor: Option<RECT>,
+    peek: Option<TrayPeek>,
+    cache: Arc<TrayIconCache>,
+    cover: CoverContext,
 ) -> bool {
     let target = target.0 as isize;
     thread::Builder::new().name("tray-click".into()).spawn(move || {
-        let (ordinary_window, snapshot, menu) = with_uia(|uia| invoke(uia, &item, anchor, peek, &cache))
+        let (ordinary_window, snapshot, menu) = with_uia(|uia| invoke(uia, &item, anchor, peek, &cache, cover))
             .unwrap_or_else(|| (item.uia_key.is_none(), TraySnapshot::default(), None));
         post_result(HWND(target as *mut _), WM_APP_TRAY_INVOKED, TrayInvocation { target: item, ordinary_window, snapshot, menu });
     }).is_ok()
@@ -374,8 +399,18 @@ struct TrayReveal {
 }
 
 impl TrayReveal {
-    fn start(peek: TrayPeek, conceal: bool) -> Option<Self> {
-        let cover = if conceal { Some(tray_popup::taskbar_cover(peek.hwnd())?) } else { None };
+    fn start(
+        peek: TrayPeek,
+        conceal: bool,
+        pass_through: bool,
+        cover_ctx: CoverContext,
+        cancel: Option<Arc<CancelSignal>>,
+    ) -> Option<Self> {
+        let cover = if conceal {
+            Some(tray_popup::taskbar_cover(peek.hwnd(), pass_through, cover_ctx, cancel)?)
+        } else {
+            None
+        };
         peek.set_visible(true).then_some(Self { peek, cover, overflow_cover: None, opened_overflow: None })
     }
 }
@@ -453,7 +488,10 @@ fn scan_buttons(uia: &IUIAutomation, tray: HWND) -> (Option<Vec<NativeButton>>, 
 
 /// 任务栏的位置可能已更新，但 XAML 子树仍在加载。等实际通知项出现后再决定是否切换到溢出区。
 fn wait_for_buttons(
-    uia: &IUIAutomation, tray: HWND, timeout: Duration,
+    uia: &IUIAutomation,
+    tray: HWND,
+    timeout: Duration,
+    cancel: Option<&CancelSignal>,
     ready: impl Fn(Option<&[NativeButton]>, Option<&[NativeButton]>) -> bool,
 ) -> (Option<Vec<NativeButton>>, Option<Vec<NativeButton>>) {
     let deadline = Instant::now() + timeout;
@@ -462,7 +500,13 @@ fn wait_for_buttons(
         if ready(buttons.0.as_deref(), buttons.1.as_deref()) || Instant::now() >= deadline {
             return buttons;
         }
-        thread::sleep(Duration::from_millis(25));
+        if let Some(sig) = cancel {
+            if sig.wait_timeout(Duration::from_millis(12)) {
+                return buttons;
+            }
+        } else {
+            thread::sleep(Duration::from_millis(12));
+        }
     }
 }
 
@@ -554,13 +598,22 @@ fn read_registrations(tray: HWND, cache: &TrayIconCache, generation: u64, cancel
 }
 
 fn read_hidden_overflow(
-    uia: &IUIAutomation, tray: HWND, registered: Option<&[Registration]>, stop: impl Fn() -> bool,
+    uia: &IUIAutomation,
+    tray: HWND,
+    registered: Option<&[Registration]>,
+    cover_ctx: CoverContext,
+    cancel: &Arc<CancelSignal>,
 ) -> Option<Vec<NativeButton>> {
-    let popup = HiddenOverflow::open(uia, tray)?;
+    let popup = HiddenOverflow::open(uia, tray, cover_ctx, Some(cancel.clone()))?;
     let expected = registered.map_or(1, |entries| entries.iter().filter(|entry| entry.overflow).count().max(1));
-    let mut overflow = wait_for_buttons(uia, tray, Duration::from_millis(500), |_, overflow| {
-        stop() || overflow.is_some_and(|buttons| buttons.len() >= expected)
-    }).1;
+    let mut overflow = wait_for_buttons(
+        uia,
+        tray,
+        Duration::from_millis(500),
+        Some(cancel),
+        |_, overflow| cancel.is_canceled() || overflow.is_some_and(|buttons| buttons.len() >= expected),
+    )
+    .1;
     drop(popup);
     if let Some(registered) = registered {
         associate_buttons(None, overflow.as_deref_mut(), registered);
@@ -577,10 +630,15 @@ struct HiddenOverflow {
 }
 
 impl HiddenOverflow {
-    fn open(uia: &IUIAutomation, tray: HWND) -> Option<Self> {
+    fn open(
+        uia: &IUIAutomation,
+        tray: HWND,
+        cover_ctx: CoverContext,
+        cancel: Option<Arc<CancelSignal>>,
+    ) -> Option<Self> {
         let window = overflow_window(tray, false)?;
         let foreground = unsafe { GetForegroundWindow() };
-        let cover = tray_popup::taskbar_cover(window)?;
+        let cover = tray_popup::taskbar_cover(window, false, cover_ctx, cancel)?;
         let chevron = overflow_chevron(uia, tray)?;
         invoke_element(&chevron).then_some(Self { tray, window, foreground, _cover: cover })
     }
@@ -786,7 +844,7 @@ struct FlashPattern {
     presented: Option<u64>,
 }
 
-fn sample_flashing(buttons: &[NativeButton], pinned: &HashSet<String>, cache: &TrayIconCache, stop: impl Fn() -> bool) {
+fn sample_flashing(buttons: &[NativeButton], pinned: &HashSet<String>, cache: &TrayIconCache, cancel: &CancelSignal) {
     let mut samples: Vec<_> = buttons.iter().filter(|button| pinned.contains(&button.item.key))
         .map(|button| (button, Vec::<FlashFrame>::new(), None)).collect();
     if samples.is_empty() {
@@ -796,10 +854,11 @@ fn sample_flashing(buttons: &[NativeButton], pinned: &HashSet<String>, cache: &T
     let blank = IconPixels { w: 32, h: 32, px: Arc::new(vec![0; 32 * 32 * 4]) };
     for tick in 0..=8 {
         let next = started + Duration::from_millis(tick * 150);
-        while !stop() && Instant::now() < next {
-            thread::sleep(next.saturating_duration_since(Instant::now()).min(Duration::from_millis(20)));
+        let wait = next.saturating_duration_since(Instant::now());
+        if !wait.is_zero() && cancel.wait_timeout(wait) {
+            return;
         }
-        if stop() {
+        if cancel.is_canceled() {
             return;
         }
         // 每轮共用一张任务栏渲染。任务栏在屏幕外或不可读时保留上次的动画状态。
@@ -818,6 +877,10 @@ fn sample_flashing(buttons: &[NativeButton], pinned: &HashSet<String>, cache: &T
             }
         }
         if samples.iter().all(|(_, _, pattern)| pattern.is_some()) {
+            break;
+        }
+        // 连续 750ms（6 帧）所有采样图标均未发生任何一次像素切换，说明当前无闪烁，提前结束以缩短遮罩持有时长。
+        if tick >= 5 && samples.iter().all(|(_, frames, pattern)| pattern.is_none() && frames.len() <= 1) {
             break;
         }
     }
@@ -869,7 +932,16 @@ fn send_chord(modifier: VIRTUAL_KEY, action: VIRTUAL_KEY) -> bool {
 fn wait_until(test: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_millis(500);
     while !test() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(Duration::from_millis(8));
+    }
+}
+
+fn wait_until_cancel(cancel: &CancelSignal, test: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while !cancel.is_canceled() && !test() && Instant::now() < deadline {
+        if cancel.wait_timeout(Duration::from_millis(8)) {
+            break;
+        }
     }
 }
 
@@ -968,7 +1040,12 @@ fn click_button(button: &NativeButton, right: bool) -> (bool, Option<POINT>) {
 }
 
 fn invoke(
-    uia: &IUIAutomation, item: &TrayItem, anchor: Option<RECT>, peek: Option<TrayPeek>, cache: &TrayIconCache,
+    uia: &IUIAutomation,
+    item: &TrayItem,
+    anchor: Option<RECT>,
+    peek: Option<TrayPeek>,
+    cache: &TrayIconCache,
+    cover_ctx: CoverContext,
 ) -> (bool, TraySnapshot, Option<isize>) {
     let Some(tray) = primary_taskbar() else { return (item.uia_key.is_none(), TraySnapshot::default(), None) };
     let right = anchor.is_some();
@@ -990,21 +1067,29 @@ fn invoke(
     }
     let foreground = unsafe { GetForegroundWindow() };
     let mut reveal = if let Some(peek) = peek {
-        let Some(reveal) = TrayReveal::start(peek, right) else { return (false, TraySnapshot::default(), None) };
+        let Some(reveal) = TrayReveal::start(peek, right, true, cover_ctx.clone(), None) else {
+            return (false, TraySnapshot::default(), None);
+        };
         Some(reveal)
     } else {
         None
     };
     // 等待异步显示生效，再处理系统的自动隐藏状态。
     wait_until(|| unsafe { IsWindowVisible(tray).as_bool() });
+    if let Some(cover) = reveal.as_ref().and_then(|display| display.cover.as_ref()) {
+        cover.sync_zorder();
+    }
     let mut buttons = scan_buttons(uia, tray);
     let revealed = buttons.0.as_ref().is_none_or(Vec::is_empty) || (right && reveal.is_some());
     if revealed {
         // Win+B 让 Explorer 展开自动隐藏的任务栏。
         send_chord(VK_LWIN, VK_B);
-        buttons = wait_for_buttons(uia, tray, Duration::from_millis(500), |main, _| {
+        buttons = wait_for_buttons(uia, tray, Duration::from_millis(500), None, |main, _| {
             main.is_some_and(|buttons| !buttons.is_empty())
         });
+        if let Some(cover) = reveal.as_ref().and_then(|display| display.cover.as_ref()) {
+            cover.sync_zorder();
+        }
     }
     let (mut main, mut overflow) = buttons;
     if let Some(registered) = registered.as_deref() {
@@ -1014,12 +1099,13 @@ fn invoke(
     if find_target(item, main.iter().flatten().chain(overflow.iter().flatten())).is_none() && overflow.is_none() {
         // 溢出列表只有展开时才发布 UIA 元素，使用原生箭头打开并重新枚举。
         if let Some(display) = reveal.as_mut().filter(|display| display.cover.is_some()) {
-            display.overflow_cover = overflow_window(tray, false).and_then(tray_popup::taskbar_cover);
+            display.overflow_cover = overflow_window(tray, false)
+                .and_then(|w| tray_popup::taskbar_cover(w, true, cover_ctx.clone(), None));
         }
         chevron = overflow_chevron(uia, tray).filter(invoke_element);
         if chevron.is_some() {
             let expected = registered.as_ref().map_or(1, |entries| entries.iter().filter(|entry| entry.overflow).count().max(1));
-            (main, overflow) = wait_for_buttons(uia, tray, Duration::from_millis(500), |_, overflow| {
+            (main, overflow) = wait_for_buttons(uia, tray, Duration::from_millis(500), None, |_, overflow| {
                 overflow.is_some_and(|buttons| buttons.len() >= expected
                     || find_target(item, buttons.iter()).is_some()
                     || item.registration.is_some_and(|id| registered.as_deref().and_then(|entries| entries.iter().find(|entry| entry.id == id))

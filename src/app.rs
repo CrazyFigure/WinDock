@@ -6,7 +6,7 @@
 use std::cell::{Cell, RefCell};
 use std::os::windows::io::IntoRawHandle;
 use std::os::windows::process::CommandExt;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,7 @@ use crate::topbar::panel::{NetworkData, PanelAction, PanelKind, StatusPanel};
 use crate::topbar::status;
 use crate::topbar::tray_mirror::{self, TrayIconCache, TrayInvocation, TrayItem, TrayRefreshRequest, TraySnapshot};
 use crate::topbar::tray_popover::Popover;
+use crate::topbar::tray_popup::{CancelSignal, CoverContext, WM_APP_TRAY_COVER_ZORDER};
 use crate::topbar::tray_tooltip::{TipTarget, TrayTooltip, TIMER_TRAY_TIP};
 use crate::topbar::{Hit, TopBar};
 use crate::tray::Tray;
@@ -294,8 +295,17 @@ struct TrayClick {
 
 enum TrayWork {
     // 图标采样中的用户点击排在其后，避免两个后台线程同时操作同一个原生托盘。
-    Refresh { canceled: Arc<AtomicBool>, reading_overflow: bool, queued_click: Option<TrayClick> },
+    Refresh { cancel: Arc<CancelSignal>, reading_overflow: bool, queued_click: Option<TrayClick> },
     Click { right: bool, screen: POINT, owner: HWND, is_popover: bool, queued_click: Option<TrayClick> },
+}
+
+/// 判断光标是否正处于指定显示器底部任务栏与 Dock 交互热区（用于延后后台托盘遮罩采样）。
+fn cursor_in_bottom_taskbar_zone(pt: POINT, mon: MonitorInfo) -> bool {
+    let band = crate::win32::dp(96, mon.dpi);
+    pt.x >= mon.rect.left
+        && pt.x < mon.rect.right
+        && pt.y >= mon.rect.bottom - band
+        && pt.y <= mon.rect.bottom
 }
 
 struct TrayContext {
@@ -1636,6 +1646,94 @@ impl App {
 
     // ---------- 托盘镜像 ----------
 
+    /// 收集需要在原生任务栏遮罩截屏时排除、且显示期间始终保持在遮罩上方的底部浮窗句柄。
+    fn tray_cover_context(&self) -> CoverContext {
+        let mut keep_above = Vec::with_capacity(self.docks.len() * 2 + 3);
+        for d in &self.docks {
+            if !d.hwnd_overlay.0.is_null() {
+                keep_above.push(d.hwnd_overlay.0 as isize);
+            }
+            if !d.hwnd_trigger.0.is_null() {
+                keep_above.push(d.hwnd_trigger.0 as isize);
+            }
+        }
+        if !self.window_preview.hwnd.0.is_null() {
+            keep_above.push(self.window_preview.hwnd.0 as isize);
+        }
+        if !self.context_menu.hwnd.0.is_null() {
+            keep_above.push(self.context_menu.hwnd.0 as isize);
+        }
+        if !self.status_panel.hwnd.0.is_null() {
+            keep_above.push(self.status_panel.hwnd.0 as isize);
+        }
+        CoverContext {
+            main_hwnd: self.hwnd.0 as isize,
+            keep_above,
+        }
+    }
+
+    /// 托盘遮罩线程发现自身升到 Dock / 预览窗前方时，由主线程按精确层级立即把底部浮窗置顶。
+    fn raise_dock_above_tray_cover(&self) {
+        unsafe {
+            let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+            for d in &self.docks {
+                if d.window_visible && !d.hwnd_overlay.0.is_null() {
+                    let _ = SetWindowPos(d.hwnd_overlay, HWND_TOPMOST, 0, 0, 0, 0, flags);
+                }
+                if d.trigger_visible && !d.hwnd_trigger.0.is_null() {
+                    let _ = SetWindowPos(d.hwnd_trigger, HWND_TOPMOST, 0, 0, 0, 0, flags);
+                }
+            }
+            if self.window_preview.visible && !self.window_preview.hwnd.0.is_null() {
+                let _ = SetWindowPos(self.window_preview.hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+            }
+            if self.context_menu.visible && !self.context_menu.hwnd.0.is_null() {
+                let _ = SetWindowPos(self.context_menu.hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+            }
+            if self.status_panel.visible && !self.status_panel.hwnd.0.is_null() {
+                let _ = SetWindowPos(self.status_panel.hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+            }
+        }
+    }
+
+    /// 立即取消进行中的非溢出后台托盘采样，让遮罩与原生任务栏毫秒级退出。
+    fn cancel_background_tray_refresh(&self) {
+        if let Some(TrayWork::Refresh { cancel, reading_overflow: false, .. }) = &self.tray_work {
+            cancel.cancel();
+        }
+    }
+
+    /// 判断当前是否处于 Dock 活跃交互或屏幕底部任务栏热区，避免此时触发后台托盘遮罩采样。
+    fn dock_busy_for_tray_reveal(&self) -> bool {
+        if self.mouse_in_dock || self.edge_since.is_some() || self.window_preview.visible {
+            return true;
+        }
+        if self.frame_on && self.docks.iter().any(Dock::animating) {
+            return true;
+        }
+        let hide_mode_non_always = self.config.dock.hide_mode != "always";
+        if self.docks.iter().any(|d| {
+            d.mouse_in
+                || d.hover.is_some()
+                || d.drag.is_some()
+                || d.drop_settle
+                || d.bounce.is_some()
+                || (hide_mode_non_always && (d.window_visible || d.want_visible))
+        }) {
+            return true;
+        }
+        let pt = cursor_pos();
+        if self.docks.iter().any(|d| cursor_in_bottom_taskbar_zone(pt, d.monitor)) {
+            return true;
+        }
+        if let Some(primary) = crate::win32::primary_monitor() {
+            if cursor_in_bottom_taskbar_zone(pt, primary) {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn refresh_tray(&mut self) {
         if self.topbars.is_empty() || self.tray_work.is_some() || self.snap.fullscreen
             || self.tray_gate.has_active_menu() || matches!(self.tray_seed, TraySeed::Loading(_))
@@ -1643,19 +1741,20 @@ impl App {
             return;
         }
         let peek = self.taskbar.begin_tray_peek();
-        let canceled = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(CancelSignal::new());
         let reading_overflow = self.tray_details_pending;
         let pinned = self.topbars.iter().flat_map(|bar| bar.tray_items.iter().filter_map(|item| {
             bar.pinned.contains(&item.key).then(|| item.uia_key.clone()).flatten()
         })).collect();
-        let request = TrayRefreshRequest { peek, canceled: canceled.clone(), overflow: reading_overflow, pinned };
+        let cover = self.tray_cover_context();
+        let request = TrayRefreshRequest { peek, cancel: cancel.clone(), overflow: reading_overflow, pinned, cover };
         if tray_mirror::spawn_refresh(self.hwnd, self.tray_icons.clone(), request) {
             self.last_tray_refresh = Some(Instant::now());
             if reading_overflow {
                 self.tray_details_pending = false;
                 self.last_tray_details = self.last_tray_refresh;
             }
-            self.tray_work = Some(TrayWork::Refresh { canceled, reading_overflow, queued_click: None });
+            self.tray_work = Some(TrayWork::Refresh { cancel, reading_overflow, queued_click: None });
         } else {
             self.taskbar.end_tray_peek();
         }
@@ -1665,6 +1764,8 @@ impl App {
     fn on_tray_refresh(&mut self, snapshot: TraySnapshot) {
         let Some(TrayWork::Refresh { queued_click, .. }) = self.tray_work.take() else { return };
         self.taskbar.end_tray_peek();
+        // 从采样完成时刻重新计算冷却周期，防止连续采样长时间占用底部遮罩。
+        self.last_tray_refresh = Some(Instant::now());
         self.apply_tray_snapshot(snapshot);
         let (active, _) = self.tray_icons.advance_flash_frames();
         if active {
@@ -1887,6 +1988,7 @@ impl App {
         }
 
         if on_edge {
+            self.cancel_background_tray_refresh();
             if self.edge_since.is_none() {
                 self.edge_since = Some(Instant::now());
             }
@@ -1897,9 +1999,11 @@ impl App {
         }
 
         if in_dock_zone {
+            self.cancel_background_tray_refresh();
             self.mouse_in_dock = true;
             self.hide_at = None;
         } else if self.mouse_in_dock {
+            self.cancel_background_tray_refresh();
             self.mouse_in_dock = false;
             if self.dock_revealed {
                 self.hide_at = Some(Instant::now());
@@ -1935,6 +2039,7 @@ impl App {
         }
 
         if let Some((di, hi)) = target_dock {
+            self.cancel_background_tray_refresh();
             self.preview_leave_at = None;
             if !self.window_preview.visible || self.window_preview.entry_idx != Some(hi) {
                 let (exe, windows, anchor_cx, anchor_top, mon) = {
@@ -2302,7 +2407,7 @@ impl App {
             let poll_seconds = if taskbar_open { 2 } else if samples_notifications { 3 } else { 6 };
             let due = self.last_tray_refresh.is_none_or(|last| last.elapsed() >= Duration::from_secs(poll_seconds));
             if (tracks_visible_icons || taskbar_open) && due && !foreground_has_menu()
-                && !(self.frame_on && self.docks.iter().any(Dock::animating))
+                && (taskbar_open || !self.dock_busy_for_tray_reveal())
             {
                 self.refresh_tray();
             }
@@ -2557,9 +2662,7 @@ impl App {
                         && self.last_tray_details.is_none_or(|last| last.elapsed() >= Duration::from_secs(3))
                     {
                         self.tray_details_pending = true;
-                        if let Some(TrayWork::Refresh { canceled, reading_overflow: false, .. }) = &self.tray_work {
-                            canceled.store(true, Ordering::Relaxed);
-                        }
+                        self.cancel_background_tray_refresh();
                         self.refresh_tray();
                     }
                 }
@@ -3105,10 +3208,8 @@ impl App {
 
     pub fn dock_mouse_move(&mut self, hwnd: HWND, x: f32, y: f32) {
         let Some(i) = self.dock_index(hwnd) else { return };
-        // Dock 放大动画优先于后台托盘采样，右键和悬停详情仍照常处理。
-        if let Some(TrayWork::Refresh { canceled, reading_overflow: false, .. }) = &self.tray_work {
-            canceled.store(true, Ordering::Relaxed);
-        }
+        // Dock 放大动画与交互优先于后台托盘采样，右键和悬停详情仍照常处理。
+        self.cancel_background_tray_refresh();
         self.mouse_in_dock = true;
         self.hide_at = None;
         self.edge_since = None;
@@ -3154,6 +3255,7 @@ impl App {
 
     pub fn dock_mouse_leave(&mut self, hwnd: HWND) {
         let Some(i) = self.dock_index(hwnd) else { return };
+        self.cancel_background_tray_refresh();
         {
             let dock = &mut self.docks[i];
             dock.mouse_in = false;
@@ -3176,6 +3278,7 @@ impl App {
 
     pub fn dock_lbutton_down(&mut self, hwnd: HWND, x: f32, y: f32) {
         let Some(i) = self.dock_index(hwnd) else { return };
+        self.cancel_background_tray_refresh();
         self.window_preview.close();
         {
             let dock = &mut self.docks[i];
@@ -3236,6 +3339,7 @@ impl App {
 
     pub fn dock_rbutton_up(&mut self, hwnd: HWND, x: f32, y: f32) {
         let Some(i) = self.dock_index(hwnd) else { return };
+        self.cancel_background_tray_refresh();
         let hit = self.docks[i].hit(x, y);
         match hit {
             None => self.product_menu(),
@@ -3294,6 +3398,7 @@ impl App {
     }
 
     pub fn dock_edge_hovered(&mut self, _hwnd: HWND) {
+        self.cancel_background_tray_refresh();
         if self.edge_since.is_none() {
             self.edge_since = Some(Instant::now());
         }
@@ -3620,9 +3725,7 @@ impl App {
             && self.last_tray_details.is_none_or(|last| last.elapsed() >= Duration::from_secs(3))
         {
             self.tray_details_pending = true;
-            if let Some(TrayWork::Refresh { canceled, reading_overflow: false, .. }) = &self.tray_work {
-                canceled.store(true, Ordering::Relaxed);
-            }
+            self.cancel_background_tray_refresh();
             self.refresh_tray();
         }
         self.tray_tip.track(self.hwnd, target, self.config.appearance.is_dark());
@@ -3739,8 +3842,8 @@ impl App {
         }
         if let Some(work) = &mut self.tray_work {
             let queued_click = match work {
-                TrayWork::Refresh { canceled, queued_click, .. } => {
-                    canceled.store(true, Ordering::Relaxed);
+                TrayWork::Refresh { cancel, queued_click, .. } => {
+                    cancel.cancel();
                     queued_click
                 }
                 TrayWork::Click { queued_click, .. } => queued_click,
@@ -3749,7 +3852,8 @@ impl App {
             return;
         }
         let peek = self.taskbar.begin_tray_peek();
-        if tray_mirror::spawn_invocation(self.hwnd, item.clone(), anchor, peek, self.tray_icons.clone()) {
+        let cover = self.tray_cover_context();
+        if tray_mirror::spawn_invocation(self.hwnd, item.clone(), anchor, peek, self.tray_icons.clone(), cover) {
             self.tray_work = Some(TrayWork::Click { right, screen, owner, is_popover, queued_click: None });
         } else {
             self.taskbar.end_tray_peek();
@@ -4867,6 +4971,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 app.on_tray_invoked(*Box::from_raw(lparam.0 as *mut TrayInvocation));
             }
         }
+        WM_APP_TRAY_COVER_ZORDER => app.raise_dock_above_tray_cover(),
         crate::topbar::tray_mirror::WM_APP_LIVE_ICON_CHANGED => app.redraw_shelf_views(),
         crate::topbar::panel::WM_APP_PANEL_DATA => app.on_panel_data(lparam.0),
         WM_APP_OVERLAY_DISMISS => app.on_overlay_dismiss(wparam.0),
@@ -5284,5 +5389,30 @@ mod tests {
             assert!(UnhookWindowsHookEx(mh).is_ok());
             assert!(UnhookWindowsHookEx(kh).is_ok());
         }
+    }
+
+    #[test]
+    fn bottom_taskbar_zone_matches_monitor_dpi_and_bounds() {
+        let primary = MonitorInfo {
+            hmonitor: windows::Win32::Graphics::Gdi::HMONITOR::default(),
+            rect: RECT { left: 0, top: 0, right: 2560, bottom: 1600 },
+            work: RECT { left: 0, top: 0, right: 2560, bottom: 1600 },
+            dpi: 144, // 150% DPI -> 96dp = 144px
+            primary: true,
+        };
+        assert!(cursor_in_bottom_taskbar_zone(POINT { x: 1200, y: 1599 }, primary));
+        assert!(cursor_in_bottom_taskbar_zone(POINT { x: 1200, y: 1456 }, primary));
+        assert!(!cursor_in_bottom_taskbar_zone(POINT { x: 1200, y: 1455 }, primary));
+        assert!(!cursor_in_bottom_taskbar_zone(POINT { x: -1, y: 1580 }, primary));
+
+        let left_monitor = MonitorInfo {
+            hmonitor: windows::Win32::Graphics::Gdi::HMONITOR::default(),
+            rect: RECT { left: -1920, top: 0, right: 0, bottom: 1080 },
+            work: RECT { left: -1920, top: 0, right: 0, bottom: 1080 },
+            dpi: 96, // 100% DPI -> 96dp = 96px
+            primary: false,
+        };
+        assert!(cursor_in_bottom_taskbar_zone(POINT { x: -500, y: 984 }, left_monitor));
+        assert!(!cursor_in_bottom_taskbar_zone(POINT { x: -500, y: 983 }, left_monitor));
     }
 }
