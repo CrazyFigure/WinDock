@@ -33,10 +33,11 @@ use crate::hotkey;
 use crate::startup;
 use crate::topbar::tray_mirror::TrayItem;
 use crate::ui::{
-    accent_from_config, draw_app_badge, draw_button, draw_glyph,
-    draw_launchpad_icon, draw_scrollbar, draw_text, draw_toggle, draw_tooltip, draw_wrapped_text,
-    make_font, measure_text, measure_wrapped_text_height, palette, rgb, BtnStyle, ColorTextRenderer,
-    DibTarget, Glyph, Palette, Rgba, Surface, TextAlign,
+    accent_from_config, draw_app_badge, draw_button, draw_glyph, draw_launchpad_icon,
+    draw_scrollbar_with_state, draw_text, draw_toggle, draw_tooltip, draw_wrapped_text, make_font,
+    measure_text, measure_wrapped_text_height, palette, rgb, scrollbar_offset_from_y,
+    scrollbar_thumb_rect, BtnStyle, ColorTextRenderer, DibTarget, Glyph, Palette, Rgba, Surface,
+    TextAlign,
 };
 use crate::update::{self, CheckResult, UpdateBundle};
 use crate::win32::{
@@ -50,12 +51,17 @@ use pages::Row;
 pub const CLASS_SETTINGS: &str = "WinDockFinderSettings";
 const TIMER_TIP: usize = 301;
 const TIMER_DOCK_DRAG_SCROLL: usize = 302;
+const TIMER_SMOOTH_SCROLL: usize = 303;
 const WM_PRINTCLIENT: u32 = 0x0318;
 const LIST_ROW_DP: f32 = 36.0;
-// Dock 固定项列表默认展示 6 行
+// Dock 固定项列表与托盘应用列表默认展示 6 行
 const DOCK_VISIBLE: usize = 6;
-const TRAY_VISIBLE: usize = 4;
+const TRAY_VISIBLE: usize = 6;
 const EXCLUDE_VISIBLE: usize = 3;
+// 平滑滚动阻尼时间常数（ms）：约 115ms 收敛 95%，兼具丝滑与跟手
+const SMOOTH_SCROLL_TAU_MS: f32 = 38.0;
+const WHEEL_PAGE_STEP_DP: f32 = 72.0;
+const WHEEL_ABOUT_STEP_DP: f32 = 60.0;
 
 /// 返回列表类行控件的可见行数，供高度计算与滚轮边界统一复用。
 fn list_visible(row: &Row) -> usize {
@@ -80,8 +86,8 @@ pub enum Page {
 
 const NAV: [(Page, &str); 5] = [
     (Page::General, "通用"),
-    (Page::Dock, "Dock"),
-    (Page::Topbar, "顶部栏"),
+    (Page::Dock, "底部Dock栏"),
+    (Page::Topbar, "顶部菜单栏"),
     (Page::Appearance, "外观"),
     (Page::About, "关于"),
 ];
@@ -110,6 +116,16 @@ fn hotkey_slot(f: Field) -> HotkeySlot {
 
 // ---------- 命中 ----------
 
+/// 设置页内全部垂直滚动条标识，统一处理点击定位、滑块拖动与 Hover/Active 状态。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScrollBarKind {
+    Page,
+    AboutLog,
+    DockList,
+    TrayList,
+    ExcludeList,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Hit {
     None,
@@ -135,7 +151,7 @@ enum Hit {
     TrayRow(usize),
     ExcludeAdd,
     ExcludeRemove(usize),
-    ScrollBar,
+    ScrollBar(ScrollBarKind),
     // 关于
     UpdateBtn,
     UpdateToggle,
@@ -155,6 +171,23 @@ struct UpdateState {
     bundle: Option<UpdateBundle>,
     expanded: HashSet<String>,
     scroll: i32,
+    scroll_f: f32,
+    scroll_target: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScrollBarDrag {
+    kind: ScrollBarKind,
+    grab_dy: f32,
+    frac: f32,
+}
+
+struct ScrollBarSpec {
+    visual_track: RECT,
+    hit_rect: RECT,
+    total: usize,
+    visible: usize,
+    offset: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -172,6 +205,80 @@ struct DockDrag {
     y: i32,
     grab_dy: i32,
     auto_scroll_dir: i32,
+}
+
+/// 推进一次平滑滚动插值，返回 `(新浮点偏移, 取整像素偏移, 是否仍需继续动画)`。
+fn advance_smooth_scroll(
+    cur: f32,
+    target: f32,
+    max_scroll: i32,
+    dt_ms: f32,
+    instant: bool,
+) -> (f32, i32, bool) {
+    let max_f = max_scroll.max(0) as f32;
+    let clamped_target = target.clamp(0.0, max_f);
+    let clamped_cur = cur.clamp(0.0, max_f);
+    if instant || (clamped_target - clamped_cur).abs() < 0.35 {
+        return (clamped_target, clamped_target.round() as i32, false);
+    }
+    let t = 1.0 - (-dt_ms.max(1.0) / SMOOTH_SCROLL_TAU_MS).exp();
+    let next = clamped_cur + (clamped_target - clamped_cur) * t;
+    if (clamped_target - next).abs() < 0.35 {
+        (clamped_target, clamped_target.round() as i32, false)
+    } else {
+        (next, next.round() as i32, true)
+    }
+}
+
+/// 计算列表控件单次滚轮后的行偏移；列表无需滚动或贴边向外推时返回 None 以透传外层页面。
+fn compute_list_wheel_scroll(
+    cur: usize,
+    total: usize,
+    visible: usize,
+    accum: &mut i32,
+    delta: i16,
+) -> Option<usize> {
+    if total <= visible || visible == 0 || delta == 0 {
+        *accum = 0;
+        return None;
+    }
+    let max = total - visible;
+    if *accum != 0 && (*accum > 0) != (delta > 0) {
+        *accum = 0;
+    }
+    *accum += delta as i32;
+    let mut lines = 0isize;
+    while *accum >= 120 {
+        *accum -= 120;
+        lines -= 1;
+    }
+    while *accum <= -120 {
+        *accum += 120;
+        lines += 1;
+    }
+    if lines == 0 {
+        // 触控板微幅增量在未撞边界前先内部蓄力，撞边继续向外推时立即透传给外层页面
+        let pushing_out = (delta > 0 && cur == 0) || (delta < 0 && cur >= max);
+        return if pushing_out { None } else { Some(cur) };
+    }
+    let next = (cur as isize + lines).clamp(0, max as isize) as usize;
+    if next == cur {
+        None
+    } else {
+        Some(next)
+    }
+}
+
+/// 计算列表框右侧内部滚动条的视觉绘制轨道。
+fn list_scrollbar_track(list: &RECT, scale: f32) -> RECT {
+    let px = |v: f32| (v * scale).round() as i32;
+    rc(list.right - px(7.0), list.top + px(4.0), list.right - px(2.0), list.bottom - px(4.0))
+}
+
+/// 计算列表框右侧内部滚动条的点击与悬停命中热区（适当加宽便于鼠标精准抓握）。
+fn list_scrollbar_hit_rect(list: &RECT, scale: f32) -> RECT {
+    let px = |v: f32| (v * scale).round() as i32;
+    rc(list.right - px(12.0), list.top, list.right, list.bottom)
 }
 
 /// 根据鼠标纵坐标 `y` 与抓手偏移计算设置页 Dock 固定项列表的目标落位索引（0..count）。
@@ -220,6 +327,10 @@ struct Dlg {
     page: Page,
     rows: Vec<Row>,
     scroll: i32,
+    scroll_f: f32,
+    scroll_target: f32,
+    scroll_timer_on: bool,
+    last_scroll_tick: Option<std::time::Instant>,
     hover: Hit,
     hover_row: Option<usize>,
     pressed: Hit,
@@ -231,6 +342,9 @@ struct Dlg {
     capture: Option<Field>,
     capture_msg: Option<String>,
     drag_slider: Option<Field>,
+    drag_scrollbar: Option<ScrollBarDrag>,
+    list_wheel_row: Option<usize>,
+    list_wheel_accum: i32,
     dock_drag_press: Option<DockDragPress>,
     dock_drag: Option<DockDrag>,
     dock_sel: usize,
@@ -315,8 +429,8 @@ fn inset(r: RECT, v: i32) -> RECT {
     rc(r.left + v, r.top + v, r.right - v, r.bottom - v)
 }
 
-fn tray_items(app: &App) -> Vec<TrayItem> {
-    app.topbars.first().map(|b| b.tray_items.clone()).unwrap_or_default()
+fn tray_items(app: &App) -> &[TrayItem] {
+    app.topbars.first().map(|b| b.tray_items.as_slice()).unwrap_or(&[])
 }
 
 fn dock_kind_label(item: &crate::config::DockItem) -> &'static str {
@@ -564,6 +678,10 @@ impl Dlg {
             page: Page::General,
             rows: Vec::new(),
             scroll: 0,
+            scroll_f: 0.0,
+            scroll_target: 0.0,
+            scroll_timer_on: false,
+            last_scroll_tick: None,
             hover: Hit::None,
             hover_row: None,
             pressed: Hit::None,
@@ -575,6 +693,9 @@ impl Dlg {
             capture: None,
             capture_msg: None,
             drag_slider: None,
+            drag_scrollbar: None,
+            list_wheel_row: None,
+            list_wheel_accum: 0,
             dock_drag_press: None,
             dock_drag: None,
             dock_sel: 0,
@@ -641,7 +762,10 @@ impl Dlg {
         unsafe {
             let _ = KillTimer(self.hwnd, TIMER_TIP);
             let _ = KillTimer(self.hwnd, TIMER_DOCK_DRAG_SCROLL);
+            let _ = KillTimer(self.hwnd, TIMER_SMOOTH_SCROLL);
         }
+        self.scroll_timer_on = false;
+        self.last_scroll_tick = None;
         self.destroy_fonts();
         self.color_text = None;
         self.target.release();
@@ -651,6 +775,9 @@ impl Dlg {
         self.page = page;
         self.rows = pages::rows(page);
         self.scroll = 0;
+        self.scroll_f = 0.0;
+        self.scroll_target = 0.0;
+        self.stop_scroll_timer();
         self.dock_scroll = 0;
         self.tray_scroll = 0;
         self.exclude_scroll = 0;
@@ -659,11 +786,311 @@ impl Dlg {
         self.pressed = Hit::None;
         self.focus = None;
         self.drag_slider = None;
+        self.drag_scrollbar = None;
+        self.list_wheel_row = None;
+        self.list_wheel_accum = 0;
         self.cancel_dock_drag();
         self.tip_pending = None;
         self.tip_visible = None;
         self.capture = None;
         self.capture_msg = None;
+    }
+
+    /// 启动平滑滚动帧定时器（若尚未启动），避免高频滚轮重复重置定时器。
+    fn start_scroll_timer(&mut self) {
+        if !self.scroll_timer_on && !self.hwnd.0.is_null() {
+            unsafe {
+                let _ = SetTimer(self.hwnd, TIMER_SMOOTH_SCROLL, 15, None);
+            }
+            self.scroll_timer_on = true;
+            self.last_scroll_tick = Some(std::time::Instant::now());
+        }
+    }
+
+    /// 停止平滑滚动帧定时器，保持零空闲唤醒。
+    fn stop_scroll_timer(&mut self) {
+        if self.scroll_timer_on && !self.hwnd.0.is_null() {
+            unsafe {
+                let _ = KillTimer(self.hwnd, TIMER_SMOOTH_SCROLL);
+            }
+        }
+        self.scroll_timer_on = false;
+        self.last_scroll_tick = None;
+    }
+
+    /// 立即定位主页面滚动位置并同步平滑动画状态。
+    fn set_page_scroll_immediate(&mut self, y: i32, max_scroll: i32) {
+        let clamped = y.clamp(0, max_scroll.max(0));
+        self.scroll = clamped;
+        self.scroll_f = clamped as f32;
+        self.scroll_target = clamped as f32;
+        if self.page != Page::About {
+            self.stop_scroll_timer();
+        }
+    }
+
+    /// 立即定位关于页更新日志滚动位置并同步平滑动画状态。
+    fn set_about_scroll_immediate(&mut self, y: i32, max_scroll: i32) {
+        let clamped = y.clamp(0, max_scroll.max(0));
+        self.update.scroll = clamped;
+        self.update.scroll_f = clamped as f32;
+        self.update.scroll_target = clamped as f32;
+        if self.page == Page::About {
+            self.stop_scroll_timer();
+        }
+    }
+
+    /// 累加主页面滚轮增量并在必要时触发平滑动画首帧。
+    fn add_page_scroll_delta(&mut self, delta_px: f32, max_scroll: i32, reduce_motion: bool) -> bool {
+        let max_f = max_scroll.max(0) as f32;
+        self.scroll_target = (self.scroll_target + delta_px).clamp(0.0, max_f);
+        if reduce_motion {
+            let prev = self.scroll;
+            self.scroll_f = self.scroll_target;
+            self.scroll = self.scroll_f.round() as i32;
+            self.stop_scroll_timer();
+            return self.scroll != prev;
+        }
+        let prev = self.scroll;
+        let now = std::time::Instant::now();
+        let should_step_now = !self.scroll_timer_on
+            || self
+                .last_scroll_tick
+                .is_none_or(|t| now.saturating_duration_since(t).as_millis() >= 10);
+        if should_step_now {
+            let dt = self
+                .last_scroll_tick
+                .map(|t| now.saturating_duration_since(t).as_secs_f32() * 1000.0)
+                .unwrap_or(16.0)
+                .clamp(6.0, 32.0);
+            let (nf, ni, still) = advance_smooth_scroll(self.scroll_f, self.scroll_target, max_scroll, dt, false);
+            self.scroll_f = nf;
+            self.scroll = ni;
+            self.last_scroll_tick = Some(now);
+            if still {
+                self.start_scroll_timer();
+            } else {
+                self.stop_scroll_timer();
+            }
+        } else {
+            self.start_scroll_timer();
+        }
+        self.scroll != prev || self.scroll_timer_on
+    }
+
+    /// 累加关于页更新日志滚轮增量并在必要时触发平滑动画首帧。
+    fn add_about_scroll_delta(&mut self, delta_px: f32, max_scroll: i32, reduce_motion: bool) -> bool {
+        let max_f = max_scroll.max(0) as f32;
+        self.update.scroll_target = (self.update.scroll_target + delta_px).clamp(0.0, max_f);
+        if reduce_motion {
+            let prev = self.update.scroll;
+            self.update.scroll_f = self.update.scroll_target;
+            self.update.scroll = self.update.scroll_f.round() as i32;
+            self.stop_scroll_timer();
+            return self.update.scroll != prev;
+        }
+        let prev = self.update.scroll;
+        let now = std::time::Instant::now();
+        let should_step_now = !self.scroll_timer_on
+            || self
+                .last_scroll_tick
+                .is_none_or(|t| now.saturating_duration_since(t).as_millis() >= 10);
+        if should_step_now {
+            let dt = self
+                .last_scroll_tick
+                .map(|t| now.saturating_duration_since(t).as_secs_f32() * 1000.0)
+                .unwrap_or(16.0)
+                .clamp(6.0, 32.0);
+            let (nf, ni, still) =
+                advance_smooth_scroll(self.update.scroll_f, self.update.scroll_target, max_scroll, dt, false);
+            self.update.scroll_f = nf;
+            self.update.scroll = ni;
+            self.last_scroll_tick = Some(now);
+            if still {
+                self.start_scroll_timer();
+            } else {
+                self.stop_scroll_timer();
+            }
+        } else {
+            self.start_scroll_timer();
+        }
+        self.update.scroll != prev || self.scroll_timer_on
+    }
+
+    /// 响应定时器推进一帧平滑滚动；返回主画面是否产生位移需要重绘。
+    fn step_smooth_scroll(&mut self, dc: HDC, l: &Layout, reduce_motion: bool) -> bool {
+        let now = std::time::Instant::now();
+        let dt_ms = self
+            .last_scroll_tick
+            .map(|t| now.saturating_duration_since(t).as_secs_f32() * 1000.0)
+            .unwrap_or(15.0)
+            .clamp(4.0, 50.0);
+        self.last_scroll_tick = Some(now);
+        let (changed, still) = if self.page == Page::About {
+            let max_log = self.about_max_log_scroll(dc, l);
+            let prev = self.update.scroll;
+            let (nf, ni, still) =
+                advance_smooth_scroll(self.update.scroll_f, self.update.scroll_target, max_log, dt_ms, reduce_motion);
+            self.update.scroll_f = nf;
+            self.update.scroll = ni;
+            (ni != prev, still)
+        } else {
+            let prev = self.scroll;
+            let (nf, ni, still) =
+                advance_smooth_scroll(self.scroll_f, self.scroll_target, l.max_scroll, dt_ms, reduce_motion);
+            self.scroll_f = nf;
+            self.scroll = ni;
+            (ni != prev, still)
+        };
+        if !still {
+            self.stop_scroll_timer();
+        }
+        changed
+    }
+
+    /// 计算关于页更新日志区域的最大滚动高度。
+    fn about_max_log_scroll(&self, dc: HDC, l: &Layout) -> i32 {
+        let (_, total) = self.changelog(dc, l.about.log_view);
+        (total - (l.about.log_view.bottom - l.about.log_view.top)).max(0)
+    }
+
+    /// 获取指定滚动条的视觉轨道、交互热区及分页参数；无可滚内容时返回 None。
+    fn scrollbar_spec(&self, dc: HDC, app: &App, l: &Layout, kind: ScrollBarKind) -> Option<ScrollBarSpec> {
+        match kind {
+            ScrollBarKind::Page => {
+                if self.page == Page::About || l.max_scroll <= 0 {
+                    return None;
+                }
+                let pad_x = self.px(5.0);
+                let hit_rect = rc(l.track.left - pad_x, l.track.top, l.track.right + pad_x, l.track.bottom);
+                Some(ScrollBarSpec {
+                    visual_track: l.track,
+                    hit_rect,
+                    total: l.total_h.max(0) as usize,
+                    visible: (l.content.bottom - l.content.top).max(0) as usize,
+                    offset: self.scroll.clamp(0, l.max_scroll) as usize,
+                })
+            }
+            ScrollBarKind::AboutLog => {
+                if self.page != Page::About {
+                    return None;
+                }
+                let a = &l.about;
+                let (_, total) = self.changelog(dc, a.log_view);
+                let visible = (a.log_view.bottom - a.log_view.top).max(0);
+                if total <= visible || visible <= 0 {
+                    return None;
+                }
+                let visual_track = rc(
+                    a.log_view.right + self.px(3.0),
+                    a.log_view.top,
+                    a.log_view.right + self.px(8.0),
+                    a.log_view.bottom,
+                );
+                let hit_rect = rc(a.log_view.right, a.log_view.top, a.log.right, a.log_view.bottom);
+                let max_off = (total - visible).max(0);
+                Some(ScrollBarSpec {
+                    visual_track,
+                    hit_rect,
+                    total: total as usize,
+                    visible: visible as usize,
+                    offset: self.update.scroll.clamp(0, max_off) as usize,
+                })
+            }
+            ScrollBarKind::DockList | ScrollBarKind::TrayList | ScrollBarKind::ExcludeList => {
+                let target_is = |row: &Row| match (kind, row) {
+                    (ScrollBarKind::DockList, Row::DockList) => true,
+                    (ScrollBarKind::TrayList, Row::TrayList) => true,
+                    (ScrollBarKind::ExcludeList, Row::Exclude) => true,
+                    _ => false,
+                };
+                let ri = self.rows.iter().position(target_is)?;
+                let g = self.geom(dc, app, l, ri);
+                let (list, _, _) = g.list?;
+                let (total, visible, offset) = match kind {
+                    ScrollBarKind::DockList => (app.dock_items.items.len(), DOCK_VISIBLE, self.dock_scroll),
+                    ScrollBarKind::TrayList => (tray_items(app).len(), TRAY_VISIBLE, self.tray_scroll),
+                    ScrollBarKind::ExcludeList => (
+                        app.config.topbar.adaptive_color_exclude.len(),
+                        EXCLUDE_VISIBLE,
+                        self.exclude_scroll,
+                    ),
+                    _ => return None,
+                };
+                if total <= visible || visible == 0 {
+                    return None;
+                }
+                let max_off = total - visible;
+                Some(ScrollBarSpec {
+                    visual_track: list_scrollbar_track(&list, self.scale),
+                    hit_rect: list_scrollbar_hit_rect(&list, self.scale),
+                    total,
+                    visible,
+                    offset: offset.min(max_off),
+                })
+            }
+        }
+    }
+
+    /// 根据规格与光标纵坐标开始拖动滚动条；若点在轨道空白处则立即跳至该位置并接续拖动。
+    fn begin_scrollbar_drag(&mut self, dc: HDC, app: &App, l: &Layout, kind: ScrollBarKind, y: i32) -> bool {
+        let Some(spec) = self.scrollbar_spec(dc, app, l, kind) else {
+            return false;
+        };
+        let Some((thumb, max_off, _)) =
+            scrollbar_thumb_rect(&spec.visual_track, spec.total, spec.visible, spec.offset, self.scale)
+        else {
+            return false;
+        };
+        if y >= thumb.top && y <= thumb.bottom {
+            let grab_dy = (y - thumb.top) as f32;
+            let frac = (spec.offset.min(max_off) as f32 / max_off.max(1) as f32).clamp(0.0, 1.0);
+            match kind {
+                ScrollBarKind::Page => self.set_page_scroll_immediate(self.scroll, max_off as i32),
+                ScrollBarKind::AboutLog => self.set_about_scroll_immediate(self.update.scroll, max_off as i32),
+                _ => {}
+            }
+            self.drag_scrollbar = Some(ScrollBarDrag { kind, grab_dy, frac });
+        } else {
+            let grab_dy = (thumb.bottom - thumb.top) as f32 * 0.5;
+            if let Some((new_off, frac)) =
+                scrollbar_offset_from_y(&spec.visual_track, spec.total, spec.visible, y, grab_dy, self.scale)
+            {
+                self.apply_scrollbar_offset(kind, new_off, max_off);
+                self.drag_scrollbar = Some(ScrollBarDrag { kind, grab_dy, frac });
+            }
+        }
+        self.drag_scrollbar.is_some()
+    }
+
+    /// 拖动滚动条过程中按鼠标 Y 坐标实时更新偏移量。
+    fn update_scrollbar_drag(&mut self, dc: HDC, app: &App, l: &Layout, y: i32) -> bool {
+        let Some(mut drag) = self.drag_scrollbar else {
+            return false;
+        };
+        let Some(spec) = self.scrollbar_spec(dc, app, l, drag.kind) else {
+            return false;
+        };
+        if let Some((new_off, frac)) =
+            scrollbar_offset_from_y(&spec.visual_track, spec.total, spec.visible, y, drag.grab_dy, self.scale)
+        {
+            drag.frac = frac;
+            self.drag_scrollbar = Some(drag);
+            self.apply_scrollbar_offset(drag.kind, new_off, spec.total.saturating_sub(spec.visible));
+            return true;
+        }
+        false
+    }
+
+    fn apply_scrollbar_offset(&mut self, kind: ScrollBarKind, off: usize, max_off: usize) {
+        let clamped = off.min(max_off);
+        match kind {
+            ScrollBarKind::Page => self.set_page_scroll_immediate(clamped as i32, max_off as i32),
+            ScrollBarKind::AboutLog => self.set_about_scroll_immediate(clamped as i32, max_off as i32),
+            ScrollBarKind::DockList => self.dock_scroll = clamped,
+            ScrollBarKind::TrayList => self.tray_scroll = clamped,
+            ScrollBarKind::ExcludeList => self.exclude_scroll = clamped,
+        }
     }
 
     /// 终止并清理设置页 Dock 固定项拖拽状态与边缘滚动定时器。
@@ -991,7 +1418,7 @@ impl Dlg {
                     .map(|r| {
                         let sz = self.px(20.0);
                         let cy = (r.top + r.bottom) / 2;
-                        rc(r.right - self.px(12.0) - sz, cy - sz / 2, r.right - self.px(12.0), cy + sz / 2)
+                        rc(r.right - self.px(16.0) - sz, cy - sz / 2, r.right - self.px(16.0), cy + sz / 2)
                     })
                     .collect();
                 g.list = Some((list, rows, btns));
@@ -1013,8 +1440,10 @@ impl Dlg {
         if self.page == Page::About {
             return self.about_hit(l, dc, x, y);
         }
-        if inside(&l.track, x, y) {
-            return Hit::ScrollBar;
+        if let Some(spec) = self.scrollbar_spec(dc, app, l, ScrollBarKind::Page) {
+            if inside(&spec.hit_rect, x, y) {
+                return Hit::ScrollBar(ScrollBarKind::Page);
+            }
         }
         if !inside(&l.content, x, y) {
             return if y < l.header_h { Hit::DragBar } else { Hit::None };
@@ -1056,7 +1485,14 @@ impl Dlg {
                     if let Some(b) = g.small[1] { if inside(&b, x, y) { return Hit::DockAdd } }
                     if let Some(b) = g.small[0] { if inside(&b, x, y) { return Hit::DockReset } }
                     match &g.list {
-                        Some((_, rows, _)) => rows.iter().position(|r| inside(r, x, y)).map(|vi| Hit::DockRow(self.dock_scroll + vi)).unwrap_or(Hit::None),
+                        Some((list, rows, _)) => {
+                            if app.dock_items.items.len() > DOCK_VISIBLE
+                                && inside(&list_scrollbar_hit_rect(list, self.scale), x, y)
+                            {
+                                return Hit::ScrollBar(ScrollBarKind::DockList);
+                            }
+                            rows.iter().position(|r| inside(r, x, y)).map(|vi| Hit::DockRow(self.dock_scroll + vi)).unwrap_or(Hit::None)
+                        }
                         None => Hit::None,
                     }
                 }
@@ -1065,7 +1501,14 @@ impl Dlg {
                         return Hit::TrayRefresh;
                     }
                     match &g.list {
-                        Some((_, rows, _)) => rows.iter().position(|r| inside(r, x, y)).map(|vi| Hit::TrayRow(self.tray_scroll + vi)).unwrap_or(Hit::None),
+                        Some((list, rows, _)) => {
+                            if tray_items(app).len() > TRAY_VISIBLE
+                                && inside(&list_scrollbar_hit_rect(list, self.scale), x, y)
+                            {
+                                return Hit::ScrollBar(ScrollBarKind::TrayList);
+                            }
+                            rows.iter().position(|r| inside(r, x, y)).map(|vi| Hit::TrayRow(self.tray_scroll + vi)).unwrap_or(Hit::None)
+                        }
                         None => Hit::None,
                     }
                 }
@@ -1074,7 +1517,12 @@ impl Dlg {
                         return Hit::ExcludeAdd;
                     }
                     match &g.list {
-                        Some((_, rows, btns)) => {
+                        Some((list, rows, btns)) => {
+                            if app.config.topbar.adaptive_color_exclude.len() > EXCLUDE_VISIBLE
+                                && inside(&list_scrollbar_hit_rect(list, self.scale), x, y)
+                            {
+                                return Hit::ScrollBar(ScrollBarKind::ExcludeList);
+                            }
                             if let Some(vi) = btns.iter().position(|b| inside(b, x, y)) {
                                 return Hit::ExcludeRemove(self.exclude_scroll + vi);
                             }
@@ -1101,6 +1549,13 @@ impl Dlg {
         for (i, r) in a.links.iter().enumerate() {
             if r.map(|r| inside(&r, x, y)).unwrap_or(false) {
                 return Hit::Link(i as u8);
+            }
+        }
+        let log_sb_hit = rc(a.log_view.right, a.log_view.top, a.log.right, a.log_view.bottom);
+        if inside(&log_sb_hit, x, y) {
+            let (_, total) = self.changelog(dc, a.log_view);
+            if total > (a.log_view.bottom - a.log_view.top) {
+                return Hit::ScrollBar(ScrollBarKind::AboutLog);
             }
         }
         if inside(&a.log_view, x, y) {
@@ -1325,6 +1780,7 @@ impl Dlg {
                 self.show_page(p);
                 if p == Page::Topbar {
                     app.refresh_tray();
+                    self.tray_scroll = self.tray_scroll.min(tray_items(app).len().saturating_sub(TRAY_VISIBLE));
                 }
             }
             Hit::Toggle(f) => {
@@ -1436,10 +1892,12 @@ impl Dlg {
             Hit::DockRow(i) => {
                 self.dock_sel = i.min(app.dock_items.items.len().saturating_sub(1));
             }
-            Hit::TrayRefresh => app.refresh_tray(),
+            Hit::TrayRefresh => {
+                app.refresh_tray();
+                self.tray_scroll = self.tray_scroll.min(tray_items(app).len().saturating_sub(TRAY_VISIBLE));
+            }
             Hit::TrayRow(i) => {
-                if let Some(t) = tray_items(app).get(i) {
-                    let key = t.key.clone();
+                if let Some(key) = tray_items(app).get(i).map(|t| t.key.clone()) {
                     app.toggle_tray_pin(&key);
                 }
             }
@@ -1462,6 +1920,9 @@ impl Dlg {
             Hit::ExcludeRemove(i) => {
                 if i < app.config.topbar.adaptive_color_exclude.len() {
                     app.config.topbar.adaptive_color_exclude.remove(i);
+                    self.exclude_scroll = self.exclude_scroll.min(
+                        app.config.topbar.adaptive_color_exclude.len().saturating_sub(EXCLUDE_VISIBLE),
+                    );
                     self.commit(app, false, true);
                 }
             }
@@ -1476,7 +1937,7 @@ impl Dlg {
                     if !self.update.expanded.remove(&n.version) {
                         self.update.expanded.insert(n.version.clone());
                     }
-                    self.update.scroll = 0;
+                    self.set_about_scroll_immediate(0, 0);
                 }
             }
             Hit::Link(k) => {
@@ -1739,9 +2200,14 @@ fn render_surface(dlg: &mut Dlg, app: &App) -> Option<(HDC, i32, i32)> {
         return None;
     }
     let dc = dlg.target.mem_dc?;
+    dlg.dock_scroll = dlg.dock_scroll.min(app.dock_items.items.len().saturating_sub(DOCK_VISIBLE));
+    dlg.tray_scroll = dlg.tray_scroll.min(tray_items(app).len().saturating_sub(TRAY_VISIBLE));
+    dlg.exclude_scroll = dlg.exclude_scroll.min(
+        app.config.topbar.adaptive_color_exclude.len().saturating_sub(EXCLUDE_VISIBLE),
+    );
     let mut l = dlg.layout(dc, app);
     if dlg.scroll > l.max_scroll {
-        dlg.scroll = l.max_scroll;
+        dlg.set_page_scroll_immediate(l.max_scroll, l.max_scroll);
         l = dlg.layout(dc, app);
     }
     if dlg.page == Page::About && dlg.color_text.is_none() {
@@ -1847,6 +2313,22 @@ fn paint_frame(dlg: &Dlg, l: &Layout, sf: &mut Surface, dc: HDC) {
     let _ = draw_text(dc, &format!("v{}", update::VERSION), dlg.font_sub, &vr, p.text_secondary, TextAlign::Left, true, false);
 }
 
+/// 统一绘制设置页全部垂直滚动条，同步绑定悬停、拖动激活态与连续拖拽位置。
+fn paint_scrollbar_for(
+    dlg: &Dlg,
+    sf: &mut Surface,
+    track: &RECT,
+    kind: ScrollBarKind,
+    total: usize,
+    visible: usize,
+    offset: usize,
+) {
+    let hov = dlg.hover == Hit::ScrollBar(kind);
+    let active = dlg.drag_scrollbar.is_some_and(|d| d.kind == kind);
+    let frac = dlg.drag_scrollbar.filter(|d| d.kind == kind).map(|d| d.frac);
+    draw_scrollbar_with_state(sf, track, total, visible, offset, frac, hov, active, dlg.dark, dlg.scale);
+}
+
 fn paint_rows(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: HDC) {
     let s = dlg.scale;
     let p = &dlg.pal;
@@ -1872,14 +2354,14 @@ fn paint_rows(dlg: &Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: HDC) {
             paint_row(dlg, app, l, sf, dc, ri);
         }
     });
-    draw_scrollbar(
+    paint_scrollbar_for(
+        dlg,
         sf,
         &l.track,
+        ScrollBarKind::Page,
         l.total_h.max(0) as usize,
         (l.content.bottom - l.content.top).max(0) as usize,
         dlg.scroll.max(0) as usize,
-        dlg.hover == Hit::ScrollBar,
-        s,
     );
 }
 
@@ -2097,8 +2579,8 @@ fn paint_dock_row_content(
         }
     }
     let tx = (icx + half) as i32 + dlg.px(10.0);
-    draw_text(dc, &dock_label(it), dlg.font_body, &rc(tx, r.top, r.right - dlg.px(76.0), r.bottom), p.text, TextAlign::Left, true, false);
-    draw_text(dc, dock_kind_label(it), dlg.font_sub, &rc(r.right - dlg.px(72.0), r.top, r.right - dlg.px(10.0), r.bottom), p.text_secondary, TextAlign::Right, true, false);
+    draw_text(dc, &dock_label(it), dlg.font_body, &rc(tx, r.top, r.right - dlg.px(80.0), r.bottom), p.text, TextAlign::Left, true, false);
+    draw_text(dc, dock_kind_label(it), dlg.font_sub, &rc(r.right - dlg.px(76.0), r.top, r.right - dlg.px(14.0), r.bottom), p.text_secondary, TextAlign::Right, true, false);
 }
 
 fn paint_dock_list(dlg: &Dlg, app: &App, sf: &mut Surface, dc: HDC, g: &Geom) {
@@ -2179,7 +2661,15 @@ fn paint_dock_list(dlg: &Dlg, app: &App, sf: &mut Surface, dc: HDC, g: &Geom) {
             }
         }
     });
-    draw_scrollbar(sf, &rc(list.right - dlg.px(4.0), list.top + 2, list.right - 1, list.bottom - 2), sorted.len(), DOCK_VISIBLE, dlg.dock_scroll, false, s);
+    paint_scrollbar_for(
+        dlg,
+        sf,
+        &list_scrollbar_track(list, s),
+        ScrollBarKind::DockList,
+        sorted.len(),
+        DOCK_VISIBLE,
+        dlg.dock_scroll,
+    );
 }
 
 fn paint_tray_list(dlg: &Dlg, app: &App, sf: &mut Surface, dc: HDC, g: &Geom) {
@@ -2223,7 +2713,7 @@ fn paint_tray_list(dlg: &Dlg, app: &App, sf: &mut Surface, dc: HDC, g: &Geom) {
                     sf.draw_icon_bilinear(&px, icx, icy, isz as f32, false, 0.0);
                 }
             }
-            let pill = rc(r.right - dlg.px(74.0), (icy - dlg.px(11.0) as f32) as i32, r.right - dlg.px(10.0), (icy + dlg.px(11.0) as f32) as i32);
+            let pill = rc(r.right - dlg.px(78.0), (icy - dlg.px(11.0) as f32) as i32, r.right - dlg.px(14.0), (icy + dlg.px(11.0) as f32) as i32);
             sf.fill_rrect(&pill, 6.0 * s, if pinned { accent_alpha(p, dlg.dark, 0.14) } else { p.control_bg });
             draw_text(dc, if pinned { "已固定" } else { "收进折叠" }, dlg.font_sub, &pill, if pinned { p.accent } else { p.text_secondary }, TextAlign::Center, true, false);
             let name: String = it.name.chars().take(48).collect();
@@ -2231,7 +2721,15 @@ fn paint_tray_list(dlg: &Dlg, app: &App, sf: &mut Surface, dc: HDC, g: &Geom) {
             focus_ring(dlg, sf, Hit::TrayRow(idx), rr, s);
         }
     });
-    draw_scrollbar(sf, &rc(list.right - dlg.px(4.0), list.top + 2, list.right - 1, list.bottom - 2), items.len(), TRAY_VISIBLE, dlg.tray_scroll, false, s);
+    paint_scrollbar_for(
+        dlg,
+        sf,
+        &list_scrollbar_track(list, s),
+        ScrollBarKind::TrayList,
+        items.len(),
+        TRAY_VISIBLE,
+        dlg.tray_scroll,
+    );
 }
 
 fn paint_exclude(dlg: &Dlg, app: &App, sf: &mut Surface, dc: HDC, g: &Geom) {
@@ -2266,12 +2764,21 @@ fn paint_exclude(dlg: &Dlg, app: &App, sf: &mut Surface, dc: HDC, g: &Geom) {
             focus_ring(dlg, sf, hit, b, s);
         }
     });
-    draw_scrollbar(sf, &rc(list.right - dlg.px(4.0), list.top + 2, list.right - 1, list.bottom - 2), ex.len(), EXCLUDE_VISIBLE, dlg.exclude_scroll, false, s);
+    paint_scrollbar_for(
+        dlg,
+        sf,
+        &list_scrollbar_track(list, s),
+        ScrollBarKind::ExcludeList,
+        ex.len(),
+        EXCLUDE_VISIBLE,
+        dlg.exclude_scroll,
+    );
 }
 
 fn paint_about(dlg: &mut Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: HDC) {
     let s = dlg.scale;
-    let p = &dlg.pal;
+    let pal = dlg.pal;
+    let p = &pal;
     let a = &l.about;
     let u = &dlg.update;
     let px = |v: f32| (v * s).round() as i32;
@@ -2324,7 +2831,7 @@ fn paint_about(dlg: &mut Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: HDC) 
     let (_, raw_total) = dlg.changelog(dc, a.log_view);
     let max_log_scroll = (raw_total - (a.log_view.bottom - a.log_view.top)).max(0);
     if dlg.update.scroll > max_log_scroll {
-        dlg.update.scroll = max_log_scroll;
+        dlg.set_about_scroll_immediate(max_log_scroll, max_log_scroll);
     }
     let (items, total) = dlg.changelog(dc, a.log_view);
     let notes = update::bundled_notes();
@@ -2392,14 +2899,14 @@ fn paint_about(dlg: &mut Dlg, app: &App, l: &Layout, sf: &mut Surface, dc: HDC) 
             });
         }
     }
-    draw_scrollbar(
+    paint_scrollbar_for(
+        dlg,
         sf,
-        &rc(a.log_view.right + px(2.0), a.log_view.top, a.log_view.right + px(6.0), a.log_view.bottom),
+        &rc(a.log_view.right + px(3.0), a.log_view.top, a.log_view.right + px(8.0), a.log_view.bottom),
+        ScrollBarKind::AboutLog,
         total.max(0) as usize,
         (a.log_view.bottom - a.log_view.top).max(0) as usize,
         dlg.update.scroll.max(0) as usize,
-        false,
-        s,
     );
 }
 
@@ -2517,6 +3024,22 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     } else {
                         let _ = KillTimer(hwnd, TIMER_DOCK_DRAG_SCROLL);
                     }
+                } else if wparam.0 == TIMER_SMOOTH_SCROLL {
+                    let dc = dlg.dc();
+                    let l = dlg.layout(dc, app);
+                    if dlg.step_smooth_scroll(dc, &l, app.config.appearance.reduce_motion) {
+                        dlg.tip_visible = None;
+                        let mut pt = POINT::default();
+                        if GetCursorPos(&mut pt).is_ok() && ScreenToClient(hwnd, &mut pt).as_bool() {
+                            let l_after = dlg.layout(dc, app);
+                            if pt.x >= 0 && pt.x < l_after.w && pt.y >= 0 && pt.y < l_after.h {
+                                let hit = dlg.hit_test(&l_after, dc, app, pt.x, pt.y);
+                                dlg.hover = hit;
+                                dlg.update_tip(&l_after, app, dc, hit);
+                            }
+                        }
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
                 }
                 LRESULT(0)
             }
@@ -2524,6 +3047,21 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 let dc = dlg.dc();
                 let (x, y) = (get_x_lparam(lparam.0), get_y_lparam(lparam.0));
                 let l = dlg.layout(dc, app);
+                if dlg.drag_scrollbar.is_some() {
+                    dlg.tip_pending = None;
+                    dlg.tip_visible = None;
+                    let _ = KillTimer(hwnd, TIMER_TIP);
+                    if dlg.update_scrollbar_drag(dc, app, &l, y) {
+                        // 拖动滚动条期间同步直绘客户区，确保滑块跟手且无延迟
+                        let wdc = GetDC(hwnd);
+                        if !wdc.is_invalid() {
+                            paint_to_dc(dlg, app, wdc);
+                            let _ = ReleaseDC(hwnd, wdc);
+                            let _ = ValidateRect(hwnd, None);
+                        }
+                    }
+                    return LRESULT(0);
+                }
                 if let Some(press) = dlg.dock_drag_press {
                     if dlg.dock_drag.is_none() {
                         let dist2 = (x - press.start_x).pow(2) + (y - press.start_y).pow(2);
@@ -2584,47 +3122,96 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 LRESULT(0)
             }
             WM_MOUSEWHEEL => {
+                if dlg.drag_scrollbar.is_some() {
+                    return LRESULT(0);
+                }
+                let delta = get_wheel_delta(wparam.0);
+                if delta == 0 {
+                    return LRESULT(0);
+                }
                 let dc = dlg.dc();
                 let mut pt = POINT { x: get_x_lparam(lparam.0), y: get_y_lparam(lparam.0) };
                 let _ = ScreenToClient(hwnd, &mut pt);
                 let l = dlg.layout(dc, app);
-                let step = if get_wheel_delta(wparam.0) > 0 { -1 } else { 1 };
+                let reduce = app.config.appearance.reduce_motion;
                 if dlg.page == Page::About {
                     if inside(&l.about.log_view, pt.x, pt.y) {
-                        let (_, total) = dlg.changelog(dc, l.about.log_view);
-                        let max = (total - (l.about.log_view.bottom - l.about.log_view.top)).max(0);
-                        dlg.update.scroll = (dlg.update.scroll + step * dlg.px(60.0)).clamp(0, max);
-                        let _ = InvalidateRect(hwnd, None, false);
+                        let max_log = dlg.about_max_log_scroll(dc, &l);
+                        let px_delta = -(delta as f32 / 120.0) * (WHEEL_ABOUT_STEP_DP * dlg.scale);
+                        if dlg.add_about_scroll_delta(px_delta, max_log, reduce) {
+                            dlg.tip_visible = None;
+                            let l_after = dlg.layout(dc, app);
+                            let hit = dlg.hit_test(&l_after, dc, app, pt.x, pt.y);
+                            dlg.hover = hit;
+                            dlg.update_tip(&l_after, app, dc, hit);
+                            let _ = InvalidateRect(hwnd, None, false);
+                        }
                     }
                     return LRESULT(0);
                 }
-                if let Some(ri) = dlg.hover_row {
-                    let g = dlg.geom(dc, app, &l, ri);
-                    if let Some((list, _, _)) = &g.list {
-                        if inside(list, pt.x, pt.y) {
-                            let (n, cur) = match &dlg.rows[ri] {
-                                Row::DockList => (app.dock_items.items.len(), &mut dlg.dock_scroll),
-                                Row::TrayList => (tray_items(app).len(), &mut dlg.tray_scroll),
-                                Row::Exclude => (app.config.topbar.adaptive_color_exclude.len(), &mut dlg.exclude_scroll),
-                                _ => (0, &mut dlg.dock_scroll),
-                            };
-                            // 按具体列表类型读取可见行数，避免托盘列表滚轮上限错用 Dock 可见行数
-                            let visible = list_visible(&dlg.rows[ri]);
-                            let max = n.saturating_sub(visible) as i32;
-                            *cur = (*cur as i32 + step).clamp(0, max) as usize;
-                            if matches!(&dlg.rows[ri], Row::DockList) && dlg.dock_drag.is_some() {
-                                dlg.update_dock_drag(app, &l, pt.y);
+                // 先检查光标实际所在列表控件；仅当列表确需滚动且未撞边时拦截滚轮，否则透传给外层页面
+                if inside(&l.content, pt.x, pt.y) {
+                    if let Some((ri, _)) = l.rows.iter().enumerate().find(|(_, r)| inside(r, pt.x, pt.y)) {
+                        let g = dlg.geom(dc, app, &l, ri);
+                        if let Some((list, _, _)) = &g.list {
+                            if inside(list, pt.x, pt.y) {
+                                let visible = list_visible(&dlg.rows[ri]);
+                                let total = match &dlg.rows[ri] {
+                                    Row::DockList => app.dock_items.items.len(),
+                                    Row::TrayList => tray_items(app).len(),
+                                    Row::Exclude => app.config.topbar.adaptive_color_exclude.len(),
+                                    _ => 0,
+                                };
+                                let cur = match &dlg.rows[ri] {
+                                    Row::DockList => dlg.dock_scroll,
+                                    Row::TrayList => dlg.tray_scroll,
+                                    Row::Exclude => dlg.exclude_scroll,
+                                    _ => 0,
+                                };
+                                if dlg.list_wheel_row != Some(ri) {
+                                    dlg.list_wheel_row = Some(ri);
+                                    dlg.list_wheel_accum = 0;
+                                }
+                                let is_dragging_dock =
+                                    matches!(&dlg.rows[ri], Row::DockList) && dlg.dock_drag.is_some();
+                                let mut accum = dlg.list_wheel_accum;
+                                let list_res = compute_list_wheel_scroll(cur, total, visible, &mut accum, delta);
+                                dlg.list_wheel_accum = accum;
+                                if let Some(next) = list_res {
+                                    if next != cur {
+                                        match &dlg.rows[ri] {
+                                            Row::DockList => dlg.dock_scroll = next,
+                                            Row::TrayList => dlg.tray_scroll = next,
+                                            Row::Exclude => dlg.exclude_scroll = next,
+                                            _ => {}
+                                        }
+                                        if is_dragging_dock {
+                                            dlg.update_dock_drag(app, &l, pt.y);
+                                        }
+                                        let l_after = dlg.layout(dc, app);
+                                        let hit = dlg.hit_test(&l_after, dc, app, pt.x, pt.y);
+                                        dlg.hover = hit;
+                                        dlg.update_tip(&l_after, app, dc, hit);
+                                        let _ = InvalidateRect(hwnd, None, false);
+                                    }
+                                    return LRESULT(0);
+                                }
+                                if is_dragging_dock {
+                                    return LRESULT(0);
+                                }
                             }
-                            let _ = InvalidateRect(hwnd, None, false);
-                            return LRESULT(0);
                         }
                     }
                 }
-                dlg.scroll = (dlg.scroll + step * dlg.px(72.0)).clamp(0, l.max_scroll);
-                let hit = dlg.hit_test(&l, dc, app, pt.x, pt.y);
-                dlg.hover = hit;
-                dlg.update_tip(&l, app, dc, hit);
-                let _ = InvalidateRect(hwnd, None, false);
+                let px_delta = -(delta as f32 / 120.0) * (WHEEL_PAGE_STEP_DP * dlg.scale);
+                if dlg.add_page_scroll_delta(px_delta, l.max_scroll, reduce) {
+                    dlg.tip_visible = None;
+                    let l_after = dlg.layout(dc, app);
+                    let hit = dlg.hit_test(&l_after, dc, app, pt.x, pt.y);
+                    dlg.hover = hit;
+                    dlg.update_tip(&l_after, app, dc, hit);
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
                 LRESULT(0)
             }
             WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
@@ -2672,10 +3259,9 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     dlg.drag_slider = Some(f);
                     dlg.set_slider(app, f, &l, x);
                 }
-                if hit == Hit::ScrollBar {
-                    let view = l.content.bottom - l.content.top;
-                    let mid = (l.track.top + l.track.bottom) / 2;
-                    dlg.scroll = (dlg.scroll + if y < mid { -view } else { view }).clamp(0, l.max_scroll);
+                if let Hit::ScrollBar(kind) = hit {
+                    dlg.hover = Hit::ScrollBar(kind);
+                    dlg.begin_scrollbar_drag(dc, app, &l, kind, y);
                 }
                 let _ = InvalidateRect(hwnd, None, false);
                 LRESULT(0)
@@ -2683,6 +3269,7 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
             WM_LBUTTONUP => {
                 let pressed = dlg.pressed;
                 let was_slider_drag = dlg.drag_slider.take().is_some();
+                let was_scrollbar_drag = dlg.drag_scrollbar.take().is_some();
                 dlg.dock_drag_press = None;
                 let dock_drag = dlg.dock_drag.is_some();
                 let dc = dlg.dc();
@@ -2696,6 +3283,7 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 let _ = ReleaseCapture();
                 let hit = dlg.hit_test(&l, dc, app, x, y);
                 dlg.pressed = Hit::None;
+                dlg.hover = hit;
                 if let Some(drag) = finished_dock_drag {
                     if drag.from_idx != drag.target_idx {
                         let mut di = app.dock_items.clone();
@@ -2705,14 +3293,13 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                             app.set_dock_items(di);
                         }
                     }
-                    dlg.hover = hit;
                     dlg.update_tip(&l, app, dc, hit);
                     let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
                 }
                 if was_slider_drag {
                     app.persist();
-                } else if pressed != Hit::None && pressed == hit {
+                } else if !was_scrollbar_drag && pressed != Hit::None && pressed == hit {
                     dlg.activate(app, hit, dc, &l, 0);
                 }
                 dlg.update_tip(&l, app, dc, hit);
@@ -2722,11 +3309,12 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
             WM_CAPTURECHANGED => {
                 dlg.pressed = Hit::None;
                 let had_dock_drag = dlg.dock_drag.is_some() || dlg.dock_drag_press.is_some();
+                let had_scrollbar_drag = dlg.drag_scrollbar.take().is_some();
                 dlg.cancel_dock_drag();
                 if dlg.drag_slider.take().is_some() {
                     app.persist();
                     let _ = InvalidateRect(hwnd, None, false);
-                } else if had_dock_drag {
+                } else if had_dock_drag || had_scrollbar_drag {
                     let _ = InvalidateRect(hwnd, None, false);
                 }
                 LRESULT(0)
@@ -2783,12 +3371,13 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         dlg.focus_from_keyboard = true;
                         if let Some(ri) = dlg.hit_row(next) {
                             let r = l.rows[ri];
+                            let mut next_scroll = dlg.scroll;
                             if r.top < l.content.top {
-                                dlg.scroll -= l.content.top - r.top;
+                                next_scroll -= l.content.top - r.top;
                             } else if r.bottom > l.content.bottom {
-                                dlg.scroll += r.bottom - l.content.bottom;
+                                next_scroll += r.bottom - l.content.bottom;
                             }
-                            dlg.scroll = dlg.scroll.clamp(0, l.max_scroll);
+                            dlg.set_page_scroll_immediate(next_scroll, l.max_scroll);
                         }
                     }
                 } else if is(VK_LEFT) || is(VK_RIGHT) || is(VK_UP) || is(VK_DOWN) {
@@ -2804,14 +3393,16 @@ fn handle(dlg: &mut Dlg, app: &mut App, hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         dlg.activate(app, h, dc, &l, 0);
                     }
                 } else if is(VK_PRIOR) || is(VK_NEXT) {
-                    let view = (l.content.bottom - l.content.top).max(1);
-                    let step = if is(VK_PRIOR) { -view } else { view };
+                    let reduce = app.config.appearance.reduce_motion;
                     if dlg.page == Page::About {
-                        let (_, total) = dlg.changelog(dc, l.about.log_view);
-                        let max = (total - view).max(0);
-                        dlg.update.scroll = (dlg.update.scroll + step).clamp(0, max);
+                        let view = (l.about.log_view.bottom - l.about.log_view.top).max(1);
+                        let step = if is(VK_PRIOR) { -view } else { view };
+                        let max_log = dlg.about_max_log_scroll(dc, &l);
+                        let _ = dlg.add_about_scroll_delta(step as f32, max_log, reduce);
                     } else {
-                        dlg.scroll = (dlg.scroll + step).clamp(0, l.max_scroll);
+                        let view = (l.content.bottom - l.content.top).max(1);
+                        let step = if is(VK_PRIOR) { -view } else { view };
+                        let _ = dlg.add_page_scroll_delta(step as f32, l.max_scroll, reduce);
                     }
                 }
                 let _ = InvalidateRect(hwnd, None, false);
@@ -2860,19 +3451,95 @@ mod tests {
     }
 
     #[test]
-    fn dock_list_displays_six_rows_without_affecting_other_lists() {
+    fn nav_tabs_use_expected_labels() {
+        assert_eq!(Page::Dock.title(), "底部Dock栏");
+        assert_eq!(Page::Topbar.title(), "顶部菜单栏");
+        assert!(NAV.iter().any(|(p, t)| *p == Page::Dock && *t == "底部Dock栏"));
+        assert!(NAV.iter().any(|(p, t)| *p == Page::Topbar && *t == "顶部菜单栏"));
+    }
+
+    #[test]
+    fn dock_and_tray_lists_display_six_rows_without_affecting_exclude_list() {
         assert_eq!(DOCK_VISIBLE, 6);
+        assert_eq!(TRAY_VISIBLE, 6);
+        assert_eq!(EXCLUDE_VISIBLE, 3);
         assert_eq!(list_visible(&Row::DockList), 6);
-        assert_eq!(list_visible(&Row::TrayList), TRAY_VISIBLE);
-        assert_eq!(list_visible(&Row::Exclude), EXCLUDE_VISIBLE);
+        assert_eq!(list_visible(&Row::TrayList), 6);
+        assert_eq!(list_visible(&Row::Exclude), 3);
 
         let cfg = Config::default();
         let dlg = Dlg::new(std::ptr::null_mut(), 1.0, &cfg);
         assert_eq!(dlg.row_height(HDC::default(), &Row::DockList, 600), 54 + 36 * 6);
-        assert_eq!(dlg.row_height(HDC::default(), &Row::TrayList, 600), 54 + 36 * 4);
+        assert_eq!(dlg.row_height(HDC::default(), &Row::TrayList, 600), 54 + 36 * 6);
+        assert_eq!(dlg.row_height(HDC::default(), &Row::Exclude, 600), 54 + 36 * 3);
         let list = rc(0, 0, 500, 300);
         assert_eq!(dlg.list_rows(list, 10, 0, DOCK_VISIBLE).len(), 6);
-        assert_eq!(dlg.list_rows(list, 4, 0, DOCK_VISIBLE).len(), 4);
+        assert_eq!(dlg.list_rows(list, 10, 0, TRAY_VISIBLE).len(), 6);
+        assert_eq!(dlg.list_rows(list, 4, 0, TRAY_VISIBLE).len(), 4);
+    }
+
+    #[test]
+    fn smooth_scroll_converges_and_respects_reduce_motion() {
+        let mut cur = 0.0f32;
+        let target = 216.0f32;
+        let mut prev_i = 0;
+        let mut steps = 0;
+        loop {
+            let (nf, ni, still) = advance_smooth_scroll(cur, target, 500, 16.0, false);
+            assert!(ni >= prev_i, "平滑滚动过程应单调递增: prev={prev_i}, next={ni}");
+            cur = nf;
+            prev_i = ni;
+            steps += 1;
+            if !still {
+                break;
+            }
+            assert!(steps < 60, "平滑滚动应在合理帧数内收敛");
+        }
+        assert_eq!(prev_i, 216);
+        assert!(steps > 3, "开启平滑动画时应分多帧过渡而非一步硬跳");
+
+        // 减少动态效果或越界目标应直接到位并夹紧在 [0, max_scroll]
+        let (rf, ri, rstill) = advance_smooth_scroll(10.0, 999.0, 320, 16.0, true);
+        assert!(!rstill);
+        assert_eq!(ri, 320);
+        assert!((rf - 320.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn list_wheel_forwards_to_page_when_unscrollable_or_at_bounds() {
+        let mut accum = 0;
+        // 1. 空列表或不足 6 行的列表不消费滚轮，透传外层页面
+        assert_eq!(compute_list_wheel_scroll(0, 0, 6, &mut accum, -120), None);
+        assert_eq!(compute_list_wheel_scroll(0, 4, 6, &mut accum, -120), None);
+        assert_eq!(compute_list_wheel_scroll(0, 6, 6, &mut accum, -120), None);
+
+        // 2. 超过可见行数时：顶端继续上滚透传，向下滚翻行，底端继续下滚透传
+        assert_eq!(compute_list_wheel_scroll(0, 8, 6, &mut accum, 120), None);
+        assert_eq!(compute_list_wheel_scroll(0, 8, 6, &mut accum, -120), Some(1));
+        assert_eq!(compute_list_wheel_scroll(1, 8, 6, &mut accum, -120), Some(2));
+        assert_eq!(compute_list_wheel_scroll(2, 8, 6, &mut accum, -120), None);
+        assert_eq!(compute_list_wheel_scroll(2, 8, 6, &mut accum, 120), Some(1));
+
+        // 3. 触控板微增量在内部可滚区累加满 120 才换行，顶格继续向上微推立即透传
+        accum = 0;
+        assert_eq!(compute_list_wheel_scroll(1, 8, 6, &mut accum, -40), Some(1));
+        assert_eq!(compute_list_wheel_scroll(1, 8, 6, &mut accum, -40), Some(1));
+        assert_eq!(compute_list_wheel_scroll(1, 8, 6, &mut accum, -40), Some(2));
+        assert_eq!(compute_list_wheel_scroll(0, 8, 6, &mut accum, 30), None);
+    }
+
+    #[test]
+    fn list_scrollbar_hit_area_stays_clear_of_exclude_remove_button() {
+        let list = rc(24, 100, 624, 210);
+        let hit = list_scrollbar_hit_rect(&list, 1.0);
+        let track = list_scrollbar_track(&list, 1.0);
+        assert!(hit.left <= track.left && hit.right >= track.right);
+        let remove_btn_right = list.right - 16;
+        assert!(
+            remove_btn_right < hit.left,
+            "排除列表删除按钮右侧({remove_btn_right})应位于滚动条热区左侧({})之外，防止误触",
+            hit.left
+        );
     }
 
     #[test]

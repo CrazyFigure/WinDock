@@ -2073,7 +2073,111 @@ pub fn draw_button(
     draw_text(dc, label, font, r, fg, TextAlign::Center, true, false);
 }
 
+/// 计算滚动条滑块矩形、最大偏移与可移动像素行程；无需滚动时返回 None。
+pub fn scrollbar_thumb_rect(
+    track: &RECT,
+    total: usize,
+    visible: usize,
+    offset: usize,
+    scale: f32,
+) -> Option<(RECT, usize, f32)> {
+    scrollbar_thumb_rect_with_frac(track, total, visible, offset, None, scale)
+}
+
+/// 计算滚动条滑块矩形；若传入连续拖拽比例 `frac_override`，滑块优先按该比例跟随指针。
+fn scrollbar_thumb_rect_with_frac(
+    track: &RECT,
+    total: usize,
+    visible: usize,
+    offset: usize,
+    frac_override: Option<f32>,
+    scale: f32,
+) -> Option<(RECT, usize, f32)> {
+    if total <= visible || visible == 0 || track.bottom <= track.top {
+        return None;
+    }
+    let th = (track.bottom - track.top) as f32;
+    let min_thumb = (24.0 * scale).min(th);
+    let thumb_h = ((visible as f32 / total as f32) * th).max(min_thumb).min(th);
+    let max_off = total - visible;
+    let frac = frac_override
+        .unwrap_or_else(|| offset.min(max_off) as f32 / max_off as f32)
+        .clamp(0.0, 1.0);
+    let travel = (th - thumb_h).max(0.0);
+    let top = track.top as f32 + frac * travel;
+    let r = RECT {
+        left: track.left,
+        top: top.round() as i32,
+        right: track.right,
+        bottom: (top + thumb_h).round() as i32,
+    };
+    Some((r, max_off, travel))
+}
+
+/// 根据鼠标纵坐标与抓手偏移，反算滚动条目标偏移及归一化滑块位置比例（0.0..=1.0）。
+pub fn scrollbar_offset_from_y(
+    track: &RECT,
+    total: usize,
+    visible: usize,
+    y: i32,
+    grab_dy: f32,
+    scale: f32,
+) -> Option<(usize, f32)> {
+    let (_, max_off, travel) = scrollbar_thumb_rect(track, total, visible, 0, scale)?;
+    if travel <= 1e-3 {
+        return Some((0, 0.0));
+    }
+    let frac = ((y as f32 - grab_dy - track.top as f32) / travel).clamp(0.0, 1.0);
+    let off = (frac * max_off as f32).round() as usize;
+    Some((off.min(max_off), frac))
+}
+
+/// 现代细长圆角滚动条（支持 Hover / Active 拖动状态与主题适配）。
+pub fn draw_scrollbar_with_state(
+    surface: &mut Surface,
+    track: &RECT,
+    total: usize,
+    visible: usize,
+    offset: usize,
+    frac_override: Option<f32>,
+    hover: bool,
+    active: bool,
+    dark: bool,
+    scale: f32,
+) {
+    let Some((r, _, _)) = scrollbar_thumb_rect_with_frac(track, total, visible, offset, frac_override, scale) else {
+        return;
+    };
+    let w = (track.right - track.left) as f32;
+    // 悬停或拖动时铺垫极淡轨道底色，强化可拖动提示
+    if hover || active {
+        let track_c = if dark {
+            (1.0, 1.0, 1.0, if active { 0.08 } else { 0.05 })
+        } else {
+            (0.0, 0.0, 0.0, if active { 0.07 } else { 0.04 })
+        };
+        surface.fill_rrect(track, w * 0.5, track_c);
+    }
+    let c = if dark {
+        if active {
+            rgb(0xCBD5E1, 0.92)
+        } else if hover {
+            rgb(0x94A3B8, 0.80)
+        } else {
+            rgb(0x64748B, 0.62)
+        }
+    } else if active {
+        rgb(0x64748B, 0.96)
+    } else if hover {
+        rgb(0x94A3B8, 0.90)
+    } else {
+        rgb(0xCBD5E1, 0.82)
+    };
+    surface.fill_rrect(&r, w * 0.5, c);
+}
+
 /// 现代细长圆角滚动条。
+#[allow(dead_code)]
 pub fn draw_scrollbar(
     surface: &mut Surface,
     track: &RECT,
@@ -2083,24 +2187,7 @@ pub fn draw_scrollbar(
     hover: bool,
     scale: f32,
 ) {
-    if total <= visible || visible == 0 {
-        return;
-    }
-    let th = (track.bottom - track.top) as f32;
-    let min_thumb = 24.0 * scale;
-    let thumb_h = ((visible as f32 / total as f32) * th).max(min_thumb).min(th);
-    let max_off = (total - visible) as f32;
-    let frac = (offset as f32 / max_off).clamp(0.0, 1.0);
-    let top = track.top as f32 + frac * (th - thumb_h);
-    let r = RECT {
-        left: track.left,
-        top: top.round() as i32,
-        right: track.right,
-        bottom: (top + thumb_h).round() as i32,
-    };
-    let w = (r.right - r.left) as f32;
-    let c = if hover { rgb(0x94A3B8, 0.9) } else { rgb(0xCBD5E1, 0.8) };
-    surface.fill_rrect(&r, w * 0.5, c);
+    draw_scrollbar_with_state(surface, track, total, visible, offset, None, hover, false, false, scale);
 }
 
 /// 绘制自定义圆角深色磨砂 Tooltip（自动约束在窗口边界内，替代原生 title）。
@@ -3407,5 +3494,44 @@ mod tests {
         let br_rim = luma_at((cap.right - 7) as usize, (cap.bottom - 7) as usize);
         let center_luma = luma_at(360, 52);
         assert!(br_rim < center_luma * 2 + 250, "期望右下底角保持收敛({br_rim})，不过曝泛白");
+    }
+
+    #[test]
+    fn scrollbar_thumb_and_drag_mapping_round_trip() {
+        let track = RECT { left: 100, top: 40, right: 108, bottom: 240 };
+        assert!(scrollbar_thumb_rect(&track, 100, 100, 0, 1.0).is_none());
+        assert!(scrollbar_thumb_rect(&track, 80, 100, 0, 1.0).is_none());
+
+        // 总高 1000、可视 250，轨道长 200 -> 滑块高 50，行程 150
+        let (t0, max_off, travel) = scrollbar_thumb_rect(&track, 1000, 250, 0, 1.0).unwrap();
+        assert_eq!(max_off, 750);
+        assert!((travel - 150.0).abs() < 0.01);
+        assert_eq!(t0.top, 40);
+        assert_eq!(t0.bottom, 90);
+
+        let (t_mid, _, _) = scrollbar_thumb_rect(&track, 1000, 250, 375, 1.0).unwrap();
+        assert_eq!(t_mid.top, 115);
+        assert_eq!(t_mid.bottom, 165);
+
+        let (t_end, _, _) = scrollbar_thumb_rect(&track, 1000, 250, 750, 1.0).unwrap();
+        assert_eq!(t_end.top, 190);
+        assert_eq!(t_end.bottom, 240);
+
+        // 在滑块中部(grab_dy=25)拖动到 track.top + 25 应回到 0，拖动到 track.bottom - 25 应到达 max_off
+        let (off_start, frac_start) = scrollbar_offset_from_y(&track, 1000, 250, 65, 25.0, 1.0).unwrap();
+        assert_eq!(off_start, 0);
+        assert!(frac_start.abs() < 1e-4);
+
+        let (off_mid, frac_mid) = scrollbar_offset_from_y(&track, 1000, 250, 140, 25.0, 1.0).unwrap();
+        assert_eq!(off_mid, 375);
+        assert!((frac_mid - 0.5).abs() < 1e-4);
+
+        let (off_end, frac_end) = scrollbar_offset_from_y(&track, 1000, 250, 215, 25.0, 1.0).unwrap();
+        assert_eq!(off_end, 750);
+        assert!((frac_end - 1.0).abs() < 1e-4);
+
+        // 拖出轨道边界时应稳健夹紧在 0..=max_off
+        assert_eq!(scrollbar_offset_from_y(&track, 1000, 250, -50, 25.0, 1.0).unwrap().0, 0);
+        assert_eq!(scrollbar_offset_from_y(&track, 1000, 250, 500, 25.0, 1.0).unwrap().0, 750);
     }
 }
