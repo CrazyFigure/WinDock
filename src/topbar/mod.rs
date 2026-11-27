@@ -1043,4 +1043,62 @@ mod tests {
 
         bar.destroy();
     }
+
+    #[test]
+    fn topbar_tray_toggle_chevron_rotates_smoothly_with_popover_animation() {
+        let mon = crate::win32::primary_monitor().unwrap_or(MonitorInfo {
+            hmonitor: windows::Win32::Graphics::Gdi::HMONITOR::default(),
+            rect: RECT { left: 0, top: 0, right: 1920, bottom: 1080 },
+            work: RECT { left: 0, top: 0, right: 1920, bottom: 1080 },
+            dpi: 96,
+            primary: true,
+        });
+        let cfg = TopbarCfg::default();
+        let app_cfg = Appearance::default();
+        let mut bar = TopBar::new(std::ptr::null_mut(), mon, &cfg, &app_cfg)
+            .expect("TopBar test window should create");
+        bar.layout(&cfg);
+        let toggle_rect = bar.rect_of(&Hit::TrayToggle).unwrap();
+        let tray_icons = crate::topbar::tray_mirror::TrayIconCache::default();
+
+        let snapshot_toggle_region = |bar: &TopBar| -> Vec<u32> {
+            let w = bar.target.w as usize;
+            let buf = unsafe {
+                std::slice::from_raw_parts(bar.target.ptr as *const u32, w * bar.target.h as usize)
+            };
+            let mut region = Vec::new();
+            for y in toggle_rect.top.max(0)..toggle_rect.bottom.min(bar.height) {
+                for x in toggle_rect.left.max(0)..toggle_rect.right.min(bar.monitor.width()) {
+                    region.push(buf[y as usize * w + x as usize]);
+                }
+            }
+            region
+        };
+
+        // 1. 初始收起态：渲染左箭头 `<`
+        assert!(crate::topbar::render::render_buffer(&mut bar, &cfg, &app_cfg, &tray_icons).is_some());
+        let closed_px = snapshot_toggle_region(&bar);
+
+        // 2. 展开首帧：箭头已开始向下方旋转，像素应不同于收起态
+        let mut pop = Popover::new(std::ptr::null_mut(), bar.dpi).expect("Popover test window should create");
+        let anchor = RECT { left: toggle_rect.left, top: 0, right: toggle_rect.right, bottom: bar.height };
+        pop.open(anchor, Vec::new(), Vec::new(), HWND::default(), &app_cfg);
+        bar.popover = Some(pop);
+        assert!(crate::topbar::render::render_buffer(&mut bar, &cfg, &app_cfg, &tray_icons).is_some());
+        let start_px = snapshot_toggle_region(&bar);
+        assert_ne!(start_px, closed_px, "点击展开首帧旋转箭头应区别于收起态");
+
+        // 3. 推进动画至完全展开到位：渲染下箭头 `v`，且不同于中途态
+        for _ in 0..15 {
+            if let Some(p) = bar.popover.as_mut() {
+                let _ = p.tick(16.0, false);
+            }
+        }
+        assert!(crate::topbar::render::render_buffer(&mut bar, &cfg, &app_cfg, &tray_icons).is_some());
+        let open_px = snapshot_toggle_region(&bar);
+        assert_ne!(open_px, start_px, "展开到位后箭头应与首帧过程态不同");
+        assert_ne!(open_px, closed_px);
+
+        bar.destroy();
+    }
 }

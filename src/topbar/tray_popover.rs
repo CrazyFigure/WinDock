@@ -23,6 +23,54 @@ pub const CLASS_POPOVER: &str = "WinDockFinderPopover";
 
 const COLS: usize = 6;
 const MAX_VISIBLE_ROWS: usize = 4;
+/// 展开动画时长（ms）：保留清晰抽屉滑出过程同时保证轻快不拖沓。
+const OPEN_ANIM_MS: f32 = 155.0;
+/// 收起动画时长（ms）：快速顺滑缩回顶部栏边缘。
+const CLOSE_ANIM_MS: f32 = 120.0;
+/// 点击展开首帧即探出部分进度，消除首帧空白造成的响应延迟感。
+const OPEN_START_T: f32 = 0.08;
+/// 点击收起首帧轻微离位，提供即时交互反馈。
+const CLOSE_START_OFFSET: f32 = 0.16;
+
+/// 计算展开/收起动画的缓动进度（0 = 完全收在栏内，1 = 完全展开到位）。
+pub fn eval_eased_progress(anim_t: f32, closing: bool) -> f32 {
+    let t = anim_t.clamp(0.0, 1.0);
+    let inv = 1.0 - t;
+    if closing {
+        // 收起：先柔和脱离静止位置，再加速缩回顶部栏后方
+        1.0 - inv * inv
+    } else {
+        // 展开：首段迅捷滑出，末端柔和减速落位
+        1.0 - inv * inv * inv
+    }
+}
+
+/// 在展开与收起中途反向切换时，根据当前视觉进度反推新方向线性参数以保持零跳变衔接。
+pub fn invert_eased_progress(eased: f32, to_closing: bool) -> f32 {
+    let e = eased.clamp(0.0, 1.0);
+    if to_closing {
+        1.0 - (1.0 - e).sqrt()
+    } else {
+        1.0 - (1.0 - e).cbrt()
+    }
+}
+
+/// 根据缓动进度计算收纳卡片顶部在分层窗口内的局部 Y 坐标（负值或超界部分在栏边自然裁切）。
+pub fn compute_card_top(
+    card_h: i32,
+    gap_px: i32,
+    resting_card_top: i32,
+    open_down: bool,
+    eased: f32,
+) -> i32 {
+    let travel = (card_h + gap_px).max(0) as f32;
+    let offset = (1.0 - eased.clamp(0.0, 1.0)) * travel;
+    if open_down {
+        (resting_card_top as f32 - offset).round() as i32
+    } else {
+        (resting_card_top as f32 + offset).round() as i32
+    }
+}
 
 /// 使用 Windows 当前区域的名称顺序。同名图标用固定键打破平局，前台切换时也不会换位。
 fn sort_items(items: &mut [TrayItem]) {
@@ -66,6 +114,128 @@ mod tests {
         sort_items(&mut items);
         assert_eq!(items.each_ref().map(|item| item.key.as_str()), ["d", "c", "a", "b"]);
     }
+
+    #[test]
+    fn drawer_easing_and_reversal_stay_monotonic_and_continuous() {
+        assert!((eval_eased_progress(0.0, false) - 0.0).abs() < 1e-6);
+        assert!((eval_eased_progress(1.0, false) - 1.0).abs() < 1e-6);
+        assert!((eval_eased_progress(0.0, true) - 0.0).abs() < 1e-6);
+        assert!((eval_eased_progress(1.0, true) - 1.0).abs() < 1e-6);
+
+        // 展开前段比线性更快（ease-out），确保点击后迅速滑出不拖沓
+        assert!(eval_eased_progress(0.3, false) > 0.55);
+
+        // 展开中途反向收起、收起中途反向展开均保持视觉进度连续无跳变
+        for step in 1..10 {
+            let t = step as f32 / 10.0;
+            let e_open = eval_eased_progress(t, false);
+            let t_close = invert_eased_progress(e_open, true);
+            assert!((eval_eased_progress(t_close, true) - e_open).abs() < 1e-4);
+
+            let e_close = eval_eased_progress(t, true);
+            let t_reopen = invert_eased_progress(e_close, false);
+            assert!((eval_eased_progress(t_reopen, false) - e_close).abs() < 1e-4);
+        }
+
+        // 向下滑出时：e=0 完全藏于顶部栏上方（card_top = -card_h），e=1 落位在 gap 处
+        assert_eq!(compute_card_top(80, 4, 4, true, 0.0), -80);
+        assert_eq!(compute_card_top(80, 4, 4, true, 1.0), 4);
+        // 向上翻转时：e=0 完全藏于锚点下方（card_top = card_h + gap），e=1 落位在 0 处
+        assert_eq!(compute_card_top(80, 4, 0, false, 0.0), 84);
+        assert_eq!(compute_card_top(80, 4, 0, false, 1.0), 0);
+    }
+
+    #[test]
+    fn popover_open_tick_reverse_and_close_animate_smoothly_with_clipping() {
+        let mut p = Popover::new(std::ptr::null_mut(), 96).expect("Popover test window should create");
+        let items: Vec<TrayItem> = (0..8).map(|i| item(&format!("k{i}"), &format!("App {i}"))).collect();
+        let anchor = RECT { left: 1600, top: 0, right: 1630, bottom: 30 };
+        let app = Appearance::default();
+
+        // 1. 展开首帧即有探出过程，尚未完全到位且处于顶部栏下沿裁切滑出状态
+        p.open(anchor, items.clone(), vec!["k0".into()], HWND::default(), &app);
+        assert!(p.is_open());
+        assert!(p.is_animating());
+        assert!(p.card_top < p.resting_card_top, "首帧卡片顶部({})应从顶部栏后方滑出(< {})", p.card_top, p.resting_card_top);
+        assert!(p.card_top + p.card_h > 0, "首帧卡片底边应已探出顶部栏下沿");
+        assert!(p.visual_progress() > 0.1 && p.visual_progress() < 0.5);
+        let mut wr = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(p.hwnd, &mut wr);
+        }
+        assert_eq!(wr.top, anchor.bottom, "向下滑出时浮层窗口顶边应紧贴顶部栏下沿");
+        let open_stride = p.target.w as usize;
+        let open_pixels = unsafe { std::slice::from_raw_parts(p.target.ptr as *const u32, open_stride * p.target.h as usize) };
+        assert!((open_pixels[p.w as usize / 2] >> 24) > 200, "首帧顶部栏下沿第一行应显示已滑出的卡片内容");
+
+        // 展开中途若托盘列表异步刷新新增条目，应保持平滑动画不回弹
+        let mut expanded_items = items.clone();
+        for i in 8..14 {
+            expanded_items.push(item(&format!("k{i}"), &format!("App {i}")));
+        }
+        let _ = p.tick(16.0, false);
+        let progress_before_refresh = p.visual_progress();
+        p.update_items(expanded_items.clone());
+        assert!(p.is_animating());
+        assert!((p.visual_progress() - progress_before_refresh).abs() < 1e-6);
+
+        // 首帧离屏像素校验：窗口顶部栏外第一行已有卡片底边像素，且整体在 160ms 内完整展开到位
+        let mut prev_top = p.card_top;
+        for _ in 0..12 {
+            let _ = p.tick(16.0, false);
+            assert!(p.card_top >= prev_top, "展开过程 card_top 应单调下移: {prev_top} -> {}", p.card_top);
+            prev_top = p.card_top;
+        }
+        assert!(!p.is_animating());
+        assert_eq!(p.card_top, p.resting_card_top);
+        assert!((p.visual_progress() - 1.0).abs() < 1e-6);
+
+        // 展开完成时顶部 gap_px 留白保持全透明，卡片本体区域首行具有不透明像素
+        assert!(p.gap_px > 0);
+        let stride = p.target.w as usize;
+        let pixels = unsafe { std::slice::from_raw_parts(p.target.ptr as *const u32, stride * p.target.h as usize) };
+        assert_eq!(pixels[p.w as usize / 2] >> 24, 0, "顶部栏与卡片间距首行应全透明");
+        assert!((pixels[(p.resting_card_top as usize + 8) * stride + (p.w as usize / 2)] >> 24) > 200);
+
+        // 2. 平滑收起，并在中途反向再次展开，验证连续接续
+        assert!(p.begin_close(false));
+        assert!(p.closing);
+        assert!(!p.is_open());
+        let _ = p.tick(24.0, false);
+        let mid_top = p.card_top;
+        assert!(mid_top < p.resting_card_top && p.visible);
+
+        // 收起中途再次点击展开应从当前高度平滑反转展开，不重置回隐藏态
+        p.open(anchor, expanded_items, vec!["k0".into()], HWND::default(), &app);
+        assert!(p.is_open());
+        assert!(!p.closing);
+        assert!((p.card_top - mid_top).abs() <= 1, "反向展开不应跳变: mid={mid_top}, now={}", p.card_top);
+
+        // 完整收起后应隐藏窗口并释放绘图缓冲
+        assert!(p.begin_close(false));
+        for _ in 0..10 {
+            let (anim, _, closed) = p.tick(16.0, false);
+            if closed {
+                assert!(!anim);
+                break;
+            }
+        }
+        assert!(!p.visible);
+        assert!(!p.closing);
+        assert!(p.target.ptr.is_null());
+
+        // 3. 减弱动态效果模式下应立即到位与立即收起
+        let mut reduced = Appearance::default();
+        reduced.reduce_motion = true;
+        p.open(anchor, items, vec![], HWND::default(), &reduced);
+        assert!(p.is_open());
+        assert!(!p.is_animating());
+        assert_eq!(p.card_top, p.resting_card_top);
+        assert!(!p.begin_close(true));
+        assert!(!p.visible);
+
+        p.destroy();
+    }
 }
 
 pub struct Popover {
@@ -76,7 +246,19 @@ pub struct Popover {
     pub dpi: u32,
     pub w: i32,
     pub h: i32,
+    /// 卡片本体高度（`h` 可能包含顶部栏与卡片之间的 4dp 间距留白）。
+    pub card_h: i32,
     pub card_top: i32,
+    /// 完全展开静止状态下卡片相对分层窗口顶部的偏移。
+    resting_card_top: i32,
+    /// 卡片与顶部栏/锚点边缘的间距。
+    gap_px: i32,
+    /// 卡片是否从锚点下方向下滑出。
+    open_down: bool,
+    /// 展开/收起线性进度（0 = 完全藏于栏后，1 = 完全展开）。
+    anim_t: f32,
+    /// 是否正在执行收起动画。
+    pub closing: bool,
     pub scroll: usize,
     pub hover_idx: Option<usize>,
     pub press: Option<usize>,
@@ -132,7 +314,13 @@ impl Popover {
                 dpi,
                 w: 0,
                 h: 0,
+                card_h: 0,
                 card_top: 0,
+                resting_card_top: 0,
+                gap_px: 0,
+                open_down: true,
+                anim_t: 1.0,
+                closing: false,
                 scroll: 0,
                 hover_idx: None,
                 press: None,
@@ -173,12 +361,45 @@ impl Popover {
         self.total_rows().saturating_sub(MAX_VISIBLE_ROWS)
     }
 
-    /// 打开浮层：锚定在顶部栏 `<` 按钮正下方、右对齐，自动避让屏幕边界。
+    /// 是否处于打开态（未进入收起动画）。
+    pub fn is_open(&self) -> bool {
+        self.visible && !self.closing
+    }
+
+    /// 是否仍有展开或收起动画需要逐帧推进。
+    pub fn is_animating(&self) -> bool {
+        self.visible && (self.closing || self.anim_t < 1.0)
+    }
+
+    /// 返回给顶部栏收纳按钮箭头旋转使用的缓动进度（0 = 收起左箭头，1 = 展开下箭头）。
+    pub fn visual_progress(&self) -> f32 {
+        if !self.visible {
+            0.0
+        } else {
+            eval_eased_progress(self.anim_t, self.closing)
+        }
+    }
+
+    /// 按当前动画进度重算卡片纵向偏移，使卡片自顶部栏边缘滑出或缩回。
+    fn sync_card_top(&mut self) {
+        let eased = eval_eased_progress(self.anim_t, self.closing);
+        self.card_top = compute_card_top(
+            self.card_h,
+            self.gap_px,
+            self.resting_card_top,
+            self.open_down,
+            eased,
+        );
+    }
+
+    /// 打开浮层：锚定在顶部栏 `<` 按钮正下方、右对齐，自动避让屏幕边界并从顶部栏下沿平滑滑出。
     pub fn open(&mut self, anchor: RECT, mut items: Vec<TrayItem>, pinned: Vec<String>, prev_fg: HWND, appearance: &Appearance) {
         sort_items(&mut items);
         if !prev_fg.0.is_null() && prev_fg != self.hwnd {
             self.prev_fg = prev_fg;
         }
+        let was_visible = self.visible;
+        let was_closing = self.visible && self.closing;
         self.items = items;
         self.pinned = pinned;
         self.scroll = 0;
@@ -188,11 +409,25 @@ impl Popover {
         self.dark = appearance.is_dark();
         self.accent = accent_from_config(appearance);
         self.anchor = anchor;
+        self.closing = false;
+
+        if appearance.reduce_motion {
+            self.anim_t = 1.0;
+        } else if was_closing {
+            // 收起中途再次点击展开时，按当前视觉位置反算展开参数，避免跳变
+            let cur = eval_eased_progress(self.anim_t, true);
+            self.anim_t = invert_eased_progress(cur, false).max(OPEN_START_T);
+        } else if !was_visible {
+            self.anim_t = OPEN_START_T;
+        }
+
         self.resize_to_items();
         unsafe {
             self.visible = true;
             self.render();
-            let _ = ShowWindow(self.hwnd, SW_SHOW);
+            if !was_visible {
+                let _ = ShowWindow(self.hwnd, SW_SHOW);
+            }
             let _ = SetForegroundWindow(self.hwnd);
             let _ = SetFocus(self.hwnd);
         }
@@ -226,17 +461,16 @@ impl Popover {
         let card_w = pad * 2 + cols as i32 * cell + (cols as i32 - 1).max(0) * gap;
         let card_h = pad * 2 + rows as i32 * cell + (rows as i32 - 1).max(0) * gap;
 
-
         self.w = if self.items.is_empty() {
             card_w.max(dp(140, self.dpi))
         } else {
             card_w
         };
-        self.card_top = 0;
-        self.h = card_h;
+        self.card_h = card_h;
 
+        let want_gap = dp(4, self.dpi);
         let mut left = anchor.right - self.w;
-        let mut top = anchor.bottom + dp(4, self.dpi);
+        let win_top;
         unsafe {
             let mut mi = windows::Win32::Graphics::Gdi::MONITORINFO {
                 cbSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::MONITORINFO>() as u32,
@@ -245,11 +479,28 @@ impl Popover {
             let mon = windows::Win32::Graphics::Gdi::MonitorFromRect(&anchor, windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST);
             let _ = windows::Win32::Graphics::Gdi::GetMonitorInfoW(mon, &mut mi);
             left = left.clamp(mi.rcWork.left + 8, (mi.rcWork.right - self.w - 8).max(mi.rcWork.left + 8));
-            if top + self.h > mi.rcWork.bottom - 8 {
-                top = (anchor.top - self.h - 4).max(mi.rcWork.top + 8);
+            let fits_below = anchor.bottom + want_gap + card_h <= mi.rcWork.bottom - 8;
+            let more_space_above = (anchor.top - mi.rcWork.top) > (mi.rcWork.bottom - anchor.bottom);
+            if fits_below || !more_space_above {
+                // 分层窗口顶边紧贴顶部栏底沿，滑出过程中上方未露出部分自然裁切在顶部栏之外
+                self.open_down = true;
+                let max_bottom = (mi.rcWork.bottom - 8).max(anchor.bottom + card_h);
+                let target_top = (anchor.bottom + want_gap).min(max_bottom - card_h).max(anchor.bottom);
+                self.gap_px = (target_top - anchor.bottom).max(0);
+                self.resting_card_top = self.gap_px;
+                self.h = self.gap_px + card_h;
+                win_top = anchor.bottom;
+            } else {
+                self.open_down = false;
+                let target_top = (anchor.top - card_h - want_gap).max(mi.rcWork.top + 8);
+                self.gap_px = (anchor.top - (target_top + card_h)).max(0);
+                self.resting_card_top = 0;
+                self.h = card_h + self.gap_px;
+                win_top = target_top;
             }
-            let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, left, top, self.w, self.h, SWP_NOACTIVATE | SWP_NOSENDCHANGING);
+            let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, left, win_top, self.w, self.h, SWP_NOACTIVATE | SWP_NOSENDCHANGING);
         }
+        self.sync_card_top();
     }
 
     /// 右键菜单接管焦点后继续高亮来源图标。
@@ -258,17 +509,93 @@ impl Popover {
         self.render();
     }
 
+    /// 触发平滑收起动画；若处于减弱动态效果模式则立即隐藏。返回是否仍需帧驱动继续推进。
+    pub fn begin_close(&mut self, reduce: bool) -> bool {
+        if !self.visible {
+            return false;
+        }
+        self.hover_idx = None;
+        self.press = None;
+        self.context_key = None;
+        // 收起动作启动瞬间即归还原应用前台焦点，避免关闭动画期间键盘操作延迟
+        crate::win32::restore_foreground_if_owned(self.hwnd, self.prev_fg);
+        if reduce || self.card_h <= 0 {
+            self.finish_close();
+            return false;
+        }
+        if self.closing {
+            return true;
+        }
+        let cur = eval_eased_progress(self.anim_t, false);
+        self.closing = true;
+        self.anim_t = invert_eased_progress(cur, true).min(1.0 - CLOSE_START_OFFSET);
+        self.sync_card_top();
+        self.render();
+        true
+    }
+
+    /// 推进一帧展开/收起动画；返回 `(是否仍在动画, 视觉进度是否变化, 本帧是否刚完成收起)`。
+    pub fn tick(&mut self, dt_ms: f32, reduce: bool) -> (bool, bool, bool) {
+        if !self.visible {
+            return (false, false, false);
+        }
+        if self.closing {
+            if reduce || self.card_h <= 0 {
+                self.finish_close();
+                return (false, true, true);
+            }
+            let next = (self.anim_t - dt_ms / CLOSE_ANIM_MS).max(0.0);
+            let changed = (next - self.anim_t).abs() > 0.0005;
+            self.anim_t = next;
+            if self.anim_t <= 0.0 {
+                self.finish_close();
+                return (false, true, true);
+            }
+            if changed {
+                self.sync_card_top();
+                self.render();
+            }
+            return (true, changed, false);
+        }
+        if self.anim_t < 1.0 {
+            let next = if reduce {
+                1.0
+            } else {
+                (self.anim_t + dt_ms / OPEN_ANIM_MS).min(1.0)
+            };
+            let changed = (next - self.anim_t).abs() > 0.0005;
+            self.anim_t = next;
+            if changed {
+                self.sync_card_top();
+                self.render();
+            }
+            return (self.anim_t < 1.0, changed, false);
+        }
+        (false, false, false)
+    }
+
     pub fn close(&mut self) {
         if self.visible {
-            self.visible = false;
-            self.hover_idx = None;
-            self.press = None;
-            self.context_key = None;
             // 收纳格隐藏前若仍持有前台焦点，主动归还原窗口防止前台变空导致顶部栏转黑
             crate::win32::restore_foreground_if_owned(self.hwnd, self.prev_fg);
-            unsafe {
-                let _ = ShowWindow(self.hwnd, SW_HIDE);
-            }
+            self.finish_close();
+        } else {
+            self.closing = false;
+            self.anim_t = 0.0;
+            self.target.release();
+            self.scratch.release();
+        }
+    }
+
+    fn finish_close(&mut self) {
+        self.visible = false;
+        self.closing = false;
+        self.anim_t = 0.0;
+        self.hover_idx = None;
+        self.press = None;
+        self.context_key = None;
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
         self.target.release();
         self.scratch.release();
@@ -286,11 +613,12 @@ impl Popover {
     }
 
     fn card_rect(&self) -> RECT {
+        let ch = if self.card_h > 0 { self.card_h } else { self.h };
         RECT {
             left: 0,
             top: self.card_top,
             right: self.w,
-            bottom: self.h,
+            bottom: self.card_top + ch,
         }
     }
 
@@ -387,6 +715,9 @@ impl Popover {
 
             for idx in start..end {
                 let Some(r) = self.cell_rect(idx) else { continue };
+                if r.bottom <= 0 || r.top >= h {
+                    continue;
+                }
                 let item = &self.items[idx];
                 let is_pinned = self.pinned.iter().any(|k| k == &item.key);
                 let is_hover = self.hover_idx == Some(idx);

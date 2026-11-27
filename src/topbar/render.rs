@@ -103,7 +103,7 @@ pub(crate) fn render_buffer(bar: &mut TopBar, _cfg: &TopbarCfg, appearance: &App
 
     // 左侧：单色徽标 + 前台应用名 + 文件/窗口/前往 菜单；右侧：托盘收纳/状态图标/时钟
     let text_shadow = false;
-    let popover_open = bar.popover.as_ref().map(|p| p.visible).unwrap_or(false);
+    let popover_progress = bar.popover.as_ref().map(|p| p.visual_progress()).unwrap_or(0.0);
     let app_icons = crate::app::app_icon_cache();
     for (r, hit) in bar.hits.iter() {
         match hit {
@@ -125,8 +125,7 @@ pub(crate) fn render_buffer(bar: &mut TopBar, _cfg: &TopbarCfg, appearance: &App
             }
             Hit::TrayToggle => {
                 let cx = (r.left + r.right) as f32 * 0.5;
-                let glyph = if popover_open { Glyph::ChevronDown } else { Glyph::ChevronLeft };
-                draw_glyph(&mut sf, glyph, cx, h as f32 * 0.5, 11.0 * s, text_dim);
+                draw_chevron_animated(&mut sf, cx, h as f32 * 0.5, 11.0 * s, popover_progress, text_dim);
             }
             Hit::TrayIcon(key) => {
                 if bar.drag.as_ref().is_some_and(|d| &d.key == key) {

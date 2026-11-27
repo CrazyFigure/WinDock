@@ -2581,6 +2581,38 @@ pub fn draw_glyph(sf: &mut Surface, glyph: Glyph, cx: f32, cy: f32, size: f32, c
     }
 }
 
+/// 绘制顶部栏收纳按钮的平滑旋转箭头（progress=0 为左箭头 `<`，progress=1 为下箭头 `v`）。
+pub fn draw_chevron_animated(sf: &mut Surface, cx: f32, cy: f32, size: f32, progress: f32, c: Rgba) {
+    if c.3 <= 0.001 || size <= 0.0 {
+        return;
+    }
+    let p = progress.clamp(0.0, 1.0);
+    if p <= 0.001 {
+        draw_glyph(sf, Glyph::ChevronLeft, cx, cy, size, c);
+        return;
+    }
+    if p >= 0.999 {
+        draw_glyph(sf, Glyph::ChevronDown, cx, cy, size, c);
+        return;
+    }
+    let sw = (size * 0.1).max(1.2);
+    // 在屏幕 Y 轴向下的坐标系中逆时针旋转 90°（0 → -π/2），同步插值视觉重心偏移以无缝衔接静态字形
+    let angle = -std::f32::consts::FRAC_PI_2 * p;
+    let (sin_a, cos_a) = angle.sin_cos();
+    let ox = -0.02 * size * (1.0 - p);
+    let oy = 0.02 * size * p;
+    let rot = |dx: f32, dy: f32| -> (f32, f32) {
+        let px = dx * size;
+        let py = dy * size;
+        (cx + ox + px * cos_a - py * sin_a, cy + oy + px * sin_a + py * cos_a)
+    };
+    let tip = rot(-0.14, 0.0);
+    let arm_a = rot(0.14, -0.28);
+    let arm_b = rot(0.14, 0.28);
+    sf.thick_line(arm_a.0, arm_a.1, tip.0, tip.1, sw, c);
+    sf.thick_line(tip.0, tip.1, arm_b.0, arm_b.1, sw, c);
+}
+
 /// 绘制带实时电量填充与充电标识的 macOS 风格电池图标。
 pub fn draw_battery_filled(sf: &mut Surface, cx: f32, cy: f32, size: f32, pct: u8, charging: bool, c: Rgba) {
     let w = size * 1.15;
@@ -2907,6 +2939,9 @@ mod tests {
         for g in [Glyph::Wifi, Glyph::Speaker, Glyph::Battery, Glyph::Gear, Glyph::TrashFull] {
             draw_glyph(&mut sf, g, 16.0, 16.0, 16.0, rgb(0xFFFFFF, 1.0));
         }
+        draw_chevron_animated(&mut sf, 48.0, 16.0, 12.0, 0.0, rgb(0xFFFFFF, 1.0));
+        draw_chevron_animated(&mut sf, 64.0, 16.0, 12.0, 0.5, rgb(0xFFFFFF, 1.0));
+        draw_chevron_animated(&mut sf, 80.0, 16.0, 12.0, 1.0, rgb(0xFFFFFF, 1.0));
         assert!(buf.iter().any(|&p| p != 0));
         let p = palette(true, (0.04, 0.52, 1.0));
         assert!(p.text.0 > 0.9);

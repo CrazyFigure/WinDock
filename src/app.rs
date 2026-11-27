@@ -841,7 +841,7 @@ impl App {
     }
 
     fn rebuild_bars(&mut self) {
-        self.close_popover();
+        self.close_popover_immediate();
         self.clear_tray_context();
         self.tray_gate.clear_suppressed();
         self.tray_tip.clear(self.hwnd);
@@ -1016,6 +1016,9 @@ impl App {
     fn on_state_changed(&mut self) {
         let label = self.active_app_label();
         let fullscreen = self.snap.fullscreen;
+        if fullscreen {
+            self.close_popover_immediate();
+        }
         let cfg = &self.config.topbar;
         for bar in &mut self.topbars {
             bar.active_app = label.clone();
@@ -1485,7 +1488,7 @@ impl App {
             bar.tray_items = items.clone();
             bar.pinned.clone_from(&pins);
             if let Some(p) = bar.popover.as_mut() {
-                if p.visible {
+                if p.is_open() {
                     p.pinned.clone_from(&pins);
                     p.update_items(items.clone());
                 }
@@ -1559,6 +1562,9 @@ impl App {
 
     fn toggle_topbar(&mut self) {
         self.topbar_visible = !self.topbar_visible;
+        if !self.topbar_visible {
+            self.close_popover_immediate();
+        }
         self.sync_topbar_visibility();
     }
 
@@ -1756,9 +1762,35 @@ impl App {
             }
         }
         let reduce = self.config.appearance.reduce_motion;
+        let ptr = app_ptr() as isize;
+        let mut any_popover_closed = false;
         for bar in &mut self.topbars {
             animating |= bar.tick_color(dt, transition);
             animating |= bar.tick_tray_anim(dt, reduce);
+            if let Some(p) = bar.popover.as_mut() {
+                if p.is_animating() {
+                    unsafe {
+                        let _ = SetWindowLongPtrW(p.hwnd, GWLP_USERDATA, 0);
+                    }
+                    let (p_anim, p_changed, just_closed) = p.tick(dt, reduce);
+                    unsafe {
+                        let _ = SetWindowLongPtrW(p.hwnd, GWLP_USERDATA, ptr);
+                    }
+                    if p_changed {
+                        invalidate(bar.hwnd);
+                    }
+                    if just_closed {
+                        any_popover_closed = true;
+                    }
+                    animating |= p_anim;
+                }
+            }
+        }
+        if any_popover_closed {
+            if !self.status_panel.visible && !self.topbars.iter().any(|b| b.popover.as_ref().is_some_and(|p| p.is_open())) {
+                self.set_topbar_active(None, None);
+            }
+            self.flush_pending_color_samples();
         }
         if !animating {
             unsafe {
@@ -1933,7 +1965,7 @@ impl App {
         }
         // 托盘镜像与运行应用动态图标低频校对（仅顶部栏可见时触发，保持零高开销轮询）
         if !self.topbars.is_empty() && self.topbar_visible {
-            let popover_open = self.topbars.iter().any(|b| b.popover.as_ref().map(|p| p.visible).unwrap_or(false));
+            let popover_open = self.topbars.iter().any(|b| b.popover.as_ref().is_some_and(|p| p.is_open()));
             let taskbar_open = !self.taskbar.active() || self.taskbar.temporary_show();
             if self.slow_ticks % 3 == 0 {
                 let mut jobs: Vec<(String, Vec<isize>)> = Vec::new();
@@ -2263,7 +2295,7 @@ impl App {
         self.tray_tip.clear(self.hwnd);
         self.tray_gate.clear_suppressed();
         self.clear_tray_context();
-        self.close_popover();
+        self.close_popover_immediate();
         self.status_panel.close();
         self.window_preview.close();
         self.menu_ctx = ctx;
@@ -3070,7 +3102,7 @@ impl App {
                 .position(|b| b.popover.as_ref().map(|p| p.hwnd) == Some(hwnd))
                 .and_then(|index| topbars[index].popover.as_ref())
                 .and_then(|p| {
-                    if !p.visible || p.press.is_some() {
+                    if !p.visible || p.closing || p.press.is_some() {
                         return None;
                     }
                     let index = p.index_at(x, y)?;
@@ -3097,7 +3129,7 @@ impl App {
         let local = if let Some(index) = self.topbar_index(owner) {
             self.topbars[index].rect_of(&Hit::TrayIcon(key.to_string()))?
         } else if let Some(index) = self.popover_owner(owner) {
-            let p = self.topbars[index].popover.as_ref().filter(|p| p.visible)?;
+            let p = self.topbars[index].popover.as_ref().filter(|p| p.is_open())?;
             let item_idx = p.items.iter().position(|it| it.key == key)?;
             p.cell_rect(item_idx)?
         } else {
@@ -3571,7 +3603,7 @@ impl App {
                 );
             }
             Hit::TrayToggle => {
-                if self.topbars[i].popover.as_ref().is_some_and(|p| p.visible) {
+                if self.topbars[i].popover.as_ref().is_some_and(|p| p.is_open()) {
                     self.close_popover();
                 } else {
                     self.open_popover(i);
@@ -3587,8 +3619,8 @@ impl App {
                         None
                     };
                     if right {
-                        // 右键托盘图标前先收起既有的收纳浮层、自绘菜单与状态面板，防止上下文错乱
-                        self.close_popover();
+                        // 右键托盘图标前先立即收起既有的收纳浮层、自绘菜单与状态面板，防止上下文错乱
+                        self.close_popover_immediate();
                         self.context_menu.close();
                         self.status_panel.close();
                     }
@@ -3626,7 +3658,7 @@ impl App {
         self.tray_tip.clear(self.hwnd);
         self.tray_gate.clear_suppressed();
         self.clear_tray_context();
-        self.close_popover();
+        self.close_popover_immediate();
         self.context_menu.close();
         self.window_preview.close();
         self.set_topbar_active(Some(bi), Some(hit.clone()));
@@ -3653,7 +3685,7 @@ impl App {
 
     pub fn close_panel(&mut self) {
         self.status_panel.close();
-        if !self.topbars.iter().any(|b| b.popover.as_ref().is_some_and(|p| p.visible)) {
+        if !self.topbars.iter().any(|b| b.popover.as_ref().is_some_and(|p| p.is_open())) {
             self.set_topbar_active(None, None);
         }
         self.flush_pending_color_samples();
@@ -3812,6 +3844,22 @@ impl App {
         let prev_fg = HWND(self.snap.foreground as *mut _);
         let ptr = app_ptr();
         let appearance = self.config.appearance.clone();
+        // 多屏模式下先立即收起其他显示器上的收纳浮层，保持单一活动浮层
+        for (idx, other) in self.topbars.iter_mut().enumerate() {
+            if idx != bi {
+                if let Some(p) = other.popover.as_mut() {
+                    if p.visible {
+                        unsafe {
+                            let _ = SetWindowLongPtrW(p.hwnd, GWLP_USERDATA, 0);
+                        }
+                        p.close();
+                        unsafe {
+                            let _ = SetWindowLongPtrW(p.hwnd, GWLP_USERDATA, ptr as isize);
+                        }
+                    }
+                }
+            }
+        }
         let bar = &mut self.topbars[bi];
         if bar.popover.is_none() {
             match Popover::new(ptr, bar.dpi) {
@@ -3822,14 +3870,20 @@ impl App {
                 }
             }
         }
-        if let Some(p) = bar.popover.as_mut() {
+        let need_anim = if let Some(p) = bar.popover.as_mut() {
             p.open(anchor, items, pinned, prev_fg, &appearance);
-        }
+            p.is_animating()
+        } else {
+            false
+        };
         self.set_topbar_active(Some(bi), Some(Hit::TrayToggle));
+        if need_anim {
+            self.ensure_frame();
+        }
         self.refresh_tray();
     }
 
-    pub fn close_popover(&mut self) {
+    fn clear_popover_tracking(&mut self) {
         if self.tray_tip.owner().is_some_and(|owner| self.popover_owner(owner).is_some()) {
             self.tray_tip.clear(self.hwnd);
         }
@@ -3849,6 +3903,48 @@ impl App {
         if let TraySeed::Loading(pending) = &mut self.tray_seed {
             *pending = None;
         }
+    }
+
+    /// 触发收纳浮层平滑收起（若开启减弱动态效果则立即隐藏）。
+    pub fn close_popover(&mut self) {
+        self.clear_popover_tracking();
+        let reduce = self.config.appearance.reduce_motion;
+        let ptr = app_ptr() as isize;
+        let mut animating = false;
+        let mut finished_immediately = false;
+        for bar in &mut self.topbars {
+            if let Some(p) = bar.popover.as_mut() {
+                if p.visible {
+                    unsafe {
+                        let _ = SetWindowLongPtrW(p.hwnd, GWLP_USERDATA, 0);
+                    }
+                    let still_anim = p.begin_close(reduce);
+                    unsafe {
+                        let _ = SetWindowLongPtrW(p.hwnd, GWLP_USERDATA, ptr);
+                    }
+                    invalidate(bar.hwnd);
+                    if still_anim {
+                        animating = true;
+                    } else {
+                        finished_immediately = true;
+                    }
+                }
+            }
+        }
+        if !self.status_panel.visible && !self.topbars.iter().any(|b| b.popover.as_ref().is_some_and(|p| p.is_open())) {
+            self.set_topbar_active(None, None);
+        }
+        if animating {
+            self.ensure_frame();
+        }
+        if finished_immediately && !self.topbars.iter().any(|b| b.popover.as_ref().is_some_and(|p| p.visible)) {
+            self.flush_pending_color_samples();
+        }
+    }
+
+    /// 立即隐藏所有收纳浮层并释放绘图缓冲（用于退出、重建与独占面板切换）。
+    pub fn close_popover_immediate(&mut self) {
+        self.clear_popover_tracking();
         let ptr = app_ptr() as isize;
         let mut closed = false;
         for bar in &mut self.topbars {
@@ -3861,6 +3957,7 @@ impl App {
                     unsafe {
                         let _ = SetWindowLongPtrW(p.hwnd, GWLP_USERDATA, ptr);
                     }
+                    invalidate(bar.hwnd);
                     closed = true;
                 }
             }
@@ -3902,6 +3999,9 @@ impl App {
     pub fn popover_mouse_move(&mut self, hwnd: HWND, x: i32, y: i32) {
         let Some(bi) = self.popover_owner(hwnd) else { return };
         if let Some(p) = self.topbars[bi].popover.as_mut() {
+            if !p.is_open() {
+                return;
+            }
             p.on_mouse_move(x, y);
         }
         self.update_tray_tip(hwnd, x, y);
@@ -3922,7 +4022,9 @@ impl App {
         }
         let Some(bi) = self.popover_owner(hwnd) else { return };
         if let Some(p) = self.topbars[bi].popover.as_mut() {
-            p.on_mouse_leave();
+            if p.is_open() {
+                p.on_mouse_leave();
+            }
         }
     }
 
@@ -3931,6 +4033,9 @@ impl App {
         let Some(bi) = self.popover_owner(hwnd) else { return };
         let bar = &mut self.topbars[bi];
         if let Some(p) = bar.popover.as_mut() {
+            if !p.is_open() {
+                return;
+            }
             let step = if delta > 0 { -1i32 } else { 1i32 };
             let next = (p.scroll as i32 + step).clamp(0, p.scroll_max() as i32) as usize;
             if next != p.scroll {
@@ -3946,6 +4051,9 @@ impl App {
         self.tray_gate.clear_suppressed();
         let Some(bi) = self.popover_owner(hwnd) else { return };
         if let Some(p) = self.topbars[bi].popover.as_mut() {
+            if !p.is_open() {
+                return;
+            }
             p.press = p.index_at(x, y);
             p.render();
         }
@@ -3958,6 +4066,9 @@ impl App {
     pub fn popover_lbutton_up(&mut self, hwnd: HWND, x: i32, y: i32) {
         let Some(bi) = self.popover_owner(hwnd) else { return };
         let Some(p) = self.topbars[bi].popover.as_mut() else { return };
+        if !p.is_open() {
+            return;
+        }
         let Some(index) = p.press.take() else { return };
         // 只在原图标格内完成点击时切换固定状态。
         if p.index_at(x, y) == Some(index) {
@@ -3971,6 +4082,9 @@ impl App {
     pub fn popover_rclick(&mut self, hwnd: HWND, x: i32, y: i32) {
         let Some(bi) = self.popover_owner(hwnd) else { return };
         let Some(p) = self.topbars[bi].popover.as_ref() else { return };
+        if !p.is_open() {
+            return;
+        }
         let Some(index) = p.index_at(x, y) else { return };
         let Some(item) = p.items.get(index).cloned() else { return };
         let Some(anchor) = p.cell_rect(index).and_then(|icon| tray_anchor(hwnd, icon)) else { return };
