@@ -298,7 +298,7 @@ struct TrayClick {
 enum TrayWork {
     // 图标采样中的用户点击排在其后，避免两个后台线程同时操作同一个原生托盘。
     Refresh { cancel: Arc<CancelSignal>, reading_overflow: bool, queued_click: Option<TrayClick> },
-    Click { right: bool, screen: POINT, owner: HWND, is_popover: bool, queued_click: Option<TrayClick> },
+    Click { right: bool, screen: POINT, anchor: Option<RECT>, owner: HWND, is_popover: bool, queued_click: Option<TrayClick> },
 }
 
 /// 判断光标是否正处于指定显示器底部任务栏与 Dock 交互热区（用于延后后台托盘遮罩采样）。
@@ -319,6 +319,10 @@ struct TrayContext {
     is_popover: bool,
     /// 已捕获到的原生或自定义右键菜单窗口句柄
     menu: Option<HWND>,
+    /// 右键菜单锚定的屏幕图标矩形，供首帧异步重定位稳定期持续纠偏使用
+    anchor: Option<RECT>,
+    /// 异步菜单稳定期截止时刻（期间若菜单被框架拉回底部则自动纠偏回锚点）
+    settle_until: Option<Instant>,
 }
 
 /// 跟踪顶部栏托盘右键菜单及其对应图标的悬浮预览抑制状态。
@@ -3805,6 +3809,8 @@ impl App {
             key,
             is_popover,
             menu: None,
+            anchor: None,
+            settle_until: None,
         });
         self.sync_overlay_hooks();
     }
@@ -3972,7 +3978,7 @@ impl App {
         let peek = self.taskbar.begin_tray_peek();
         let cover = self.tray_cover_context();
         if tray_mirror::spawn_invocation(self.hwnd, item.clone(), anchor, peek, self.tray_icons.clone(), cover) {
-            self.tray_work = Some(TrayWork::Click { right, screen, owner, is_popover, queued_click: None });
+            self.tray_work = Some(TrayWork::Click { right, screen, anchor, owner, is_popover, queued_click: None });
         } else {
             self.taskbar.end_tray_peek();
             self.invoke_window_shelf_item(&item, right, screen);
@@ -3985,7 +3991,7 @@ impl App {
     }
 
     fn on_tray_invoked(&mut self, result: TrayInvocation) {
-        let Some(TrayWork::Click { right, screen, owner, is_popover, queued_click }) = self.tray_work.take() else { return };
+        let Some(TrayWork::Click { right, screen, anchor, owner, is_popover, queued_click }) = self.tray_work.take() else { return };
         self.taskbar.end_tray_peek();
         self.apply_tray_snapshot(result.snapshot);
         if let Some(click) = queued_click {
@@ -4015,6 +4021,9 @@ impl App {
             if let Some(menu) = result.menu {
                 if let Some(ctx) = &mut self.tray_gate.context {
                     ctx.menu = Some(HWND(menu as *mut _));
+                    ctx.anchor = anchor;
+                    // 打开后 500ms 内持续校验位置，防止异步 UI 框架在布局完成后把菜单拖回底部。
+                    ctx.settle_until = anchor.map(|_| Instant::now() + Duration::from_millis(500));
                 }
                 // 原生/自定义菜单拥有自己的消息循环：持续监测其可见性，菜单开启期间仅屏蔽来源图标的悬浮预览。
                 unsafe { let _ = SetTimer(self.hwnd, TIMER_TRAY_CONTEXT, 45, None); }
@@ -4927,6 +4936,12 @@ impl App {
             } else {
                 self.clear_tray_context();
             }
+            return;
+        }
+        if let (Some(anchor), Some(until)) = (ctx.anchor, ctx.settle_until) {
+            if Instant::now() < until {
+                crate::topbar::tray_popup::keep_menu_at_anchor(menu, anchor);
+            }
         }
     }
 
@@ -5333,6 +5348,8 @@ mod tests {
             key: "k_a".into(),
             is_popover: false,
             menu: Some(menu_hwnd),
+            anchor: None,
+            settle_until: None,
         });
         assert!(!gate.is_popover_owner(pop_hwnd));
         let (t_a, _, _, hk_a) = App::resolve_tray_tip_target(&topbars, &gate, bar_hwnd, ax, ay);
@@ -5363,6 +5380,8 @@ mod tests {
             key: "k_a".into(),
             is_popover: true,
             menu: Some(menu_hwnd),
+            anchor: None,
+            settle_until: None,
         });
         assert!(gate.is_popover_owner(pop_hwnd));
         let (t_pa, from_pop, _, _) = App::resolve_tray_tip_target(&topbars, &gate, pop_hwnd, pax, pay);

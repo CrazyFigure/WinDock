@@ -20,7 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, IsHungAppWindow, HWND_MESSAGE,
 };
 
-use crate::taskbar::{process_image, window_pid};
+use crate::taskbar::{canonical_exe_lower, process_image, window_pid};
 use crate::ui::IconPixels;
 use crate::win32::from_wide;
 
@@ -224,7 +224,7 @@ fn windows_by_exe() -> HashMap<String, Vec<HWND>> {
 
 /// 按可执行文件路径收集当前拥有窗口的进程 ID，供未绑定注册项的托盘回退识别归属。
 pub(super) fn exe_pids(exe: &str) -> Vec<u32> {
-    let key = exe.to_lowercase();
+    let key = canonical_exe_lower(exe);
     let mut pids: Vec<u32> = windows_by_exe()
         .get(&key)
         .into_iter()
@@ -355,7 +355,7 @@ pub(super) fn active_registrations(
         else {
             continue;
         };
-        let exe_key = exe.to_lowercase();
+        let exe_key = canonical_exe_lower(&exe);
         let file = exe_key.rsplit(['\\', '/']).next().unwrap_or(&exe_key);
         if matches!(file, "windock.exe" | "windockfinder.exe") {
             continue;

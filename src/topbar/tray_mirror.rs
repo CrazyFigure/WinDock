@@ -29,15 +29,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, CopyIcon, FindWindowExW, GetAncestor, GetClassLongPtrW, GetCursorPos,
     GetForegroundWindow, GetWindowRect, IsHungAppWindow, IsWindow, IsWindowVisible, PostMessageW,
-    SendMessageTimeoutW, SetCursorPos, SetForegroundWindow, WindowFromPoint, GA_ROOT, GCLP_HICON,
+    SendMessageTimeoutW, SetForegroundWindow, WindowFromPoint, GA_ROOT, GCLP_HICON,
     GCLP_HICONSM, HICON, ICON_BIG, ICON_SMALL, ICON_SMALL2, PW_RENDERFULLCONTENT, SMTO_ABORTIFHUNG,
     WM_GETICON,
 };
 
 use crate::ui::{DibTarget, IconPixels};
 use crate::win32::fnv1a64;
-use crate::taskbar::{primary_taskbar, TrayPeek};
-use super::tray_popup::{self, CancelSignal, CoverContext, DesktopCover, MenuPlacement};
+use crate::taskbar::{canonical_exe_lower, is_process_elevated, primary_taskbar, TrayPeek};
+use super::tray_popup::{self, CancelSignal, CoverContext, CursorMove, DesktopCover, MenuPlacement};
 use super::tray_registry::{self, Registration};
 
 pub const WM_APP_TRAY_ITEMS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 31;
@@ -131,7 +131,10 @@ pub fn build_shelf_items(apps: &[crate::monitor::RuntimeApp], uia_items: &[TrayI
     for tray in uia_items {
         // 已注册的图标按实际进程路径归属，避免动态提示文字把图标分配给其他应用。
         let match_index = if let Some(exe) = &tray.app_exe {
-            items[..app_count].iter().position(|app| app.app_exe.as_ref().is_some_and(|path| path.eq_ignore_ascii_case(exe)))
+            let exe_norm = canonical_exe_lower(exe);
+            items[..app_count].iter().position(|app| {
+                app.app_exe.as_ref().is_some_and(|path| canonical_exe_lower(path) == exe_norm)
+            })
         } else if tray.registration.is_none() {
             unique_best(items[..app_count].iter().enumerate().filter_map(|(index, app)| {
                 name_match(&tray.name, &app.name).map(|rank| (index, rank))
@@ -960,7 +963,14 @@ fn find_target<'a>(
         }
     }
     let exe = item.app_exe.as_deref()?;
-    let mut same_exe = buttons.clone().filter(|button| button.item.app_exe.as_deref().is_some_and(|path| path.eq_ignore_ascii_case(exe)));
+    let exe_norm = canonical_exe_lower(exe);
+    let mut same_exe = buttons.clone().filter(|button| {
+        button
+            .item
+            .app_exe
+            .as_deref()
+            .is_some_and(|path| canonical_exe_lower(path) == exe_norm)
+    });
     if let Some(button) = same_exe.next().filter(|_| same_exe.next().is_none()) {
         return Some(button);
     }
@@ -990,7 +1000,7 @@ fn settle_live_point(button: &NativeButton) -> Option<POINT> {
 }
 
 /// 原生按钮能命中时透传同一鼠标动作。被遮住的按钮可用焦点键盘菜单。
-fn click_button(button: &NativeButton, right: bool) -> (bool, Option<POINT>) {
+fn click_button(button: &NativeButton, right: bool) -> (bool, Option<CursorMove>) {
     if !right && invoke_element(&button.element) {
         return (true, None);
     }
@@ -1000,19 +1010,22 @@ fn click_button(button: &NativeButton, right: bool) -> (bool, Option<POINT>) {
     if let Some(mut point) = settle_live_point(button) {
         unsafe {
             let mut old = POINT::default();
-            if GetCursorPos(&mut old).is_ok() && SetCursorPos(point.x, point.y).is_ok() {
-                thread::sleep(Duration::from_millis(20));
+            // 使用经 DPI 校准确认的落点移动光标，避免跨缩放屏幕首次 SetCursorPos 落偏导致后续还原失灵。
+            if GetCursorPos(&mut old).is_ok() && tray_popup::move_cursor_verified(point).is_some() {
+                thread::sleep(Duration::from_millis(16));
                 // 发送输入前再次校验坐标，若刚刚微移则跟进一次。
                 let latest = live_point();
                 if let Some(latest) = latest.filter(|latest| *latest != point && belongs_to(button.root, *latest)) {
-                    if SetCursorPos(latest.x, latest.y).is_ok() {
+                    if tray_popup::move_cursor_verified(latest).is_some() {
                         point = latest;
-                        thread::sleep(Duration::from_millis(20));
+                        thread::sleep(Duration::from_millis(16));
                     }
                 }
                 if live_point() == Some(point) && belongs_to(button.root, point) {
+                    let mut actual_moved = point;
+                    let _ = GetCursorPos(&mut actual_moved);
                     if right {
-                        MenuPlacement::set_live_source(point);
+                        MenuPlacement::set_live_source(actual_moved);
                     }
                     let (down, up) = if right { (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP) }
                         else { (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP) };
@@ -1021,11 +1034,17 @@ fn click_button(button: &NativeButton, right: bool) -> (bool, Option<POINT>) {
                     mouse_event(up, 0, 0, 0, 0);
                     if !right {
                         thread::sleep(Duration::from_millis(35));
-                        let _ = SetCursorPos(old.x, old.y);
+                        let _ = tray_popup::move_cursor_verified(old);
                     }
-                    return (true, right.then_some(point));
+                    return (
+                        true,
+                        right.then_some(CursorMove {
+                            restore_to: old,
+                            moved_to: actual_moved,
+                        }),
+                    );
                 }
-                let _ = SetCursorPos(old.x, old.y);
+                let _ = tray_popup::move_cursor_verified(old);
             }
         }
     }
@@ -1136,8 +1155,9 @@ fn invoke(
     let mut menu = None;
     let invoked = target.is_some_and(|button| {
         let Some(anchor) = anchor else { return click_button(button, false).0 };
-        let fallback_pids = if button.owner_pids.is_empty() && item.app_hwnds.is_empty() {
-            item.app_exe.as_deref().map(tray_registry::exe_pids).unwrap_or_default()
+        let exe_hint = item.app_exe.as_deref().or(button.item.app_exe.as_deref());
+        let fallback_pids = if button.owner_pids.is_empty() {
+            exe_hint.map(tray_registry::exe_pids).unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -1147,6 +1167,23 @@ fn invoke(
                 let _ = AllowSetForegroundWindow(owner_pid);
             }
         }
+        // 汇总注册表、应用窗口和托盘按钮的可执行路径，兼容多进程架构及子进程弹出自绘菜单的场景。
+        let mut owner_exes = Vec::new();
+        for candidate in [item.app_exe.as_ref(), button.item.app_exe.as_ref()].into_iter().flatten() {
+            if !owner_exes.contains(candidate) {
+                owner_exes.push(candidate.clone());
+            }
+        }
+        if let Some(reg_id) = item.registration.or(button.item.registration) {
+            if let Some(entries) = registered.as_deref() {
+                if let Some(entry) = entries.iter().find(|e| e.id == reg_id) {
+                    if !owner_exes.contains(&entry.exe) {
+                        owner_exes.push(entry.exe.clone());
+                    }
+                }
+            }
+        }
+        let target_elevated = owner_pids.iter().any(|&p| is_process_elevated(p));
         let source = center(button.button_rect);
         let opened = MenuPlacement::new(
             anchor,
@@ -1154,6 +1191,8 @@ fn invoke(
             click_cursor.then_some(cursor),
             &item.app_hwnds,
             owner_pids,
+            &owner_exes,
+            target_elevated,
         )
         .open_at(
             cache.menu_uses_mouse(&button.item.key),

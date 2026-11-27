@@ -8,8 +8,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use windows::core::w;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_NAME_FORMAT, QueryFullProcessImageNameW};
+use windows::Win32::Foundation::{BOOL, ERROR_ACCESS_DENIED, HWND, LPARAM, WPARAM};
+use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+use windows::Win32::Storage::FileSystem::GetLongPathNameW;
+use windows::Win32::System::Threading::{
+    OpenProcess, OpenProcessToken, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+    QueryFullProcessImageNameW,
+};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::WINEVENT_OUTOFCONTEXT;
 use windows::Win32::UI::Shell::{
@@ -76,9 +81,70 @@ pub fn process_image_raw(pid: u32) -> String {
     }
 }
 
-/// 进程映像文件名（小写），失败返回空串。
+/// 统一归一化可执行文件路径为小写长路径（展开 `WPSOFF~1` 等 8.3 短路径并剥离 `\\?\` 前缀）。
+pub fn canonical_exe_lower(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let resolved = if trimmed.contains('~') {
+        let wide_in = crate::win32::wide(trimmed);
+        let mut buf = [0u16; 1024];
+        let n = unsafe {
+            GetLongPathNameW(
+                windows::core::PCWSTR(wide_in.as_ptr()),
+                Some(&mut buf),
+            )
+        };
+        if n > 0 && (n as usize) < buf.len() {
+            crate::win32::from_wide(&buf[..n as usize])
+        } else {
+            trimmed.to_string()
+        }
+    } else {
+        trimmed.to_string()
+    };
+    resolved
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&resolved)
+        .to_lowercase()
+}
+
+/// 进程映像文件名（小写长路径），失败返回空串。
 pub fn process_image(pid: u32) -> String {
-    process_image_raw(pid).to_lowercase()
+    canonical_exe_lower(&process_image_raw(pid))
+}
+
+/// 判断目标进程是否处于管理员提权（或受 UIPI 保护）状态，用于决定点击后的光标提前归位策略。
+pub fn is_process_elevated(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(h) => h,
+            Err(err) => return err.code() == ERROR_ACCESS_DENIED.to_hresult(),
+        };
+        let mut token = windows::Win32::Foundation::HANDLE::default();
+        let elevated = if OpenProcessToken(handle, TOKEN_QUERY, &mut token).is_ok() {
+            let mut info = TOKEN_ELEVATION::default();
+            let mut size = 0u32;
+            let ok = GetTokenInformation(
+                token,
+                TokenElevation,
+                Some((&mut info as *mut TOKEN_ELEVATION).cast()),
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut size,
+            )
+            .is_ok();
+            let _ = windows::Win32::Foundation::CloseHandle(token);
+            ok && info.TokenIsElevated != 0
+        } else {
+            false
+        };
+        let _ = windows::Win32::Foundation::CloseHandle(handle);
+        elevated
+    }
 }
 
 pub fn window_pid(hwnd: HWND) -> u32 {
@@ -512,4 +578,20 @@ pub fn wait_taskbar_visible(timeout_ms: u32) -> bool {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exe_normalization_and_elevation_checks_work_safely() {
+        assert_eq!(canonical_exe_lower(""), "");
+        assert_eq!(
+            canonical_exe_lower(r"\\?\C:\Software\WeMeet\WeMeetApp.exe"),
+            r"c:\software\wemeet\wemeetapp.exe"
+        );
+        assert!(!is_process_elevated(0));
+        assert!(!is_process_elevated(std::process::id()));
+    }
 }
