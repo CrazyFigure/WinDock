@@ -2613,6 +2613,252 @@ pub fn draw_chevron_animated(sf: &mut Surface, cx: f32, cy: f32, size: f32, prog
     sf.thick_line(tip.0, tip.1, arm_b.0, arm_b.1, sw, c);
 }
 
+/// 顶部栏下拉浮层/菜单抽屉展开动画时长（ms）：保证清晰滑出动作且轻快不拖沓。
+pub const DRAWER_OPEN_ANIM_MS: f32 = 155.0;
+/// 顶部栏下拉浮层/菜单抽屉收起动画时长（ms）：顺滑缩回栏边。
+pub const DRAWER_CLOSE_ANIM_MS: f32 = 120.0;
+/// 点击展开首帧初始线性进度，避免首帧全透明空白带来的响应延迟感。
+pub const DRAWER_OPEN_START_T: f32 = 0.08;
+/// 点击收起首帧轻微离位偏移，提供即时视觉反馈。
+pub const DRAWER_CLOSE_START_OFFSET: f32 = 0.16;
+
+/// 计算抽屉展开/收起动画的缓动进度（0 = 完全收在栏内，1 = 完全展开到位）。
+pub fn eval_drawer_progress(anim_t: f32, closing: bool) -> f32 {
+    let t = anim_t.clamp(0.0, 1.0);
+    let inv = 1.0 - t;
+    if closing {
+        // 收起：先柔和脱离静止位置，再加速缩回顶部栏后方
+        1.0 - inv * inv
+    } else {
+        // 展开：首段迅捷滑出，末端柔和减速落位
+        1.0 - inv * inv * inv
+    }
+}
+
+/// 展开与收起中途反向切换时，按当前视觉进度反推新方向线性参数以保持零跳变衔接。
+pub fn invert_drawer_progress(eased: f32, to_closing: bool) -> f32 {
+    let e = eased.clamp(0.0, 1.0);
+    if to_closing {
+        1.0 - (1.0 - e).sqrt()
+    } else {
+        1.0 - (1.0 - e).cbrt()
+    }
+}
+
+/// 根据缓动进度计算卡片顶部相对分层窗口的 Y 坐标（超界部分在栏边自然裁切）。
+pub fn compute_drawer_card_top(
+    card_h: i32,
+    gap_px: i32,
+    resting_card_top: i32,
+    open_down: bool,
+    eased: f32,
+) -> i32 {
+    let travel = (card_h + gap_px).max(0) as f32;
+    let offset = (1.0 - eased.clamp(0.0, 1.0)) * travel;
+    if open_down {
+        (resting_card_top as f32 - offset).round() as i32
+    } else {
+        (resting_card_top as f32 + offset).round() as i32
+    }
+}
+
+/// 顶部栏下拉浮层/菜单共用的工作区定位结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnchoredDrawerBounds {
+    pub left: i32,
+    pub win_top: i32,
+    pub win_h: i32,
+    pub gap_px: i32,
+    pub resting_card_top: i32,
+    pub open_down: bool,
+}
+
+/// 计算贴靠顶部栏按钮的抽屉窗口定位与裁切间距（优先向下滑出，底边不足时向上翻转）。
+pub fn compute_anchored_drawer_bounds(
+    anchor: RECT,
+    work: RECT,
+    w: i32,
+    card_h: i32,
+    want_gap: i32,
+    margin: i32,
+    align_right: bool,
+) -> AnchoredDrawerBounds {
+    let raw_left = if align_right { anchor.right - w } else { anchor.left };
+    let left = raw_left.clamp(work.left + margin, (work.right - w - margin).max(work.left + margin));
+    let fits_below = anchor.bottom + want_gap + card_h <= work.bottom - margin;
+    let more_space_above = (anchor.top - work.top) > (work.bottom - anchor.bottom);
+    if fits_below || !more_space_above {
+        let max_bottom = (work.bottom - margin).max(anchor.bottom + card_h);
+        let target_top = (anchor.bottom + want_gap).min(max_bottom - card_h).max(anchor.bottom);
+        let gap_px = (target_top - anchor.bottom).max(0);
+        AnchoredDrawerBounds {
+            left,
+            win_top: anchor.bottom,
+            win_h: gap_px + card_h,
+            gap_px,
+            resting_card_top: gap_px,
+            open_down: true,
+        }
+    } else {
+        let target_top = (anchor.top - card_h - want_gap).max(work.top + margin);
+        let gap_px = (anchor.top - (target_top + card_h)).max(0);
+        AnchoredDrawerBounds {
+            left,
+            win_top: target_top,
+            win_h: card_h + gap_px,
+            gap_px,
+            resting_card_top: 0,
+            open_down: false,
+        }
+    }
+}
+
+/// 顶部栏弹出面板/菜单/收纳浮层共用的抽屉滑出动画状态机。
+#[derive(Clone, Copy, Debug)]
+pub struct DrawerAnim {
+    pub anim_t: f32,
+    pub closing: bool,
+    pub enabled: bool,
+    pub card_h: i32,
+    pub gap_px: i32,
+    pub resting_card_top: i32,
+    pub open_down: bool,
+    pub card_top: i32,
+}
+
+impl Default for DrawerAnim {
+    fn default() -> Self {
+        Self {
+            anim_t: 1.0,
+            closing: false,
+            enabled: true,
+            card_h: 0,
+            gap_px: 0,
+            resting_card_top: 0,
+            open_down: true,
+            card_top: 0,
+        }
+    }
+}
+
+impl DrawerAnim {
+    /// 同步配置目标尺寸与方向，并立即重算当前 `card_top`。
+    pub fn configure_bounds(&mut self, card_h: i32, gap_px: i32, resting_card_top: i32, open_down: bool) {
+        self.card_h = card_h;
+        self.gap_px = gap_px;
+        self.resting_card_top = resting_card_top;
+        self.open_down = open_down;
+        self.sync_card_top();
+    }
+
+    pub fn sync_card_top(&mut self) {
+        let eased = eval_drawer_progress(self.anim_t, self.closing);
+        self.card_top = compute_drawer_card_top(
+            self.card_h,
+            self.gap_px,
+            self.resting_card_top,
+            self.open_down,
+            eased,
+        );
+    }
+
+    /// 准备展开动画；支持收起中途反向无跳变接续，以及原地刷新保持到位状态。
+    pub fn begin_open(
+        &mut self,
+        was_visible: bool,
+        reverse_from_closing: bool,
+        keep_in_place: bool,
+        reduce: bool,
+        enabled: bool,
+    ) {
+        self.enabled = enabled;
+        if reduce || !enabled {
+            self.closing = false;
+            self.anim_t = 1.0;
+        } else if reverse_from_closing && was_visible && self.closing {
+            let cur = eval_drawer_progress(self.anim_t, true);
+            self.anim_t = invert_drawer_progress(cur, false).max(DRAWER_OPEN_START_T);
+            self.closing = false;
+        } else if keep_in_place && was_visible && !self.closing {
+            // 原地刷新内容（如切换深浅主题）保持当前进度，不重复滑出
+        } else {
+            self.closing = false;
+            self.anim_t = DRAWER_OPEN_START_T;
+        }
+        self.sync_card_top();
+    }
+
+    /// 启动收起动画；返回 true 表示需要继续逐帧推进，false 表示应立即隐藏。
+    pub fn begin_close(&mut self, reduce: bool) -> bool {
+        if reduce || !self.enabled || self.card_h <= 0 {
+            return false;
+        }
+        if self.closing {
+            return true;
+        }
+        let cur = eval_drawer_progress(self.anim_t, false);
+        self.closing = true;
+        self.anim_t = invert_drawer_progress(cur, true).min(1.0 - DRAWER_CLOSE_START_OFFSET);
+        self.sync_card_top();
+        true
+    }
+
+    /// 推进一帧动画；返回 `(仍在动画, 进度有变化, 本帧刚完成收起)`。
+    pub fn tick(&mut self, dt_ms: f32, reduce: bool) -> (bool, bool, bool) {
+        if !self.enabled {
+            return (false, false, self.closing);
+        }
+        if self.closing {
+            if reduce || self.card_h <= 0 {
+                self.reset_closed();
+                return (false, true, true);
+            }
+            let next = (self.anim_t - dt_ms / DRAWER_CLOSE_ANIM_MS).max(0.0);
+            let changed = (next - self.anim_t).abs() > 0.0005;
+            self.anim_t = next;
+            if self.anim_t <= 0.0 {
+                self.reset_closed();
+                return (false, true, true);
+            }
+            if changed {
+                self.sync_card_top();
+            }
+            return (true, changed, false);
+        }
+        if self.anim_t < 1.0 {
+            let next = if reduce {
+                1.0
+            } else {
+                (self.anim_t + dt_ms / DRAWER_OPEN_ANIM_MS).min(1.0)
+            };
+            let changed = (next - self.anim_t).abs() > 0.0005;
+            self.anim_t = next;
+            if changed {
+                self.sync_card_top();
+            }
+            return (self.anim_t < 1.0, changed, false);
+        }
+        (false, false, false)
+    }
+
+    pub fn reset_closed(&mut self) {
+        self.closing = false;
+        self.anim_t = 0.0;
+    }
+
+    pub fn is_animating(&self, visible: bool) -> bool {
+        visible && self.enabled && (self.closing || self.anim_t < 1.0)
+    }
+
+    pub fn visual_progress(&self, visible: bool) -> f32 {
+        if !visible {
+            0.0
+        } else {
+            eval_drawer_progress(self.anim_t, self.closing)
+        }
+    }
+}
+
 /// 绘制带实时电量填充与充电标识的 macOS 风格电池图标。
 pub fn draw_battery_filled(sf: &mut Surface, cx: f32, cy: f32, size: f32, pct: u8, charging: bool, c: Rgba) {
     let w = size * 1.15;
@@ -2945,6 +3191,61 @@ mod tests {
         assert!(buf.iter().any(|&p| p != 0));
         let p = palette(true, (0.04, 0.52, 1.0));
         assert!(p.text.0 > 0.9);
+    }
+
+    #[test]
+    fn drawer_anim_math_and_bounds_stay_continuous() {
+        assert!((eval_drawer_progress(0.0, false) - 0.0).abs() < 1e-6);
+        assert!((eval_drawer_progress(1.0, false) - 1.0).abs() < 1e-6);
+        assert!(eval_drawer_progress(0.3, false) > 0.55);
+        for step in 1..10 {
+            let t = step as f32 / 10.0;
+            let e_open = eval_drawer_progress(t, false);
+            assert!((eval_drawer_progress(invert_drawer_progress(e_open, true), true) - e_open).abs() < 1e-4);
+            let e_close = eval_drawer_progress(t, true);
+            assert!((eval_drawer_progress(invert_drawer_progress(e_close, false), false) - e_close).abs() < 1e-4);
+        }
+        assert_eq!(compute_drawer_card_top(80, 4, 4, true, 0.0), -80);
+        assert_eq!(compute_drawer_card_top(80, 4, 4, true, 1.0), 4);
+        assert_eq!(compute_drawer_card_top(80, 4, 0, false, 0.0), 84);
+        assert_eq!(compute_drawer_card_top(80, 4, 0, false, 1.0), 0);
+
+        let work = RECT { left: 0, top: 30, right: 1920, bottom: 1040 };
+        let anchor_down = RECT { left: 10, top: 0, right: 80, bottom: 30 };
+        let b_down = compute_anchored_drawer_bounds(anchor_down, work, 200, 120, 4, 6, false);
+        assert!(b_down.open_down);
+        assert_eq!(b_down.left, 10);
+        assert_eq!(b_down.win_top, 30);
+        assert_eq!(b_down.win_h, 124);
+        assert_eq!(b_down.resting_card_top, 4);
+
+        let anchor_right = RECT { left: 1840, top: 0, right: 1900, bottom: 30 };
+        let b_right = compute_anchored_drawer_bounds(anchor_right, work, 260, 140, 4, 8, true);
+        assert!(b_right.open_down);
+        assert_eq!(b_right.left, 1640);
+        assert_eq!(b_right.win_top, 30);
+        assert_eq!(b_right.win_h, 144);
+        assert_eq!(b_right.resting_card_top, 4);
+
+        // 禁用动画模式（如非锚定右键菜单）保持零偏移直达且不开启收起动画
+        let mut d = DrawerAnim::default();
+        d.begin_open(false, false, false, false, false);
+        d.configure_bounds(120, 0, 0, true);
+        assert!(!d.is_animating(true));
+        assert_eq!(d.card_top, 0);
+        assert!(!d.begin_close(false));
+
+        // 启用动画模式：首帧探出 -> 渐进落位 -> 中途反向无缝衔接
+        d.begin_open(false, false, false, false, true);
+        d.configure_bounds(120, 4, 4, true);
+        assert!(d.is_animating(true));
+        assert!(d.card_top < 4 && d.card_top + 120 > 0);
+        assert!(d.begin_close(false));
+        let _ = d.tick(32.0, false);
+        let mid_top = d.card_top;
+        d.begin_open(true, true, false, false, true);
+        assert!(!d.closing);
+        assert!((d.card_top - mid_top).abs() <= 1);
     }
 
     #[test]

@@ -167,11 +167,13 @@ enum CalView {
 #[derive(Clone, Debug)]
 pub enum PanelAction {
     None,
+    Close,
     OpenSettings,
+    NotificationCenter,
     SwitchKind(PanelKind),
     ToggleTheme,
     VolumeChanged(i32, bool),
-    ImeChanged,
+    ImeChanged { close: bool },
     LockScreen,
     Sleep,
 }
@@ -181,8 +183,9 @@ pub struct StatusPanel {
     pub visible: bool,
     pub kind: PanelKind,
     dpi: u32,
-    w: i32,
-    h: i32,
+    pub w: i32,
+    pub h: i32,
+    pub drawer: DrawerAnim,
     anchor: RECT,
     prev_fg: HWND,
     dark: bool,
@@ -229,6 +232,7 @@ impl Default for StatusPanel {
             dpi: 96,
             w: 0,
             h: 0,
+            drawer: DrawerAnim::default(),
             anchor: RECT::default(),
             prev_fg: HWND::default(),
             dark: false,
@@ -339,6 +343,26 @@ impl StatusPanel {
         self.font_big = HFONT::default();
     }
 
+    /// 是否处于打开态（未进入收起动画）。
+    pub fn is_open(&self) -> bool {
+        self.visible && !self.drawer.closing
+    }
+
+    /// 是否仍有展开或收起动画需要逐帧推进。
+    pub fn is_animating(&self) -> bool {
+        self.drawer.is_animating(self.visible)
+    }
+
+    fn card_rect(&self) -> RECT {
+        let ch = if self.drawer.card_h > 0 { self.drawer.card_h } else { self.h };
+        RECT {
+            left: 0,
+            top: self.drawer.card_top,
+            right: self.w,
+            bottom: self.drawer.card_top + ch,
+        }
+    }
+
     pub fn open(
         &mut self,
         app_ptr: *mut crate::app::App,
@@ -352,6 +376,10 @@ impl StatusPanel {
         if !self.ensure_window(app_ptr, dpi) {
             return;
         }
+        let was_visible = self.visible;
+        let same_target = self.kind == kind && self.anchor == anchor;
+        let same_closing = was_visible && same_target && self.drawer.closing;
+        let keep_in_place = was_visible && same_target && !self.drawer.closing;
         self.kind = kind;
         self.anchor = anchor;
         if !prev_fg.0.is_null() && prev_fg != self.hwnd {
@@ -363,18 +391,68 @@ impl StatusPanel {
         self.pressed = PanelHit::None;
         self.drag_slider = false;
         self.drag_bright = false;
+        unsafe {
+            if windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() == self.hwnd {
+                let _ = ReleaseCapture();
+            }
+        }
         self.cal_view = CalView::Days;
 
+        // 统一接入顶部栏锚定抽屉展开动效，支持收起中途反向无跳变接续
+        self.drawer
+            .begin_open(was_visible, same_closing, keep_in_place, appearance.reduce_motion, true);
         self.refresh_data(main_hwnd);
         self.resize_and_position();
 
         self.visible = true;
         unsafe {
             self.render();
-            let _ = ShowWindow(self.hwnd, SW_SHOW);
+            if !was_visible {
+                let _ = ShowWindow(self.hwnd, SW_SHOW);
+            }
             let _ = SetForegroundWindow(self.hwnd);
             let _ = SetFocus(self.hwnd);
         }
+    }
+
+    /// 启动平滑收起动画；若处于减弱动态效果模式则立即隐藏并释放缓冲。
+    pub fn begin_close(&mut self, reduce: bool) -> bool {
+        if !self.visible {
+            return false;
+        }
+        self.hover = PanelHit::None;
+        self.pressed = PanelHit::None;
+        self.drag_slider = false;
+        self.drag_bright = false;
+        unsafe {
+            if windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() == self.hwnd {
+                let _ = ReleaseCapture();
+            }
+        }
+        // 收起动作启动瞬间归还原外部前台窗口焦点，避免动画期间焦点落空
+        crate::win32::restore_foreground_if_owned(self.hwnd, self.prev_fg);
+        if !self.drawer.begin_close(reduce) {
+            self.finish_close();
+            return false;
+        }
+        self.render();
+        true
+    }
+
+    /// 推进一帧状态面板展开/收起动画；返回 `(仍在动画, 进度有变化, 本帧刚完成收起)`。
+    pub fn tick(&mut self, dt_ms: f32, reduce: bool) -> (bool, bool, bool) {
+        if !self.visible {
+            return (false, false, false);
+        }
+        let (animating, changed, just_closed) = self.drawer.tick(dt_ms, reduce);
+        if just_closed {
+            self.finish_close();
+            return (false, true, true);
+        }
+        if changed {
+            self.render();
+        }
+        (animating, changed, false)
     }
 
     pub fn close(&mut self) {
@@ -386,14 +464,24 @@ impl StatusPanel {
             }
         }
         if self.visible {
-            self.visible = false;
-            self.hover = PanelHit::None;
-            self.pressed = PanelHit::None;
             // 若面板关闭前仍持有焦点，先归还给原外部应用窗口，避免顶部栏色回落桌面色
             crate::win32::restore_foreground_if_owned(self.hwnd, self.prev_fg);
-            unsafe {
-                let _ = ShowWindow(self.hwnd, SW_HIDE);
-            }
+            self.finish_close();
+        } else {
+            self.drawer.reset_closed();
+            self.target.release();
+            self.scratch.release();
+        }
+    }
+
+    fn finish_close(&mut self) {
+        self.visible = false;
+        self.drawer.reset_closed();
+        self.hover = PanelHit::None;
+        self.pressed = PanelHit::None;
+        self.zones.clear();
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
         self.target.release();
         self.scratch.release();
@@ -465,7 +553,7 @@ impl StatusPanel {
             return;
         }
         self.net_data = data;
-        if self.visible && self.kind == PanelKind::Network {
+        if self.is_open() && self.kind == PanelKind::Network {
             self.resize_and_position();
             self.render();
         }
@@ -473,7 +561,7 @@ impl StatusPanel {
 
     fn resize_and_position(&mut self) {
         let d = self.dpi;
-        let (w, h) = match self.kind {
+        let (w, card_h) = match self.kind {
             PanelKind::Ime => {
                 let rows = self.ime_layouts.len().clamp(1, 7) as i32;
                 let extra = if self.ime_cur_chinese { dp(40, d) } else { 0 };
@@ -501,7 +589,7 @@ impl StatusPanel {
             PanelKind::Clock => (dp(292, d), dp(304, d)),
         };
         self.w = w;
-        self.h = h;
+        let want_gap = dp(4, d);
         unsafe {
             let mut mi = MONITORINFO {
                 cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -509,13 +597,26 @@ impl StatusPanel {
             };
             let mon = windows::Win32::Graphics::Gdi::MonitorFromRect(&self.anchor, MONITOR_DEFAULTTONEAREST);
             let _ = GetMonitorInfoW(mon, &mut mi);
-            let left = (self.anchor.right - w).clamp(mi.rcWork.left + 8, (mi.rcWork.right - w - 8).max(mi.rcWork.left + 8));
-            let top = (self.anchor.bottom + dp(4, d)).min((mi.rcWork.bottom - h - 8).max(mi.rcWork.top + 8));
-            let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, left, top, w, h, SWP_NOACTIVATE | SWP_NOSENDCHANGING);
+            let bounds = compute_anchored_drawer_bounds(self.anchor, mi.rcWork, w, card_h, want_gap, 8, true);
+            self.h = bounds.win_h;
+            self.drawer
+                .configure_bounds(card_h, bounds.gap_px, bounds.resting_card_top, bounds.open_down);
+            let _ = SetWindowPos(
+                self.hwnd,
+                HWND_TOPMOST,
+                bounds.left,
+                bounds.win_top,
+                self.w,
+                self.h,
+                SWP_NOACTIVATE | SWP_NOSENDCHANGING,
+            );
         }
     }
 
     pub fn on_mouse_move(&mut self, x: i32, y: i32) -> PanelAction {
+        if !self.is_open() {
+            return PanelAction::None;
+        }
         if self.drag_slider {
             let act = self.apply_slider_x(x);
             self.render();
@@ -535,6 +636,9 @@ impl StatusPanel {
     }
 
     pub fn on_mouse_leave(&mut self) {
+        if !self.is_open() {
+            return;
+        }
         if !self.drag_slider && !self.drag_bright && self.hover != PanelHit::None {
             self.hover = PanelHit::None;
             self.render();
@@ -542,6 +646,9 @@ impl StatusPanel {
     }
 
     pub fn on_lbutton_down(&mut self, x: i32, y: i32) -> PanelAction {
+        if !self.is_open() {
+            return PanelAction::None;
+        }
         let hit = self.hit_test(x, y);
         self.pressed = hit.clone();
         if hit == PanelHit::VolSlider {
@@ -567,6 +674,9 @@ impl StatusPanel {
     }
 
     pub fn on_lbutton_up(&mut self, main_hwnd: HWND, x: i32, y: i32) -> PanelAction {
+        if !self.is_open() {
+            return PanelAction::None;
+        }
         if self.drag_slider || self.drag_bright {
             self.drag_slider = false;
             self.drag_bright = false;
@@ -628,19 +738,17 @@ impl StatusPanel {
                 set_ime_native(self.prev_fg, native);
                 self.ime_native = native;
                 self.render();
-                PanelAction::ImeChanged
+                PanelAction::ImeChanged { close: false }
             }
             PanelHit::ImeLayout(i) => {
                 if let Some(it) = self.ime_layouts.get(i) {
                     switch_keyboard_layout(self.prev_fg, it.hkl);
                 }
-                self.close();
-                PanelAction::ImeChanged
+                PanelAction::ImeChanged { close: true }
             }
             PanelHit::ImeSettings => {
-                self.close();
                 let _ = crate::win32::open_shell_path("open", "explorer.exe", Some("ms-settings:regionlanguage"));
-                PanelAction::None
+                PanelAction::Close
             }
             PanelHit::NetRefresh => {
                 self.net_data.loading = true;
@@ -663,17 +771,17 @@ impl StatusPanel {
                             spawn_network_query(HWND(mh as *mut _), token);
                         });
                         self.render();
+                        return PanelAction::None;
                     } else {
-                        self.close();
                         let _ = crate::win32::open_shell_path("open", "explorer.exe", Some("ms-availablenetworks:"));
+                        return PanelAction::Close;
                     }
                 }
                 PanelAction::None
             }
             PanelHit::NetSettings => {
-                self.close();
                 let _ = crate::win32::open_shell_path("open", "explorer.exe", Some("ms-settings:network-wifi"));
-                PanelAction::None
+                PanelAction::Close
             }
             PanelHit::VolMute => {
                 self.vol_mute = !self.vol_mute;
@@ -697,9 +805,8 @@ impl StatusPanel {
                 PanelAction::None
             }
             PanelHit::SoundSettings => {
-                self.close();
                 let _ = crate::win32::open_shell_path("open", "explorer.exe", Some("ms-settings:sound"));
-                PanelAction::None
+                PanelAction::Close
             }
             PanelHit::PowerScheme(i) => {
                 if let Some(sc) = self.power_schemes.get(i) {
@@ -715,29 +822,15 @@ impl StatusPanel {
                 PanelAction::None
             }
             PanelHit::PowerSettings => {
-                self.close();
                 let _ = crate::win32::open_shell_path("open", "explorer.exe", Some("ms-settings:powersleep"));
-                PanelAction::None
+                PanelAction::Close
             }
             PanelHit::BrightSlider | PanelHit::VolSlider => PanelAction::None,
             PanelHit::CtrlTheme => PanelAction::ToggleTheme,
-            PanelHit::CtrlNotify | PanelHit::CalNotify => {
-                self.close();
-                trigger_notification_center();
-                PanelAction::None
-            }
-            PanelHit::CtrlLock => {
-                self.close();
-                PanelAction::LockScreen
-            }
-            PanelHit::CtrlSleep => {
-                self.close();
-                PanelAction::Sleep
-            }
-            PanelHit::CtrlSettings => {
-                self.close();
-                PanelAction::OpenSettings
-            }
+            PanelHit::CtrlNotify | PanelHit::CalNotify => PanelAction::NotificationCenter,
+            PanelHit::CtrlLock => PanelAction::LockScreen,
+            PanelHit::CtrlSleep => PanelAction::Sleep,
+            PanelHit::CtrlSettings => PanelAction::OpenSettings,
             PanelHit::CalTitle => {
                 self.cal_view = match self.cal_view {
                     CalView::Days => CalView::Months,
@@ -803,6 +896,9 @@ impl StatusPanel {
     }
 
     fn hit_test(&self, x: i32, y: i32) -> PanelHit {
+        if x < 0 || x >= self.w || y < 0 || y >= self.h {
+            return PanelHit::None;
+        }
         self.zones
             .iter()
             .rev()
@@ -828,7 +924,7 @@ impl StatusPanel {
         let s = d as f32 / 96.0;
         let dark = self.dark;
         let bg = if dark { rgb(0x222328, 0.96) } else { rgb(0xF7F8FB, 0.97) };
-        let card = if dark { rgb(0x2D2F36, 0.95) } else { rgb(0xFFFFFF, 0.96) };
+        let card_bg = if dark { rgb(0x2D2F36, 0.95) } else { rgb(0xFFFFFF, 0.96) };
         let hov_bg = if dark { rgb(0x3B3E48, 0.95) } else { rgb(0xEAEFF7, 0.98) };
         let bd = if dark { (1.0, 1.0, 1.0, 0.16) } else { (0.0, 0.0, 0.0, 0.12) };
         let sep = if dark { (1.0, 1.0, 1.0, 0.10) } else { (0.0, 0.0, 0.0, 0.08) };
@@ -837,12 +933,13 @@ impl StatusPanel {
         let acc = (self.accent.0, self.accent.1, self.accent.2, 1.0);
         let acc_soft = (self.accent.0, self.accent.1, self.accent.2, if dark { 0.24 } else { 0.14 });
 
-        let outer = RECT { left: 0, top: 0, right: w, bottom: h };
-        sf.fill_rrect(&outer, 14.0 * s, bg);
-        sf.stroke_rrect(&outer, 14.0 * s, 1.0, bd);
+        // 按抽屉偏移绘制卡片本体，超出顶部栏下沿（y < 0）的区域由 Surface 自动裁切
+        let card = self.card_rect();
+        sf.fill_rrect(&card, 14.0 * s, bg);
+        sf.stroke_rrect(&card, 14.0 * s, 1.0, bd);
 
         let pad = dp(14, d);
-        let mut y = pad;
+        let mut y = card.top + pad;
 
         match self.kind {
             PanelKind::Ime => {
@@ -851,7 +948,7 @@ impl StatusPanel {
                 y += dp(28, d);
                 if self.ime_cur_chinese {
                     let seg_r = RECT { left: pad, top: y, right: w - pad, bottom: y + dp(32, d) };
-                    sf.fill_rrect(&seg_r, 8.0 * s, card);
+                    sf.fill_rrect(&seg_r, 8.0 * s, card_bg);
                     let half = (seg_r.right - seg_r.left) / 2;
                     for (idx, (label, is_nat)) in [("中文模式", true), ("英文模式", false)].iter().enumerate() {
                         let r = RECT {
@@ -892,7 +989,7 @@ impl StatusPanel {
                     self.zones.push((r, hit));
                     y += dp(34, d);
                 }
-                let foot = RECT { left: pad, top: h - dp(32, d), right: w - pad, bottom: h - dp(8, d) };
+                let foot = RECT { left: pad, top: card.bottom - dp(32, d), right: w - pad, bottom: card.bottom - dp(8, d) };
                 sf.fill_rect(&RECT { left: pad, top: foot.top - dp(4, d), right: w - pad, bottom: foot.top - dp(3, d) }, sep);
                 if self.hover == PanelHit::ImeSettings {
                     sf.fill_rrect(&foot, 6.0 * s, hov_bg);
@@ -904,13 +1001,13 @@ impl StatusPanel {
                 let title_rc = RECT { left: pad, top: y, right: w - pad - dp(54, d), bottom: y + dp(24, d) };
                 draw_transparent_text_aligned(&mut sf, &mut self.scratch, "网络与 Wi-Fi", self.font_bold, &title_rc, fg, TextAlign::Left, false, s);
                 let ref_r = RECT { left: w - pad - dp(50, d), top: y, right: w - pad, bottom: y + dp(24, d) };
-                sf.fill_rrect(&ref_r, 6.0 * s, if self.hover == PanelHit::NetRefresh { hov_bg } else { card });
+                sf.fill_rrect(&ref_r, 6.0 * s, if self.hover == PanelHit::NetRefresh { hov_bg } else { card_bg });
                 draw_transparent_text_aligned(&mut sf, &mut self.scratch, "刷新", self.font_sub, &ref_r, fg, TextAlign::Center, false, s);
                 self.zones.push((ref_r, PanelHit::NetRefresh));
                 y += dp(30, d);
 
                 let status_r = RECT { left: pad, top: y, right: w - pad, bottom: y + dp(44, d) };
-                sf.fill_rrect(&status_r, 9.0 * s, card);
+                sf.fill_rrect(&status_r, 9.0 * s, card_bg);
                 let state_title = if self.net_data.connected {
                     if self.net_data.active_name.is_empty() { "已连接互联网".to_string() } else { self.net_data.active_name.clone() }
                 } else {
@@ -958,7 +1055,7 @@ impl StatusPanel {
                     draw_transparent_text_aligned(&mut sf, &mut self.scratch, "当前设备使用有线/非 WLAN 网络", self.font_sub, &er, fg_dim, TextAlign::Center, false, s);
                 }
 
-                let foot = RECT { left: pad, top: h - dp(32, d), right: w - pad, bottom: h - dp(8, d) };
+                let foot = RECT { left: pad, top: card.bottom - dp(32, d), right: w - pad, bottom: card.bottom - dp(8, d) };
                 sf.fill_rect(&RECT { left: pad, top: foot.top - dp(4, d), right: w - pad, bottom: foot.top - dp(3, d) }, sep);
                 if self.hover == PanelHit::NetSettings {
                     sf.fill_rrect(&foot, 6.0 * s, hov_bg);
@@ -975,7 +1072,7 @@ impl StatusPanel {
                 y += dp(30, d);
 
                 let row = RECT { left: pad, top: y, right: w - pad, bottom: y + dp(40, d) };
-                sf.fill_rrect(&row, 9.0 * s, card);
+                sf.fill_rrect(&row, 9.0 * s, card_bg);
                 if self.bright_supported {
                     draw_glyph(&mut sf, Glyph::Sun, row.left as f32 + 19.0 * s, (row.top + row.bottom) as f32 * 0.5, 15.0 * s, fg);
                     let slider_r = RECT { left: row.left + dp(34, d), top: row.top, right: row.right - dp(8, d), bottom: row.bottom };
@@ -995,7 +1092,7 @@ impl StatusPanel {
                 y += dp(30, d);
 
                 let vol_row = RECT { left: pad, top: y, right: w - pad, bottom: y + dp(36, d) };
-                sf.fill_rrect(&vol_row, 9.0 * s, card);
+                sf.fill_rrect(&vol_row, 9.0 * s, card_bg);
                 let mute_r = RECT { left: vol_row.left + dp(4, d), top: vol_row.top + dp(4, d), right: vol_row.left + dp(32, d), bottom: vol_row.bottom - dp(4, d) };
                 if self.hover == PanelHit::VolMute {
                     sf.fill_rrect(&mute_r, 6.0 * s, hov_bg);
@@ -1028,7 +1125,7 @@ impl StatusPanel {
                     y += dp(34, d);
                 }
 
-                let foot = RECT { left: pad, top: h - dp(32, d), right: w - pad, bottom: h - dp(8, d) };
+                let foot = RECT { left: pad, top: card.bottom - dp(32, d), right: w - pad, bottom: card.bottom - dp(8, d) };
                 sf.fill_rect(&RECT { left: pad, top: foot.top - dp(4, d), right: w - pad, bottom: foot.top - dp(3, d) }, sep);
                 if self.hover == PanelHit::SoundSettings {
                     sf.fill_rrect(&foot, 6.0 * s, hov_bg);
@@ -1038,7 +1135,7 @@ impl StatusPanel {
             }
             PanelKind::Battery => {
                 let hero = RECT { left: pad, top: y, right: w - pad, bottom: y + dp(68, d) };
-                sf.fill_rrect(&hero, 10.0 * s, card);
+                sf.fill_rrect(&hero, 10.0 * s, card_bg);
                 if let Some((pct, charging, secs)) = self.battery_pct {
                     draw_battery_filled(&mut sf, hero.left as f32 + 28.0 * s, (hero.top + hero.bottom) as f32 * 0.5, 22.0 * s, pct, charging, fg);
                     let pct_str = format!("{pct}%");
@@ -1076,7 +1173,7 @@ impl StatusPanel {
                     y += dp(34, d);
                 }
 
-                let foot = RECT { left: pad, top: h - dp(32, d), right: w - pad, bottom: h - dp(8, d) };
+                let foot = RECT { left: pad, top: card.bottom - dp(32, d), right: w - pad, bottom: card.bottom - dp(8, d) };
                 sf.fill_rect(&RECT { left: pad, top: foot.top - dp(4, d), right: w - pad, bottom: foot.top - dp(3, d) }, sep);
                 if self.hover == PanelHit::PowerSettings {
                     sf.fill_rrect(&foot, 6.0 * s, hov_bg);
@@ -1101,7 +1198,7 @@ impl StatusPanel {
                     } else if active {
                         acc_soft
                     } else {
-                        card
+                        card_bg
                     };
                     sf.fill_rrect(&tr, 10.0 * s, tbg);
                     let icx = tr.left as f32 + 22.0 * s;
@@ -1124,7 +1221,7 @@ impl StatusPanel {
                         right: pad + (idx as i32 + 1) * bw + idx as i32 * btn_gap,
                         bottom: y + dp(34, d),
                     };
-                    sf.fill_rrect(&br, 8.0 * s, if self.hover == hit { hov_bg } else { card });
+                    sf.fill_rrect(&br, 8.0 * s, if self.hover == hit { hov_bg } else { card_bg });
                     draw_transparent_text_aligned(&mut sf, &mut self.scratch, label, self.font_sub, &br, fg, TextAlign::Center, false, s);
                     self.zones.push((br, hit));
                 }
@@ -1148,17 +1245,17 @@ impl StatusPanel {
                 self.zones.push((title_r, PanelHit::CalTitle));
 
                 let today_r = RECT { left: hdr.right - dp(102, d), top: hdr.top + dp(2, d), right: hdr.right - dp(58, d), bottom: hdr.bottom - dp(2, d) };
-                sf.fill_rrect(&today_r, 6.0 * s, if self.hover == PanelHit::CalToday { hov_bg } else { card });
+                sf.fill_rrect(&today_r, 6.0 * s, if self.hover == PanelHit::CalToday { hov_bg } else { card_bg });
                 draw_transparent_text_aligned(&mut sf, &mut self.scratch, "今天", self.font_sub, &today_r, fg, TextAlign::Center, false, s);
                 self.zones.push((today_r, PanelHit::CalToday));
 
                 let prev_r = RECT { left: hdr.right - dp(52, d), top: hdr.top + dp(2, d), right: hdr.right - dp(28, d), bottom: hdr.bottom - dp(2, d) };
-                sf.fill_rrect(&prev_r, 6.0 * s, if self.hover == PanelHit::CalPrev { hov_bg } else { card });
+                sf.fill_rrect(&prev_r, 6.0 * s, if self.hover == PanelHit::CalPrev { hov_bg } else { card_bg });
                 draw_transparent_text_aligned(&mut sf, &mut self.scratch, "‹", self.font_bold, &prev_r, fg, TextAlign::Center, false, s);
                 self.zones.push((prev_r, PanelHit::CalPrev));
 
                 let next_r = RECT { left: hdr.right - dp(24, d), top: hdr.top + dp(2, d), right: hdr.right, bottom: hdr.bottom - dp(2, d) };
-                sf.fill_rrect(&next_r, 6.0 * s, if self.hover == PanelHit::CalNext { hov_bg } else { card });
+                sf.fill_rrect(&next_r, 6.0 * s, if self.hover == PanelHit::CalNext { hov_bg } else { card_bg });
                 draw_transparent_text_aligned(&mut sf, &mut self.scratch, "›", self.font_bold, &next_r, fg, TextAlign::Center, false, s);
                 self.zones.push((next_r, PanelHit::CalNext));
                 y += dp(34, d);
@@ -1224,7 +1321,7 @@ impl StatusPanel {
                             } else if selected {
                                 acc_soft
                             } else {
-                                card
+                                card_bg
                             };
                             sf.fill_rrect(&cr, 8.0 * s, bg_c);
                             if is_cur_month {
@@ -1258,7 +1355,7 @@ impl StatusPanel {
                             } else if selected {
                                 acc_soft
                             } else {
-                                card
+                                card_bg
                             };
                             sf.fill_rrect(&cr, 8.0 * s, bg_c);
                             if is_cur_year {
@@ -1270,7 +1367,7 @@ impl StatusPanel {
                     }
                 }
 
-                let foot = RECT { left: pad, top: h - dp(34, d), right: w - pad, bottom: h - dp(8, d) };
+                let foot = RECT { left: pad, top: card.bottom - dp(34, d), right: w - pad, bottom: card.bottom - dp(8, d) };
                 sf.fill_rect(&RECT { left: pad, top: foot.top - dp(4, d), right: w - pad, bottom: foot.top - dp(3, d) }, sep);
                 if self.hover == PanelHit::CalNotify {
                     sf.fill_rrect(&foot, 6.0 * s, hov_bg);
@@ -2170,5 +2267,96 @@ mod tests {
         if let Some(cur) = read_wmi_brightness() {
             assert!(set_wmi_brightness(cur), "WmiSetBrightness 应能成功写入当前亮度 {cur}");
         }
+    }
+
+    #[test]
+    fn status_panel_drawer_opens_ticks_reverses_and_closes_smoothly() {
+        let mut panel = StatusPanel::default();
+        let anchor_clock = RECT { left: 1760, top: 0, right: 1890, bottom: 30 };
+        let anchor_ctrl = RECT { left: 1710, top: 0, right: 1750, bottom: 30 };
+        let app = Appearance::default();
+
+        // 1. 打开日历状态面板：首帧即从顶部栏下沿探出，保持窗口顶边紧贴顶部栏下沿
+        panel.open(std::ptr::null_mut(), HWND::default(), PanelKind::Clock, anchor_clock, 96, HWND::default(), &app);
+        assert!(panel.is_open());
+        assert!(panel.is_animating());
+        assert!(panel.drawer.card_top < panel.drawer.resting_card_top);
+        assert!(panel.drawer.card_top + panel.drawer.card_h > 0);
+        let mut wr = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(panel.hwnd, &mut wr);
+        }
+        assert_eq!(wr.top, anchor_clock.bottom);
+        let stride = panel.target.w as usize;
+        let open_pixels = unsafe { std::slice::from_raw_parts(panel.target.ptr as *const u32, stride * panel.target.h as usize) };
+        assert!((open_pixels[panel.w as usize / 2] >> 24) > 200, "首帧顶部栏下沿第一行应显示已滑出的面板内容");
+
+        // 推进动画至完全展开到位：顶部留白透明，底栏区域按钮（打开系统通知中心）可准确命中
+        let mut prev_top = panel.drawer.card_top;
+        for _ in 0..14 {
+            let _ = panel.tick(16.0, false);
+            assert!(panel.drawer.card_top >= prev_top);
+            prev_top = panel.drawer.card_top;
+        }
+        assert!(!panel.is_animating());
+        assert_eq!(panel.drawer.card_top, panel.drawer.resting_card_top);
+        assert!(panel.drawer.gap_px > 0);
+        let pixels = unsafe { std::slice::from_raw_parts(panel.target.ptr as *const u32, stride * panel.target.h as usize) };
+        assert_eq!(pixels[panel.w as usize / 2] >> 24, 0, "顶部间距首行应全透明");
+        assert!((pixels[(panel.drawer.resting_card_top as usize + 12) * stride + (panel.w as usize / 2)] >> 24) > 200);
+        assert_eq!(panel.hit_test(panel.w / 2, panel.h - 18), PanelHit::CalNotify);
+
+        // 2. 平滑收起期间拦截点击，并在中途点击同一按钮时反向无缝展开
+        assert!(panel.begin_close(false));
+        assert!(panel.drawer.closing);
+        assert!(!panel.is_open());
+        assert!(matches!(panel.on_lbutton_down(panel.w / 2, panel.h - 18), PanelAction::None));
+        let _ = panel.tick(24.0, false);
+        let mid_top = panel.drawer.card_top;
+        assert!(mid_top < panel.drawer.resting_card_top && panel.visible);
+
+        panel.open(std::ptr::null_mut(), HWND::default(), PanelKind::Clock, anchor_clock, 96, HWND::default(), &app);
+        assert!(panel.is_open());
+        assert!(!panel.drawer.closing);
+        assert!((panel.drawer.card_top - mid_top).abs() <= 1, "反向展开不应跳变: mid={mid_top}, now={}", panel.drawer.card_top);
+
+        // 3. 切换到另一面板类型（Control）应重新播放滑出动画；同位置重复刷新 Control 保持原地不重播
+        panel.open(std::ptr::null_mut(), HWND::default(), PanelKind::Control, anchor_ctrl, 96, HWND::default(), &app);
+        assert!(panel.is_animating());
+        assert!(panel.drawer.card_top < panel.drawer.resting_card_top);
+        for _ in 0..14 {
+            let _ = panel.tick(16.0, false);
+        }
+        assert!(!panel.is_animating());
+        let mut dark_app = Appearance::default();
+        dark_app.theme = "dark".into();
+        panel.open(std::ptr::null_mut(), HWND::default(), PanelKind::Control, anchor_ctrl, 96, HWND::default(), &dark_app);
+        assert!(!panel.is_animating(), "同面板切换主题应原地刷新不重复滑出");
+        assert_eq!(panel.drawer.card_top, panel.drawer.resting_card_top);
+
+        // 4. 完整收起后应隐藏窗口并释放绘图缓冲
+        assert!(panel.begin_close(false));
+        for _ in 0..12 {
+            let (anim, _, closed) = panel.tick(16.0, false);
+            if closed {
+                assert!(!anim);
+                break;
+            }
+        }
+        assert!(!panel.visible);
+        assert!(!panel.drawer.closing);
+        assert!(panel.target.ptr.is_null());
+
+        // 5. 减弱动态效果模式下应立即到位与立即隐藏
+        let mut reduced = Appearance::default();
+        reduced.reduce_motion = true;
+        panel.open(std::ptr::null_mut(), HWND::default(), PanelKind::Brightness, anchor_ctrl, 96, HWND::default(), &reduced);
+        assert!(panel.is_open());
+        assert!(!panel.is_animating());
+        assert_eq!(panel.drawer.card_top, panel.drawer.resting_card_top);
+        assert!(!panel.begin_close(true));
+        assert!(!panel.visible);
+
+        panel.destroy();
     }
 }

@@ -394,6 +394,8 @@ pub struct App {
     pub settings: Option<crate::settings::Settings>,
     pub context_menu: ContextMenu,
     pub status_panel: StatusPanel,
+    pub topbar_menu: Option<(usize, Hit)>,
+    pub status_panel_bar: Option<(usize, Hit)>,
     pub window_preview: WindowPreview,
     pub preview_leave_at: Option<Instant>,
     pub snap: MonitorState,
@@ -531,6 +533,8 @@ pub fn run(open_settings: bool) -> i32 {
         settings: None,
         context_menu: ContextMenu::default(),
         status_panel: StatusPanel::default(),
+        topbar_menu: None,
+        status_panel_bar: None,
         window_preview: WindowPreview::default(),
         preview_leave_at: None,
         snap: monitor::snapshot(),
@@ -845,8 +849,8 @@ impl App {
         self.clear_tray_context();
         self.tray_gate.clear_suppressed();
         self.tray_tip.clear(self.hwnd);
-        self.context_menu.close();
-        self.status_panel.close();
+        self.close_context_menu_immediate();
+        self.close_panel_immediate();
         self.window_preview.close();
         for bar in &mut self.topbars {
             if let Some(p) = bar.popover.as_mut() {
@@ -1018,6 +1022,8 @@ impl App {
         let fullscreen = self.snap.fullscreen;
         if fullscreen {
             self.close_popover_immediate();
+            self.close_context_menu_immediate();
+            self.close_panel_immediate();
         }
         let cfg = &self.config.topbar;
         for bar in &mut self.topbars {
@@ -1564,6 +1570,8 @@ impl App {
         self.topbar_visible = !self.topbar_visible;
         if !self.topbar_visible {
             self.close_popover_immediate();
+            self.close_context_menu_immediate();
+            self.close_panel_immediate();
         }
         self.sync_topbar_visibility();
     }
@@ -1763,7 +1771,7 @@ impl App {
         }
         let reduce = self.config.appearance.reduce_motion;
         let ptr = app_ptr() as isize;
-        let mut any_popover_closed = false;
+        let mut any_overlay_closed = false;
         for bar in &mut self.topbars {
             animating |= bar.tick_color(dt, transition);
             animating |= bar.tick_tray_anim(dt, reduce);
@@ -1780,16 +1788,53 @@ impl App {
                         invalidate(bar.hwnd);
                     }
                     if just_closed {
-                        any_popover_closed = true;
+                        any_overlay_closed = true;
                     }
                     animating |= p_anim;
                 }
             }
         }
-        if any_popover_closed {
-            if !self.status_panel.visible && !self.topbars.iter().any(|b| b.popover.as_ref().is_some_and(|p| p.is_open())) {
-                self.set_topbar_active(None, None);
+        // 统一推进顶部栏右侧状态面板与左侧下拉菜单的抽屉滑出/收起帧动画
+        if self.status_panel.is_animating() {
+            let sp_hwnd = self.status_panel.hwnd;
+            if !sp_hwnd.0.is_null() {
+                unsafe {
+                    let _ = SetWindowLongPtrW(sp_hwnd, GWLP_USERDATA, 0);
+                }
             }
+            let (sp_anim, _, just_closed) = self.status_panel.tick(dt, reduce);
+            if !sp_hwnd.0.is_null() {
+                unsafe {
+                    let _ = SetWindowLongPtrW(sp_hwnd, GWLP_USERDATA, ptr);
+                }
+            }
+            if just_closed {
+                self.status_panel_bar = None;
+                any_overlay_closed = true;
+            }
+            animating |= sp_anim;
+        }
+        if self.context_menu.is_animating() {
+            let cm_hwnd = self.context_menu.hwnd;
+            if !cm_hwnd.0.is_null() {
+                unsafe {
+                    let _ = SetWindowLongPtrW(cm_hwnd, GWLP_USERDATA, 0);
+                }
+            }
+            let (cm_anim, _, just_closed) = self.context_menu.tick(dt, reduce);
+            if !cm_hwnd.0.is_null() {
+                unsafe {
+                    let _ = SetWindowLongPtrW(cm_hwnd, GWLP_USERDATA, ptr);
+                }
+            }
+            if just_closed {
+                self.topbar_menu = None;
+                any_overlay_closed = true;
+            }
+            animating |= cm_anim;
+        }
+        if any_overlay_closed {
+            self.sync_topbar_active();
             self.flush_pending_color_samples();
         }
         if !animating {
@@ -2296,7 +2341,9 @@ impl App {
         self.tray_gate.clear_suppressed();
         self.clear_tray_context();
         self.close_popover_immediate();
-        self.status_panel.close();
+        self.close_panel_immediate();
+        self.topbar_menu = None;
+        self.sync_topbar_active();
         self.window_preview.close();
         self.menu_ctx = ctx;
         let ptr = app_ptr();
@@ -2304,8 +2351,79 @@ impl App {
         self.context_menu.open(ptr, items, x, y, prev_fg, &appearance);
     }
 
+    /// 在顶部栏按钮下方弹出带抽屉滑出动效的下拉菜单并点亮对应按钮激活态。
+    fn popup_topbar_menu(
+        &mut self,
+        bi: usize,
+        hit: Hit,
+        items: Vec<MenuItem>,
+        ctx: MenuCtx,
+        anchor: RECT,
+        dpi: u32,
+        align_right: bool,
+    ) {
+        let prev_fg = HWND(self.snap.foreground as *mut _);
+        self.tray_tip.clear(self.hwnd);
+        self.tray_gate.clear_suppressed();
+        self.clear_tray_context();
+        self.close_popover_immediate();
+        self.close_panel_immediate();
+        self.window_preview.close();
+        self.menu_ctx = ctx;
+        self.topbar_menu = Some((bi, hit));
+        self.sync_topbar_active();
+        let ptr = app_ptr();
+        let appearance = self.config.appearance.clone();
+        self.context_menu
+            .open_anchored(ptr, items, anchor, dpi, align_right, prev_fg, &appearance);
+        if self.context_menu.is_animating() {
+            self.ensure_frame();
+        }
+    }
+
     pub fn close_context_menu(&mut self) {
+        let reduce = self.config.appearance.reduce_motion;
+        let ptr = app_ptr() as isize;
+        let cm_hwnd = self.context_menu.hwnd;
+        if !cm_hwnd.0.is_null() {
+            unsafe {
+                let _ = SetWindowLongPtrW(cm_hwnd, GWLP_USERDATA, 0);
+            }
+        }
+        let animating = self.context_menu.begin_close(reduce);
+        if !cm_hwnd.0.is_null() {
+            unsafe {
+                let _ = SetWindowLongPtrW(cm_hwnd, GWLP_USERDATA, ptr);
+            }
+        }
+        if !animating {
+            self.topbar_menu = None;
+        }
+        self.sync_topbar_active();
+        if animating {
+            self.ensure_frame();
+        } else {
+            self.flush_pending_color_samples();
+        }
+    }
+
+    /// 立即隐藏自绘菜单并清理顶部栏菜单激活态（用于切换独占面板、退出或全屏让位）。
+    pub fn close_context_menu_immediate(&mut self) {
+        let cm_hwnd = self.context_menu.hwnd;
+        let ptr = app_ptr() as isize;
+        if !cm_hwnd.0.is_null() {
+            unsafe {
+                let _ = SetWindowLongPtrW(cm_hwnd, GWLP_USERDATA, 0);
+            }
+        }
         self.context_menu.close();
+        if !cm_hwnd.0.is_null() {
+            unsafe {
+                let _ = SetWindowLongPtrW(cm_hwnd, GWLP_USERDATA, ptr);
+            }
+        }
+        self.topbar_menu = None;
+        self.sync_topbar_active();
         self.flush_pending_color_samples();
     }
 
@@ -2323,6 +2441,8 @@ impl App {
 
     pub fn menu_lbutton_up(&mut self, x: i32, y: i32) {
         if let Some(id) = self.context_menu.on_lbutton_up(x, y) {
+            self.topbar_menu = None;
+            self.sync_topbar_active();
             self.on_menu(id);
         }
         self.flush_pending_color_samples();
@@ -2330,6 +2450,8 @@ impl App {
 
     pub fn menu_key_down(&mut self, vk: u32) {
         if let Some(id) = self.context_menu.on_key_down(vk) {
+            self.topbar_menu = None;
+            self.sync_topbar_active();
             self.on_menu(id);
         }
         self.flush_pending_color_samples();
@@ -3102,7 +3224,7 @@ impl App {
                 .position(|b| b.popover.as_ref().map(|p| p.hwnd) == Some(hwnd))
                 .and_then(|index| topbars[index].popover.as_ref())
                 .and_then(|p| {
-                    if !p.visible || p.closing || p.press.is_some() {
+                    if !p.is_open() || p.press.is_some() {
                         return None;
                     }
                     let index = p.index_at(x, y)?;
@@ -3513,20 +3635,40 @@ impl App {
     pub fn topbar_click(&mut self, hwnd: HWND, x: i32, y: i32, right: bool) {
         let Some(i) = self.topbar_index(hwnd) else { return };
         let Some(hit) = self.topbars[i].hit_test(x, y) else { return };
-        let anchor_pt = {
+        let (anchor, dpi) = {
             let bar = &self.topbars[i];
             let mut wr = RECT::default();
             let _ = unsafe { GetWindowRect(bar.hwnd, &mut wr) };
             let r = bar.rect_of(&hit).unwrap_or_default();
-            (wr.left + r.left, wr.bottom + 2)
+            (
+                RECT {
+                    left: wr.left + r.left,
+                    top: wr.top + r.top,
+                    right: wr.left + r.right,
+                    bottom: wr.top + r.bottom,
+                },
+                bar.dpi,
+            )
         };
+        if matches!(
+            hit,
+            Hit::ProductMenu | Hit::AppMenu | Hit::MenuFile | Hit::MenuWindow | Hit::MenuGo
+        ) && self.context_menu.is_open()
+            && self.topbar_menu.as_ref() == Some(&(i, hit.clone()))
+        {
+            self.close_context_menu();
+            return;
+        }
         match hit {
-            Hit::ProductMenu => self.product_menu_at(anchor_pt.0, anchor_pt.1),
+            Hit::ProductMenu => {
+                let v = Self::product_menu_items(self.dock_visible, self.topbar_visible, self.taskbar_menu_label());
+                self.popup_topbar_menu(i, hit, v, MenuCtx::None, anchor, dpi, false);
+            }
             Hit::AppMenu => {
-                match self.foreground_window() {
+                let (v, ctx) = match self.foreground_window() {
                     Some(fg) => {
                         let zoomed = unsafe { IsZoomed(fg).as_bool() };
-                        self.popup_at(
+                        (
                             vec![
                                 MenuItem::normal(M_FG_MIN, "最小化"),
                                 MenuItem::normal(M_FG_MAX, if zoomed { "还原" } else { "最大化" }),
@@ -3535,20 +3677,17 @@ impl App {
                                 MenuItem::danger(M_FG_CLOSE, "关闭窗口"),
                             ],
                             MenuCtx::Foreground(fg.0 as isize),
-                            anchor_pt.0,
-                            anchor_pt.1,
-                        );
+                        )
                     }
-                    None => self.popup_at(
+                    None => (
                         vec![
                             MenuItem::normal(M_NEW_FINDER, "打开文件管理器"),
                             MenuItem::normal(M_SETTINGS, "WinDockFinder设置"),
                         ],
                         MenuCtx::None,
-                        anchor_pt.0,
-                        anchor_pt.1,
                     ),
-                }
+                };
+                self.popup_topbar_menu(i, hit, v, ctx, anchor, dpi, false);
             }
             Hit::MenuFile => {
                 let mut v = vec![
@@ -3562,7 +3701,7 @@ impl App {
                 } else {
                     MenuCtx::None
                 };
-                self.popup_at(v, ctx, anchor_pt.0, anchor_pt.1);
+                self.popup_topbar_menu(i, hit, v, ctx, anchor, dpi, false);
             }
             Hit::MenuWindow => {
                 let (mut v, ctx) = match self.foreground_window() {
@@ -3584,23 +3723,19 @@ impl App {
                     None => (Vec::new(), MenuCtx::None),
                 };
                 v.push(MenuItem::normal(M_SHOW_DESKTOP, "最小化全部窗口（显示桌面）"));
-                self.popup_at(v, ctx, anchor_pt.0, anchor_pt.1);
+                self.popup_topbar_menu(i, hit, v, ctx, anchor, dpi, false);
             }
             Hit::MenuGo => {
-                self.popup_at(
-                    vec![
-                        MenuItem::normal(M_OPEN_BASE, "此电脑"),
-                        MenuItem::normal(M_OPEN_BASE + 1, "桌面"),
-                        MenuItem::normal(M_OPEN_BASE + 2, "下载"),
-                        MenuItem::normal(M_OPEN_BASE + 3, "文档"),
-                        MenuItem::sep(),
-                        MenuItem::normal(M_OPEN_BASE + 4, "回收站"),
-                        MenuItem::normal(M_OPEN_BASE + 5, "Windows 设置"),
-                    ],
-                    MenuCtx::None,
-                    anchor_pt.0,
-                    anchor_pt.1,
-                );
+                let v = vec![
+                    MenuItem::normal(M_OPEN_BASE, "此电脑"),
+                    MenuItem::normal(M_OPEN_BASE + 1, "桌面"),
+                    MenuItem::normal(M_OPEN_BASE + 2, "下载"),
+                    MenuItem::normal(M_OPEN_BASE + 3, "文档"),
+                    MenuItem::sep(),
+                    MenuItem::normal(M_OPEN_BASE + 4, "回收站"),
+                    MenuItem::normal(M_OPEN_BASE + 5, "Windows 设置"),
+                ];
+                self.popup_topbar_menu(i, hit, v, MenuCtx::None, anchor, dpi, false);
             }
             Hit::TrayToggle => {
                 if self.topbars[i].popover.as_ref().is_some_and(|p| p.is_open()) {
@@ -3621,8 +3756,8 @@ impl App {
                     if right {
                         // 右键托盘图标前先立即收起既有的收纳浮层、自绘菜单与状态面板，防止上下文错乱
                         self.close_popover_immediate();
-                        self.context_menu.close();
-                        self.status_panel.close();
+                        self.close_context_menu_immediate();
+                        self.close_panel_immediate();
                     }
                     self.invoke_tray_native(hwnd, item, anchor);
                 }
@@ -3647,11 +3782,30 @@ impl App {
         }
     }
 
+    /// 根据当前仍处于打开态的顶部栏面板/下拉菜单/收纳浮层统一刷新按钮高亮。
+    fn sync_topbar_active(&mut self) {
+        let target: Option<(usize, Hit)> = if self.status_panel.is_open() {
+            self.status_panel_bar.clone()
+        } else if self.context_menu.is_open() {
+            self.topbar_menu.clone()
+        } else {
+            self.topbars
+                .iter()
+                .position(|b| b.popover.as_ref().is_some_and(|p| p.is_open()))
+                .map(|bi| (bi, Hit::TrayToggle))
+        };
+        match target {
+            Some((bi, hit)) => self.set_topbar_active(Some(bi), Some(hit)),
+            None => self.set_topbar_active(None, None),
+        }
+    }
+
     fn toggle_status_panel(&mut self, bi: usize, kind: PanelKind, hit: Hit) {
-        if self.status_panel.visible && self.status_panel.kind == kind {
-            self.status_panel.close();
-            self.set_topbar_active(None, None);
-            self.flush_pending_color_samples();
+        if self.status_panel.is_open()
+            && self.status_panel.kind == kind
+            && self.status_panel_bar.as_ref().is_some_and(|(idx, _)| *idx == bi)
+        {
+            self.close_panel();
             return;
         }
         let prev_fg = HWND(self.snap.foreground as *mut _);
@@ -3659,9 +3813,8 @@ impl App {
         self.tray_gate.clear_suppressed();
         self.clear_tray_context();
         self.close_popover_immediate();
-        self.context_menu.close();
+        self.close_context_menu_immediate();
         self.window_preview.close();
-        self.set_topbar_active(Some(bi), Some(hit.clone()));
         let (anchor, dpi) = {
             let bar = &self.topbars[bi];
             let mut wr = RECT::default();
@@ -3680,14 +3833,58 @@ impl App {
         let ptr = app_ptr();
         let main_hwnd = self.hwnd;
         let appearance = self.config.appearance.clone();
+        self.status_panel_bar = Some((bi, hit));
         self.status_panel.open(ptr, main_hwnd, kind, anchor, dpi, prev_fg, &appearance);
+        self.sync_topbar_active();
+        if self.status_panel.is_animating() {
+            self.ensure_frame();
+        }
     }
 
+    /// 触发状态面板平滑收起（若开启减弱动态效果则立即隐藏）。
     pub fn close_panel(&mut self) {
-        self.status_panel.close();
-        if !self.topbars.iter().any(|b| b.popover.as_ref().is_some_and(|p| p.is_open())) {
-            self.set_topbar_active(None, None);
+        let reduce = self.config.appearance.reduce_motion;
+        let ptr = app_ptr() as isize;
+        let sp_hwnd = self.status_panel.hwnd;
+        if !sp_hwnd.0.is_null() {
+            unsafe {
+                let _ = SetWindowLongPtrW(sp_hwnd, GWLP_USERDATA, 0);
+            }
         }
+        let animating = self.status_panel.begin_close(reduce);
+        if !sp_hwnd.0.is_null() {
+            unsafe {
+                let _ = SetWindowLongPtrW(sp_hwnd, GWLP_USERDATA, ptr);
+            }
+        }
+        if !animating {
+            self.status_panel_bar = None;
+        }
+        self.sync_topbar_active();
+        if animating {
+            self.ensure_frame();
+        } else {
+            self.flush_pending_color_samples();
+        }
+    }
+
+    /// 立即隐藏状态面板并清理高亮状态（用于切换独占浮层、退出、全屏让位或锁屏睡眠）。
+    pub fn close_panel_immediate(&mut self) {
+        let sp_hwnd = self.status_panel.hwnd;
+        let ptr = app_ptr() as isize;
+        if !sp_hwnd.0.is_null() {
+            unsafe {
+                let _ = SetWindowLongPtrW(sp_hwnd, GWLP_USERDATA, 0);
+            }
+        }
+        self.status_panel.close();
+        if !sp_hwnd.0.is_null() {
+            unsafe {
+                let _ = SetWindowLongPtrW(sp_hwnd, GWLP_USERDATA, ptr);
+            }
+        }
+        self.status_panel_bar = None;
+        self.sync_topbar_active();
         self.flush_pending_color_samples();
     }
 
@@ -3722,16 +3919,30 @@ impl App {
     fn handle_panel_action(&mut self, act: PanelAction) {
         match act {
             PanelAction::None => {}
-            PanelAction::OpenSettings => self.open_settings(None),
-            PanelAction::LockScreen => self.on_menu(M_LOCK),
-            PanelAction::Sleep => self.on_menu(M_SLEEP),
+            PanelAction::Close => self.close_panel(),
+            PanelAction::OpenSettings => {
+                self.close_panel_immediate();
+                self.open_settings(None);
+            }
+            PanelAction::NotificationCenter => {
+                self.close_panel();
+                crate::topbar::panel::trigger_notification_center();
+            }
+            PanelAction::LockScreen => {
+                self.close_panel_immediate();
+                self.on_menu(M_LOCK);
+            }
+            PanelAction::Sleep => {
+                self.close_panel_immediate();
+                self.on_menu(M_SLEEP);
+            }
             PanelAction::VolumeChanged(v, m) => {
                 for bar in &mut self.topbars {
                     bar.status.volume = Some((v, m));
                     invalidate(bar.hwnd);
                 }
             }
-            PanelAction::ImeChanged => {
+            PanelAction::ImeChanged { close } => {
                 let cur = status::ime_label(HWND(self.snap.foreground as *mut _));
                 self.last_ime = cur.clone();
                 for bar in &mut self.topbars {
@@ -3739,25 +3950,36 @@ impl App {
                     bar.layout(&self.config.topbar);
                     invalidate(bar.hwnd);
                 }
+                if close {
+                    self.close_panel();
+                }
             }
             PanelAction::ToggleTheme => {
                 let next = if self.config.appearance.is_dark() { "light" } else { "dark" };
                 self.config.appearance.theme = next.into();
                 let _ = self.store.save_config(&self.config);
                 self.apply_config(false);
-                if self.status_panel.visible {
+                if self.status_panel.is_open() {
                     let prev_fg = HWND(self.snap.foreground as *mut _);
-                    let dpi = self.topbars.first().map(|b| b.dpi).unwrap_or(96);
-                    let anchor = self.topbars.first().and_then(|b| {
-                        let mut wr = RECT::default();
-                        let _ = unsafe { GetWindowRect(b.hwnd, &mut wr) };
-                        b.rect_of(&Hit::Control).map(|r| RECT {
-                            left: wr.left + r.left,
-                            top: wr.top + r.top,
-                            right: wr.left + r.right,
-                            bottom: wr.top + r.bottom,
+                    let bi = self.status_panel_bar.as_ref().map(|(idx, _)| *idx).unwrap_or(0);
+                    let (anchor, dpi) = self
+                        .topbars
+                        .get(bi)
+                        .map(|b| {
+                            let mut wr = RECT::default();
+                            let _ = unsafe { GetWindowRect(b.hwnd, &mut wr) };
+                            let r = b.rect_of(&Hit::Control).unwrap_or_default();
+                            (
+                                RECT {
+                                    left: wr.left + r.left,
+                                    top: wr.top + r.top,
+                                    right: wr.left + r.right,
+                                    bottom: wr.top + r.bottom,
+                                },
+                                b.dpi,
+                            )
                         })
-                    }).unwrap_or_default();
+                        .unwrap_or((RECT::default(), 96));
                     let ptr = app_ptr();
                     let main_hwnd = self.hwnd;
                     let appearance = self.config.appearance.clone();
@@ -3821,8 +4043,8 @@ impl App {
         self.tray_tip.clear(self.hwnd);
         self.tray_gate.clear_suppressed();
         self.clear_tray_context();
-        self.context_menu.close();
-        self.status_panel.close();
+        self.close_context_menu_immediate();
+        self.close_panel_immediate();
         self.window_preview.close();
         self.sync_shelf_items();
         let (anchor, items, pinned) = {
@@ -3876,7 +4098,7 @@ impl App {
         } else {
             false
         };
-        self.set_topbar_active(Some(bi), Some(Hit::TrayToggle));
+        self.sync_topbar_active();
         if need_anim {
             self.ensure_frame();
         }
@@ -3931,9 +4153,7 @@ impl App {
                 }
             }
         }
-        if !self.status_panel.visible && !self.topbars.iter().any(|b| b.popover.as_ref().is_some_and(|p| p.is_open())) {
-            self.set_topbar_active(None, None);
-        }
+        self.sync_topbar_active();
         if animating {
             self.ensure_frame();
         }
@@ -3962,10 +4182,8 @@ impl App {
                 }
             }
         }
-        if closed && !self.status_panel.visible {
-            self.set_topbar_active(None, None);
-        }
         if closed {
+            self.sync_topbar_active();
             self.flush_pending_color_samples();
         }
     }
